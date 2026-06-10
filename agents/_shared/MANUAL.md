@@ -526,7 +526,7 @@ entry before invocation. The owner ID is always allowed on Discord (see
   is empty. When BOTH are omitted, the return channel auto-resolves via:
   (1) caller's current channel if recipient can access, (2) recipient's DM
   with the originating human, (3) caller's channel. Chain depth cap: 20.
-  Generates a fresh chain_id per dispatch; replies on stale chain_ids drop.
+  Generates a fresh chain_id per dispatch; a reply on a superseded chain_id is delivered with a `[FRAMEWORK]` late-reply prefix (it used to be silently dropped).
 - **`end_chain()`** — explicitly end a chain-terminator turn without
   dispatching anywhere. Use when silence is correct (recipient agent
   decides nothing further needs to go back to the originator).
