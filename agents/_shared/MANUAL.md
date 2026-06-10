@@ -519,7 +519,7 @@ entry before invocation. The owner ID is always allowed on Discord (see
   — fire a synthetic turn at another running agent. Fire-and-forget.
   Framed as `"<your_id>: <message>"` to the recipient.
   **`session_id` is the canonical target conversation key** — pass the
-  transport-prefixed id (e.g. `"discord:12345"`, `"imessage:42"`,
+  transport-prefixed id (e.g. `"discord:12345"`, `"imessage:you@example.com"`,
   `"internal:email-support"`) and it is used DIRECTLY: all the
   return-channel guessing is bypassed. `channel_id` is the
   deprecated-but-supported bare-int fallback, used only when `session_id`
@@ -535,7 +535,7 @@ entry before invocation. The owner ID is always allowed on Discord (see
   silently plant context into ANOTHER agent's conversation history for a
   specific conversation. **`session_id` is the canonical conversation
   key** — pass the transport-prefixed id (e.g. `"discord:12345"`,
-  `"imessage:42"`, `"internal:email-support"`) and it is used DIRECTLY as
+  `"imessage:you@example.com"`, `"internal:email-support"`) and it is used DIRECTLY as
   the conversation key (no int() coercion, no prefix guessing).
   `channel_id` is the deprecated-but-supported bare-int fallback, used only
   when `session_id` is empty (the transport prefix is then inferred from
@@ -567,7 +567,7 @@ entry before invocation. The owner ID is always allowed on Discord (see
   `every_seconds` — never both. Modes: `"reminder"` (final text auto-
   posts to the anchor conversation), `"data_collection"` (silent — you
   can still call `send_message`), `"mixed"` (silent, reserved).
-  **Anchor:** `session_id` (transport-prefixed, e.g. `"imessage:42"` or
+  **Anchor:** `session_id` (transport-prefixed, e.g. `"imessage:you@example.com"` or
   `"discord:12345"`) is PREFERRED — it pins the fired turn to the exact
   conversation. A bare `channel_id` is ambiguous on agents that run more
   than one transport (iMessage + Discord), so the turn can land in the
@@ -1142,7 +1142,7 @@ fire.
 
 Every job needs an anchor — even silent jobs use it to attach the
 synthetic turn to a conversation file. Prefer `sessionId`, the
-transport-prefixed id (`"imessage:42"`, `"discord:12345"`): it routes the
+transport-prefixed id (`"imessage:you@example.com"`, `"discord:12345"`): it routes the
 turn to the exact conversation. The legacy bare `channelId` still works,
 but on an agent with more than one transport a bare id is ambiguous —
 the scheduler can't tell `discord:1` from `imessage:1` and falls back to
