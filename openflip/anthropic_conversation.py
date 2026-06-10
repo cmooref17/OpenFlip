@@ -1345,14 +1345,60 @@ class AnthropicConversation:
                 continue
             total -= _est(_content_str(self.messages[i]))
             del self.messages[i]
-        if total > trim_target and len(self.messages) <= LAST_KEEP:
-            print_ts(
-                f"{COLOR_YELLOW}_trim_to_fit_window: hit LAST_KEEP={LAST_KEEP} floor "
-                f"while still over budget ({total} > {trim_target}). Sending anyway; "
-                f"Anthropic will surface the real error if context is still too long."
-                f"{COLOR_END}",
-                agent=self.agent.id,
+        if total > trim_target:
+            # LAST-RESORT IN-MESSAGE TRUNCATION (2026-06-10). Reaching here
+            # means whole-message trimming is exhausted and the kept tail
+            # alone still exceeds the window — a single recent message is
+            # bigger than the budget. "Sending anyway" used to hand this to
+            # Anthropic, which hard-400s, and neither rescue the old comment
+            # promised could ever run: auto-compact rides inside an ACCEPTED
+            # request, and a smaller-budget retry still can't touch the
+            # protected tail. Result: a permanently wedged conversation
+            # (the 10.3MB tool-result dump, 2026-06-10). Now we truncate the
+            # CONTENT of the largest kept messages until the estimate fits —
+            # the model loses the middle of a dump it could never have read
+            # anyway, and the conversation stays alive. The runtime-side
+            # ingestion cap makes this near-unreachable; defense in depth.
+            _TRUNC_MARKER = (
+                "\n[FRAMEWORK: this message was emergency-truncated — its "
+                "original content was too large to ever fit the model's "
+                "context window.]"
             )
+            _MIN_KEEP_CHARS = 2000
+            while total > trim_target:
+                _idx, _len = -1, 0
+                for _j, _m in enumerate(self.messages):
+                    if _role(_m) == "system":
+                        continue
+                    _c = _m.get("content")
+                    if not isinstance(_c, str):
+                        continue
+                    if len(_c) > _len:
+                        _idx, _len = _j, len(_c)
+                if _idx < 0 or _len <= _MIN_KEEP_CHARS:
+                    break  # nothing shrinkable left
+                _m = self.messages[_idx]
+                _old_c = _m["content"]
+                # estimator is chars/2, so chars to shed ≈ overage tokens * 2
+                _need = (total - trim_target) * 2
+                _new_len = max(_MIN_KEEP_CHARS, len(_old_c) - _need - len(_TRUNC_MARKER))
+                _new_c = _old_c[:_new_len] + _TRUNC_MARKER
+                _m["content"] = _new_c
+                total -= _est(_old_c)
+                total += _est(_new_c)
+                print_ts(
+                    f"{COLOR_YELLOW}_trim_to_fit_window: emergency-truncated "
+                    f"oversized message at index {_idx} "
+                    f"({len(_old_c):,} -> {len(_new_c):,} chars){COLOR_END}",
+                    agent=self.agent.id,
+                )
+            if total > trim_target:
+                print_ts(
+                    f"{COLOR_YELLOW}_trim_to_fit_window: still over budget after "
+                    f"emergency truncation ({total} > {trim_target}); sending anyway"
+                    f"{COLOR_END}",
+                    agent=self.agent.id,
+                )
 
         # With a compaction block present, the head of self.messages must not
         # be 'assistant' — that would emit [assistant(compaction), assistant(...)]
