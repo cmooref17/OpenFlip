@@ -1,0 +1,17 @@
+{% extends 'base.html' %}
+{% block title %}Log in — openflip{% endblock %}
+{% block content %}
+<div class="auth-card">
+  <h1>openflip</h1>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="post">
+    <label>Username
+      <input type="text" name="username" value="{{ username or '' }}" required autofocus />
+    </label>
+    <label>Password
+      <input type="password" name="password" required />
+    </label>
+    <button type="submit">Log in</button>
+  </form>
+</div>
+{% endblock %}

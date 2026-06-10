@@ -1,0 +1,24 @@
+{% extends 'base.html' %}
+{% block title %}{{ agent.id }} · inter-agent — openflip{% endblock %}
+{% block content %}
+<div class="page-head">
+  <a href="{{ url_for('agent_detail', agent_id=agent.id) }}" class="back">← {{ agent.id }}</a>
+  <h1>Inter-agent threads</h1>
+</div>
+<p class="muted">Channels where another agent has spoken to <code>{{ agent.id }}</code> via <code>talk_to_agent</code>.</p>
+{% if links %}
+<ul class="conv-list">
+  {% for L in links %}
+  <li>
+    <a href="{{ url_for('interagent_thread', agent_id=agent.id, peer_id=L.peer, focal_channel=L.focal_channel) }}">
+      <strong>{{ L.peer }}</strong>
+      <span class="muted small">via {{ L.focal_channel }}</span>
+    </a>
+    <span class="muted small">{{ L.count }} cross-msgs · {{ L.last_seen | relative_time }}</span>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="muted">No inter-agent traffic detected yet for this agent.</p>
+{% endif %}
+{% endblock %}

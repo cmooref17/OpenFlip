@@ -1,0 +1,74 @@
+{% extends 'base.html' %}
+{% block title %}{{ agent.id }} · {{ channel_id }} — openflip{% endblock %}
+{% block content %}
+<script id="conv-initial-data" type="application/json">{{ messages | tojson | safe }}</script>
+<div class="conv-page" x-data="convView()" x-init="bootstrap(JSON.parse(document.getElementById('conv-initial-data').textContent))">
+  <div class="conv-head">
+    <a href="{{ url_for('agent_detail', agent_id=agent.id) }}" class="back">← {{ agent.id }}</a>
+    <strong>{{ channel_id }}</strong>
+    <span x-text="status" class="muted small"></span>
+  </div>
+
+  <div class="messages" x-ref="scroller">
+    <template x-for="(m, i) in messages" :key="i">
+      <div :class="'msg msg-' + m.role">
+        <div class="msg-meta">
+          <span class="role" x-text="m.role"></span>
+          <span class="ts muted" x-text="formatTs(m.ts)"></span>
+        </div>
+        <div class="msg-body" x-html="renderBody(m)"></div>
+      </div>
+    </template>
+  </div>
+</div>
+
+<script>
+function convView() {
+  return {
+    messages: [],
+    ws: null,
+    status: "Connecting…",
+    bootstrap(initial) {
+      this.messages = initial || [];
+      this.$nextTick(() => this.scrollBottom());
+      this.connect();
+    },
+    connect() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const url = `${proto}//${location.host}/ws/conversations/{{ agent.id }}/{{ channel_id }}`;
+      this.ws = new WebSocket(url);
+      this.ws.onmessage = (e) => {
+        const frame = JSON.parse(e.data);
+        if (frame.type === "subscribed") { this.status = "Live"; return; }
+        if (frame.type === "message") {
+          this.messages.push(frame.data);
+          this.$nextTick(() => this.scrollBottom());
+        }
+      };
+      this.ws.onclose = () => {
+        this.status = "Disconnected, retrying…";
+        setTimeout(() => this.connect(), 1500);
+      };
+      this.ws.onerror = () => { this.status = "Connection error."; };
+    },
+    scrollBottom() {
+      const el = this.$refs.scroller;
+      if (el) el.scrollTop = el.scrollHeight;
+    },
+    formatTs(ts) {
+      if (!ts) return "";
+      try { return new Date(ts * 1000).toLocaleTimeString(); }
+      catch { return ""; }
+    },
+    renderBody(m) {
+      const content = (m.content || "").toString();
+      // escape then linebreaks
+      const escaped = content
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+      return escaped.replace(/\n/g, "<br>");
+    },
+  };
+}
+</script>
+{% endblock %}

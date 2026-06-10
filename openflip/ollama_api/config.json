@@ -1,0 +1,29 @@
+{
+  "host": "http://localhost:11434",
+  "default_model": "yantien/llama3.1-uncensored:latest",
+  "default_options": {
+    "max_tokens": 2048,
+    "num_ctx": 8000,
+    "temperature": 0.8,
+    "repeat_last_n": -1,
+    "repeat_penalty": 1.02,
+    "num_predict": -1,
+    "top_k": 40,
+    "top_p": 0.9,
+    "min_p": 0.0,
+    "mirostat": 0,
+    "mirostat_eta": 0.1,
+    "mirostat_tau": 5.0
+  },
+  "keep_model_alive_minutes": 10,
+  "rag": {
+    "enable": 1,
+    "vector_db_path": "./data/chromadb",
+    "embedding_model": "nomic-embed-text",
+    "chunk_size": 4096,
+    "chunk_overlap": 200,
+    "retrieval_top_k": 5,
+    "similarity_threshold": 0.0,
+    "context_format": "[Context from {source}]\n{content}\n---"
+  }
+}

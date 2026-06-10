@@ -1,0 +1,24 @@
+{% extends 'base.html' %}
+{% block title %}Agents — openflip{% endblock %}
+{% block content %}
+<h1>Agents</h1>
+<div class="agents-grid">
+  {% for agent in agents %}
+  <a class="agent-card{% if not agent.enabled %} disabled{% endif %}"
+     href="{{ url_for('agent_detail', agent_id=agent.id) }}">
+    <h2>{{ agent.display_name }}</h2>
+    <div class="agent-meta">
+      <span class="badge">{{ agent.provider }}</span>
+      {# Strip "<provider>/" prefix from the model name when it matches the
+         badge — avoids redundant "anthropic / anthropic/claude-..." display
+         and gives the model name more horizontal room before wrapping. #}
+      <span class="muted">{% if agent.model.startswith(agent.provider + '/') %}{{ agent.model[(agent.provider|length + 1):] }}{% else %}{{ agent.model }}{% endif %}</span>
+    </div>
+    <div class="agent-id">{{ agent.id }}</div>
+    {% if not agent.enabled %}<div class="badge muted">disabled</div>{% endif %}
+  </a>
+  {% else %}
+  <p class="muted">No agents found under <code>agents/</code>.</p>
+  {% endfor %}
+</div>
+{% endblock %}

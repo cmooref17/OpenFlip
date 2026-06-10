@@ -1,0 +1,149 @@
+{% extends 'base.html' %}
+{% block title %}{{ agent.id }} — openflip{% endblock %}
+{% block content %}
+<div class="agent-detail"
+     x-data='agentDetail({{ agent.config | tojson_pretty | tojson }}, "{{ agent.id }}", {{ "true" if agent.enabled else "false" }})'>
+  <div class="agent-header">
+    <h1>{{ agent.config.display_name or agent.id }}</h1>
+    <code class="muted">{{ agent.id }}</code>
+    <a class="badge" href="{{ url_for('interagent_index', agent_id=agent.id) }}">Inter-agent threads</a>
+    <a class="badge" href="{{ url_for('memory_view', agent_id=agent.id) }}">Memory</a>
+    <button class="badge"
+            :class="enabled ? 'on' : 'off'"
+            @click="toggleEnabled()"
+            :disabled="enabledBusy"
+            x-text="enabled ? 'enabled' : 'disabled'"></button>
+    <span x-text="enabledStatus" class="muted small"></span>
+  </div>
+
+  <div class="grid-2col">
+    <section class="panel">
+      <h2>Configuration</h2>
+      <p class="muted small">Every field in <code>agent.json</code>. Edits hot-reload automatically.</p>
+      <textarea x-model="configText" rows="22" class="json-editor"></textarea>
+      <div class="row">
+        <button @click="saveConfig()" :disabled="saving">Save</button>
+        <span x-text="status" class="muted small"></span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>System files</h2>
+      <p class="muted small">In load order. Each contributes to the system prompt.</p>
+      <ul class="filelist">
+        {% for f in agent.system_files %}
+        <li>
+          <a href="#" @click.prevent="openFile('{{ f.name }}')">{{ f.name }}</a>
+          <span class="muted small">{{ f.size }} bytes{% if not f.exists %} · <em>missing</em>{% endif %}</span>
+        </li>
+        {% endfor %}
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Conversations</h2>
+      <p class="muted small">Per-channel history. Click for live view.</p>
+      <ul class="conv-list">
+        {% for c in agent.conversations %}
+        <li>
+          <a href="{{ url_for('conversation_view', agent_id=agent.id, channel_id=c.channel_id) }}">
+            <span class="mono">{{ c.display or c.channel_id }}</span>
+          </a>
+          <span class="muted small">{{ c.msg_count }} msgs · {{ c.mtime | relative_time }}</span>
+        </li>
+        {% else %}
+        <li class="muted">No conversations yet.</li>
+        {% endfor %}
+      </ul>
+    </section>
+  </div>
+
+  <div x-show="editingFile" class="modal" @click.self="editingFile = null" x-cloak>
+    <div class="modal-card">
+      <div class="modal-head">
+        <strong x-text="editingFile"></strong>
+        <button class="link-btn" @click="editingFile = null">×</button>
+      </div>
+      <textarea x-model="editingContent" rows="24" class="text-editor"></textarea>
+      <div class="row">
+        <button @click="saveFile()" :disabled="saving">Save</button>
+        <span x-text="fileStatus" class="muted small"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function agentDetail(initialConfig, agentId, initialEnabled) {
+  return {
+    configText: initialConfig,
+    saving: false,
+    status: "",
+    editingFile: null,
+    editingContent: "",
+    fileStatus: "",
+    enabled: initialEnabled,
+    enabledBusy: false,
+    enabledStatus: "",
+    async toggleEnabled() {
+      const target = !this.enabled;
+      this.enabledBusy = true;
+      this.enabledStatus = target ? "Enabling…" : "Disabling…";
+      try {
+        const r = await fetch(`/agents/${agentId}/enabled`, {
+          method: "POST",
+          headers: csrfHeaders({"Content-Type": "application/json"}),
+          body: JSON.stringify({enabled: target}),
+        });
+        const j = await r.json();
+        if (j.ok) {
+          this.enabled = target;
+          this.enabledStatus = j.warning ? ("Saved with warning: " + j.warning) : "";
+        } else {
+          this.enabledStatus = "Failed: " + (j.error || "?");
+        }
+      } catch (e) { this.enabledStatus = "Error: " + e.message; }
+      this.enabledBusy = false;
+    },
+    async saveConfig() {
+      let parsed;
+      try { parsed = JSON.parse(this.configText); }
+      catch (e) { this.status = "Invalid JSON: " + e.message; return; }
+      this.saving = true; this.status = "Saving…";
+      try {
+        const r = await fetch(`/agents/{{ agent.id }}/config`, {
+          method: "POST",
+          headers: csrfHeaders({"Content-Type": "application/json"}),
+          body: JSON.stringify(parsed),
+        });
+        const j = await r.json();
+        this.status = j.ok ? "Saved." : ("Save failed: " + (j.error || "?"));
+      } catch (e) { this.status = "Error: " + e.message; }
+      this.saving = false;
+    },
+    async openFile(name) {
+      this.editingFile = name;
+      this.editingContent = "Loading…";
+      this.fileStatus = "";
+      const r = await fetch(`/agents/{{ agent.id }}/files/${encodeURIComponent(name)}`);
+      if (!r.ok) { this.editingContent = "Failed to load."; return; }
+      const j = await r.json();
+      this.editingContent = j.content;
+    },
+    async saveFile() {
+      this.saving = true; this.fileStatus = "Saving…";
+      try {
+        const r = await fetch(`/agents/{{ agent.id }}/files/${encodeURIComponent(this.editingFile)}`, {
+          method: "POST",
+          headers: csrfHeaders({"Content-Type": "application/json"}),
+          body: JSON.stringify({content: this.editingContent}),
+        });
+        const j = await r.json();
+        this.fileStatus = j.ok ? "Saved." : "Save failed.";
+      } catch (e) { this.fileStatus = "Error: " + e.message; }
+      this.saving = false;
+    },
+  };
+}
+</script>
+{% endblock %}

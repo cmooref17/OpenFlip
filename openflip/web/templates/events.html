@@ -1,0 +1,56 @@
+{% extends 'base.html' %}
+{% block title %}Events — openflip{% endblock %}
+{% block content %}
+<h1>Events</h1>
+<div x-data="eventsView()" x-init="load()">
+  <p class="muted small">Most recent 200 entries from <code>data/events.jsonl</code>. Refreshing every 3s.</p>
+  <table class="evtbl">
+    <thead><tr>
+      <th>Time</th><th>Agent</th><th>Type</th><th>Payload</th>
+    </tr></thead>
+    <tbody>
+      <template x-for="e in events.slice().reverse()" :key="e.id || e.ts">
+        <tr>
+          <td class="mono small" x-text="formatTs(e.ts)"></td>
+          <td x-text="e.agent || ''"></td>
+          <td x-text="e.type || ''"></td>
+          <td class="mono small" x-text="payloadPreview(e)"></td>
+        </tr>
+      </template>
+    </tbody>
+  </table>
+</div>
+
+<style>
+.evtbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+.evtbl th, .evtbl td { padding: 6px 10px; border-bottom: 1px solid var(--border);
+  text-align: left; vertical-align: top; }
+.evtbl th { color: var(--muted); font-weight: 600; }
+.evtbl td.mono { font-family: ui-monospace, monospace; }
+</style>
+
+<script>
+function eventsView() {
+  return {
+    events: [],
+    async load() {
+      try {
+        const r = await fetch("/events/recent.json");
+        const j = await r.json();
+        this.events = j.events || [];
+      } catch (e) { /* ignore — retry next tick */ }
+      setTimeout(() => this.load(), 3000);
+    },
+    formatTs(ts) {
+      if (!ts) return "";
+      try { return new Date(ts * 1000).toLocaleTimeString(); }
+      catch { return ""; }
+    },
+    payloadPreview(e) {
+      const { ts, agent, type, ...rest } = e;
+      return JSON.stringify(rest).slice(0, 200);
+    },
+  };
+}
+</script>
+{% endblock %}

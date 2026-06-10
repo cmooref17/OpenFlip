@@ -1,0 +1,5 @@
+ollama
+pydantic
+setuptools
+# Optional: enables ollama_api.rag (vector store + retrieval).
+# chromadb

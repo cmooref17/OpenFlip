@@ -1,0 +1,69 @@
+{% extends 'base.html' %}
+{% block title %}{{ agent.id }} · memory — openflip{% endblock %}
+{% block content %}
+<div class="page-head" x-data="memoryView()">
+  <a href="{{ url_for('agent_detail', agent_id=agent.id) }}" class="back">← {{ agent.id }}</a>
+  <h1>Memory</h1>
+
+  <div class="grid-2col">
+    <section class="panel">
+      <h2>Core memory (MEMORY.md)</h2>
+      {% if memory.core %}
+      <pre class="memory-body">{{ memory.core }}</pre>
+      {% else %}
+      <p class="muted">No core memory yet.</p>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <h2>Daily logs</h2>
+      {% if memory.daily %}
+      <ul class="conv-list">
+        {% for d in memory.daily %}
+        <li>
+          <a href="#" @click.prevent="openDate('{{ d.date }}')">{{ d.date }}</a>
+          <span class="muted small">{{ d.size }} bytes · {{ d.mtime | relative_time }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="muted">No daily logs.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  <div x-show="openedDate" class="modal" @click.self="openedDate = null" x-cloak>
+    <div class="modal-card">
+      <div class="modal-head">
+        <strong x-text="openedDate"></strong>
+        <button class="link-btn" @click="openedDate = null">×</button>
+      </div>
+      <pre class="memory-body" x-text="content"></pre>
+    </div>
+  </div>
+</div>
+
+<style>
+.memory-body { white-space: pre-wrap; word-wrap: break-word;
+  font-family: ui-monospace, monospace; font-size: 13px; max-height: 60vh;
+  overflow-y: auto; background: var(--panel-2); padding: 12px;
+  border-radius: var(--radius); margin: 0; }
+</style>
+
+<script>
+function memoryView() {
+  return {
+    openedDate: null,
+    content: "",
+    async openDate(date) {
+      this.openedDate = date;
+      this.content = "Loading…";
+      const r = await fetch(`/agents/{{ agent.id }}/memory/daily/${date}`);
+      if (!r.ok) { this.content = "Failed to load."; return; }
+      const j = await r.json();
+      this.content = j.content;
+    },
+  };
+}
+</script>
+{% endblock %}

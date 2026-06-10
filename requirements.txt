@@ -1,0 +1,15 @@
+# Discord transport
+nextcord
+
+# Anthropic provider
+anthropic
+
+# Ollama provider (vendored openflip/ollama_api/ talks to a local Ollama server)
+ollama
+pydantic
+
+# HTTP + general networking (used by web_search, fetch_url, file tools, etc.)
+aiohttp
+
+# Cron scheduler (cron-expression validation/eval in cron_jobs.py / cron.py)
+croniter

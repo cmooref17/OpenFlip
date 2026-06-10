@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  {% if request.endpoint not in ('login', 'setup') %}
+  <meta name="csrf-token" content="{{ csrf_token() }}" />
+  {% endif %}
+  <title>{% block title %}openflip{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
+  <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+  <script src="https://unpkg.com/alpinejs@3.14.6/dist/cdn.min.js" defer></script>
+  <script>
+    // CSRF helper — every fetch POST must include this header. Reads the
+    // token from the meta tag injected above. JS callers should use
+    // `csrfHeaders()` instead of building headers manually.
+    window.csrfToken = function () {
+      const m = document.querySelector('meta[name="csrf-token"]');
+      return m ? m.getAttribute('content') : '';
+    };
+    window.csrfHeaders = function (extra) {
+      const h = Object.assign({}, extra || {}, {'X-CSRF-Token': window.csrfToken()});
+      return h;
+    };
+  </script>
+  {% block head %}{% endblock %}
+</head>
+<body>
+  {% if request.endpoint not in ('login', 'setup') %}
+  <nav class="top">
+    <a class="brand" href="{{ url_for('agents_list') }}">openflip</a>
+    <div class="nav-links">
+      <a href="{{ url_for('agents_list') }}">Agents</a>
+      <a href="{{ url_for('events_view') }}">Events</a>
+      <a href="{{ url_for('usage_view') }}">Usage</a>
+      <a href="{{ url_for('settings') }}">Settings</a>
+      <form action="{{ url_for('logout') }}" method="post" class="inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+        <button type="submit" class="link-btn">Log out</button>
+      </form>
+    </div>
+  </nav>
+  {% endif %}
+  <main class="content">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
