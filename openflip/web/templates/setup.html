@@ -1,0 +1,21 @@
+{% extends 'base.html' %}
+{% block title %}Setup — openflip{% endblock %}
+{% block content %}
+<div class="auth-card">
+  <h1>First-time setup</h1>
+  <p class="muted">Create the operator account. This page locks after a credential exists.</p>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="post">
+    <label>Username
+      <input type="text" name="username" value="{{ username or '' }}" required autofocus />
+    </label>
+    <label>Password (≥ 8 chars)
+      <input type="password" name="password" required />
+    </label>
+    <label>Confirm password
+      <input type="password" name="password_confirm" required />
+    </label>
+    <button type="submit">Create account</button>
+  </form>
+</div>
+{% endblock %}

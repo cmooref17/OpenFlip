@@ -1,0 +1,205 @@
+{% extends 'base.html' %}
+{% block title %}Usage — openflip{% endblock %}
+{% block content %}
+<h1>Usage</h1>
+<div x-data="usageView()" x-init="load()">
+  <p class="muted small">
+    Read-only view over <code>data/usage_ledger.db</code>. Window mapping matches
+    the <code>/usage</code> slash command. Session/channel ids are shown raw
+    (transport-prefixed).
+  </p>
+
+  <div class="row" style="margin-bottom: 18px;">
+    <label class="inline-sel">Window
+      <select x-model="window" @change="load()">
+        <option value="24h">Last 24h</option>
+        <option value="7d">Last 7d</option>
+        <option value="30d">Last 30d</option>
+        <option value="all">All</option>
+      </select>
+    </label>
+    <label class="inline-sel">Group by
+      <select x-model="groupBy" @change="load()">
+        <option value="session">Session</option>
+        <option value="channel">Channel</option>
+        <option value="agent">Agent</option>
+        <option value="user">User</option>
+        <option value="model">Model</option>
+      </select>
+    </label>
+    <span class="muted small" x-show="loading">loading…</span>
+  </div>
+
+  <!-- Headline totals -->
+  <div class="stat-grid">
+    <div class="stat">
+      <div class="stat-label">Turns</div>
+      <div class="stat-value" x-text="fmtInt(totals.turns)"></div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Total tokens</div>
+      <div class="stat-value" x-text="fmtTokens(totals.total_tokens)"></div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Est. cost</div>
+      <div class="stat-value" x-text="fmtCost(totals.est_cost_usd)"></div>
+    </div>
+  </div>
+
+  <!-- Per-day trend (inline SVG bar chart, no chart lib) -->
+  <div class="panel" style="margin-bottom: 18px;">
+    <h2>Daily trend
+      <span class="muted small" style="font-weight: 400;">— bar height = total tokens</span>
+    </h2>
+    <template x-if="series.length">
+      <svg class="trend" :viewBox="'0 0 ' + chartW + ' ' + chartH"
+           preserveAspectRatio="none" role="img" aria-label="Per-day token usage">
+        <template x-for="(d, i) in series" :key="d.date">
+          <g>
+            <rect :x="barX(i)" :y="barY(d)" :width="barW()"
+                  :height="barHeight(d)" rx="2" fill="var(--accent)">
+              <title x-text="d.date + ' · ' + fmtTokens(d.total_tokens) + ' tokens · ' + fmtCost(d.est_cost_usd)"></title>
+            </rect>
+          </g>
+        </template>
+      </svg>
+    </template>
+    <p class="muted small" x-show="!series.length">No usage in this window.</p>
+    <div class="trend-axis" x-show="series.length">
+      <span class="mono small" x-text="series.length ? series[0].date : ''"></span>
+      <span class="mono small" x-text="series.length ? series[series.length-1].date : ''"></span>
+    </div>
+  </div>
+
+  <!-- Group-by breakdown (sortable) -->
+  <h2 x-text="'Breakdown by ' + groupBy"></h2>
+  <table class="evtbl">
+    <thead><tr>
+      <th @click="sortBy('group')" class="sortable">Group <span x-text="sortArrow('group')"></span></th>
+      <th @click="sortBy('turns')" class="sortable num">Turns <span x-text="sortArrow('turns')"></span></th>
+      <th @click="sortBy('total_tokens')" class="sortable num">Tokens <span x-text="sortArrow('total_tokens')"></span></th>
+      <th @click="sortBy('est_cost_usd')" class="sortable num">Cost <span x-text="sortArrow('est_cost_usd')"></span></th>
+    </tr></thead>
+    <tbody>
+      <template x-for="r in sortedRows()" :key="r.group">
+        <tr>
+          <td class="mono small" x-text="r.group || '—'"></td>
+          <td class="num" x-text="fmtInt(r.turns)"></td>
+          <td class="num" x-text="fmtTokens(r.total_tokens)"></td>
+          <td class="num" x-text="fmtCost(r.est_cost_usd)"></td>
+        </tr>
+      </template>
+      <template x-if="!rows.length">
+        <tr><td colspan="4" class="muted small">No usage in this window.</td></tr>
+      </template>
+    </tbody>
+  </table>
+</div>
+
+<style>
+.inline-sel { display: inline-block; margin-bottom: 0; }
+.inline-sel select { width: auto; margin-top: 4px; }
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 14px; margin-bottom: 18px; }
+.stat { background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px 16px; }
+.stat-label { color: var(--muted); font-size: 12px; text-transform: uppercase;
+  letter-spacing: 0.05em; margin-bottom: 6px; }
+.stat-value { font-size: 22px; font-weight: 700; font-family: ui-monospace, monospace; }
+svg.trend { width: 100%; height: 160px; display: block; }
+.trend-axis { display: flex; justify-content: space-between; margin-top: 6px; color: var(--muted); }
+.evtbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+.evtbl th, .evtbl td { padding: 6px 10px; border-bottom: 1px solid var(--border);
+  text-align: left; vertical-align: top; }
+.evtbl th { color: var(--muted); font-weight: 600; }
+.evtbl td.mono { font-family: ui-monospace, monospace; }
+.evtbl .num { text-align: right; font-family: ui-monospace, monospace; }
+.evtbl th.sortable { cursor: pointer; user-select: none; }
+.evtbl th.sortable:hover { color: var(--text); }
+</style>
+
+<script>
+function usageView() {
+  return {
+    window: "24h",
+    groupBy: "session",
+    totals: { turns: 0, total_tokens: 0, est_cost_usd: 0 },
+    rows: [],
+    series: [],
+    loading: false,
+    sortKey: "est_cost_usd",
+    sortDir: "desc",
+    // SVG drawing space — viewBox units, scaled to the container by CSS.
+    chartW: 600,
+    chartH: 160,
+    async load() {
+      this.loading = true;
+      try {
+        const u = `/usage/data.json?window=${encodeURIComponent(this.window)}` +
+          `&group_by=${encodeURIComponent(this.groupBy)}`;
+        const r = await fetch(u);
+        const j = await r.json();
+        this.totals = j.totals || this.totals;
+        this.rows = j.rows || [];
+        this.series = j.series || [];
+      } catch (e) { /* ignore — selector change retriggers */ }
+      this.loading = false;
+    },
+    // ── chart geometry (bars sized to the window's max-token day) ──
+    maxTokens() {
+      return Math.max(1, ...this.series.map(d => d.total_tokens || 0));
+    },
+    barW() {
+      const n = this.series.length || 1;
+      return (this.chartW / n) * 0.8;
+    },
+    barX(i) {
+      const n = this.series.length || 1;
+      const slot = this.chartW / n;
+      return i * slot + slot * 0.1;
+    },
+    barHeight(d) {
+      const h = (d.total_tokens || 0) / this.maxTokens() * (this.chartH - 4);
+      return Math.max(1, h);
+    },
+    barY(d) {
+      return this.chartH - this.barHeight(d);
+    },
+    // ── table sorting ──
+    sortBy(key) {
+      if (this.sortKey === key) {
+        this.sortDir = this.sortDir === "asc" ? "desc" : "asc";
+      } else {
+        this.sortKey = key;
+        this.sortDir = key === "group" ? "asc" : "desc";
+      }
+    },
+    sortArrow(key) {
+      if (this.sortKey !== key) return "";
+      return this.sortDir === "asc" ? "▲" : "▼";
+    },
+    sortedRows() {
+      const k = this.sortKey, dir = this.sortDir === "asc" ? 1 : -1;
+      return this.rows.slice().sort((a, b) => {
+        let av = a[k], bv = b[k];
+        if (k === "group") {
+          av = (av || "").toString(); bv = (bv || "").toString();
+          return av.localeCompare(bv) * dir;
+        }
+        return ((av || 0) - (bv || 0)) * dir;
+      });
+    },
+    // ── formatting ──
+    fmtInt(n) { return (n || 0).toLocaleString(); },
+    fmtTokens(n) {
+      n = n || 0;
+      if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+      if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+      return n.toLocaleString();
+    },
+    fmtCost(n) { return "$" + (n || 0).toFixed(2); },
+  };
+}
+</script>
+{% endblock %}

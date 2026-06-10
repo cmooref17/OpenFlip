@@ -1,0 +1,122 @@
+"""Transport-agnostic session, attachment, and inbound-message types.
+
+Introduced as part of the Discord-decouple refactor (TODO #2). Phase 1 wraps
+nextcord types at the on_message boundary so the rest of openflip can stop
+depending on Discord internals. Phase 2 extracts Transport adapters.
+
+A Session is one conversation context. For Discord that's a channel/DM; for
+other transports it's whatever the native identity unit is. The conversation
+file key is `conversation_id` which is already prefixed (e.g. `"discord:12345"`).
+
+Tools never touch nextcord. They receive `InboundMessage` and Session info via
+contextvars or explicit parameters and route outbound traffic through the
+Transport adapter (Phase 2).
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class Session:
+    """One conversation context, transport-agnostic.
+
+    For Discord: transport="discord", transport_id=str(channel_id).
+    For future transports: transport_id is whatever string identifier that
+    transport uses natively.
+    """
+    transport: str               # "discord", "imessage", "slack", etc.
+    transport_id: str            # platform-native ID as a string
+    conversation_id: str         # prefixed: f"{transport}:{transport_id}"
+    speaker_id: int              # always int; non-discord transports hash native ID to int
+    speaker_role_ids: list[int]  # transport-native role IDs; empty for transports without roles
+    is_owner: bool               # speaker == openflip owner_id
+    is_dm: bool                  # 1:1 conversation vs group/channel
+    display_name: str            # human-readable label for logs/UI
+    guild_id: int = 0            # Discord guild (server) id; 0 for DMs and non-guild transports
+    category_id: int = 0         # Discord channel category id; 0 for DMs, uncategorized channels, non-discord
+    handle: str = ""             # raw sender handle for handle-based transports (iMessage email/phone);
+                                 # "" for Discord. Source of truth for owner/admin auth on those
+                                 # transports — never the per-process-unstable hash in speaker_id.
+    tool_grants: list[str] = field(default_factory=list)
+    # Tool names this session is authorized to call REGARDLESS of per-user auth.
+    # Used for trusted synthetic sessions (cron jobs) that have no human speaker.
+    # Empty = no extra grants; normal per-user ACL applies. A tool name here makes
+    # that tool callable for this session even if no auth block matches. Additive
+    # only — it never overrides an exclude deny, and can't authorize a tool that
+    # isn't present in the agent's allowed_tools at all.
+
+    @property
+    def channel_id_int(self) -> int:
+        """Best-effort int conversion of transport_id, for legacy callsites.
+
+        Phase 1 compat helper. New code should use transport_id directly.
+        Raises ValueError if transport_id isn't numeric.
+        """
+        return int(self.transport_id)
+
+
+@dataclass
+class Attachment:
+    """Transport-neutral attachment. Either url OR local_path is set.
+
+    Discord transports populate `url` from the CDN. Local-file transports
+    populate `local_path`. Consumers that need bytes call `read_bytes()`
+    or fetch the URL.
+    """
+    content_type: str
+    filename: str
+    url: Optional[str] = None
+    local_path: Optional[str] = None
+
+
+@dataclass
+class InboundMessage:
+    """Transport-neutral inbound message.
+
+    Built at the transport-adapter boundary (Phase 2) or at the
+    `_handle_message` boundary in runtime.py (Phase 1) by wrapping a
+    `nextcord.Message`.
+
+    `reply_to` is optional and currently only populated for Discord replies.
+    """
+    session: Session
+    text: str
+    sender_id: int
+    sender_display_name: str
+    is_dm: bool
+    mentions_us: bool
+    sender_is_bot: bool = False
+    attachments: list[Attachment] = field(default_factory=list)
+    reply_to: Optional["InboundMessage"] = None
+
+
+def make_discord_session(
+    *,
+    channel_id: int,
+    speaker_id: int,
+    speaker_role_ids: list[int],
+    is_owner: bool,
+    is_dm: bool,
+    display_name: str,
+    guild_id: int = 0,
+    category_id: int = 0,
+) -> Session:
+    """Build a Session for a Discord channel.
+
+    Centralizes the prefix convention so we don't recompute
+    `f"discord:{channel_id}"` everywhere. `guild_id` and `category_id` are
+    0 for DMs (and `category_id` is also 0 for uncategorized channels).
+    """
+    return Session(
+        transport="discord",
+        transport_id=str(channel_id),
+        conversation_id=f"discord:{channel_id}",
+        speaker_id=speaker_id,
+        speaker_role_ids=speaker_role_ids,
+        is_owner=is_owner,
+        is_dm=is_dm,
+        display_name=display_name,
+        guild_id=guild_id,
+        category_id=category_id,
+    )

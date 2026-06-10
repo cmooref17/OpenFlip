@@ -1,0 +1,48 @@
+{% extends 'base.html' %}
+{% block title %}{{ focal.id }} ↔ {{ peer.id }} — openflip{% endblock %}
+{% block content %}
+<div class="conv-page">
+  <div class="conv-head">
+    <a href="{{ url_for('interagent_index', agent_id=focal.id) }}" class="back">← inter-agent</a>
+    <strong>{{ focal.id }}</strong>
+    <span class="muted">↔</span>
+    <strong>{{ peer.id }}</strong>
+    <span class="muted small">{{ timeline|length }} rows{% if not peer_channel %} · peer channel not found{% endif %}</span>
+  </div>
+
+  <div class="legend">
+    <span class="legend-dot dot-focal"></span> {{ focal.id }}
+    <span class="legend-dot dot-peer"></span> {{ peer.id }}
+    <span class="legend-dot dot-bridge"></span> cross-bridge
+  </div>
+
+  <div class="messages messages-thread">
+    {% for r in timeline %}
+      {% set body = r.content %}
+      {% if '---' in body %}
+        {% set body = body.rsplit('---', 1)[1].strip() %}
+      {% endif %}
+      <div class="msg msg-{{ r.role }} thread-{{ 'focal' if r.agent == focal.id else 'peer' }}{% if r.peer_sender %} is-bridge{% endif %}">
+        <div class="msg-meta">
+          <span class="role">{{ r.agent }}</span>
+          <span class="muted">/ {{ r.role }}{% if r.peer_sender %} ← <strong>{{ r.peer_sender }}</strong>{% endif %}</span>
+          <span class="ts muted">{{ r.ts | fmt_ts }}</span>
+        </div>
+        <div class="msg-body">{{ body }}</div>
+      </div>
+    {% endfor %}
+  </div>
+</div>
+
+<style>
+.legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+.legend-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: middle; margin-right: 4px; }
+.dot-focal { background: var(--accent); }
+.dot-peer { background: #58d68d; }
+.dot-bridge { background: var(--warn); }
+.messages-thread .thread-focal { border-left: 3px solid var(--accent); }
+.messages-thread .thread-peer { border-left: 3px solid #58d68d; }
+.messages-thread .is-bridge { background: rgba(240,160,75,0.08); border-color: rgba(240,160,75,0.5); }
+.msg-body { white-space: pre-wrap; word-wrap: break-word; }
+</style>
+{% endblock %}

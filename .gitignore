@@ -1,0 +1,127 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Editor
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# openflip runtime / ephemeral state — DO track agent.json, SOUL.md, AGENT.md, etc.
+log.txt
+restart-sentinel/
+agent_state.json
+api_config.json
+config.json
+
+# Per-agent runtime state (NOT identity)
+agents/*/conversations/
+agents/*/memory/index.json
+agents/*/state.json
+agents/*/live.json
+
+# Generated outputs and ephemeral working files
+
+
+
+# Recovery snapshots — bounded retention, but no need to track in git
+.snapshots/
+
+# Sensitive / local-only
+*.token
+*.secret
+secrets.json
+
+# Maintainer-private; not for public consumption.
+CLAUDE.md
+
+# Virtualenv
+.lvenv
+.venv/
+venv/
+
+# Personal agent directories (each user creates their own).
+# Default-deny: every directory under agents/ is gitignored, except:
+#   - _shared/    (framework rules — must be tracked)
+#   - example/    (skeleton template for new users — tracked)
+# Any new agent dir you create is automatically gitignored — no need to
+# remember to add it. To make an agent public, add a "!agents/<name>/"
+# un-ignore line below.
+agents/*/
+!agents/_shared/
+!agents/example_agent/
+
+# Per-agent personal content (in case other agent dirs get created)
+agents/*/MEMORY.md
+agents/*/AGENT.md
+agents/*/HEARTBEAT.md
+agents/*/notes/
+
+# Personal scheduler config (Discord channel IDs, etc.)
+cron/jobs.json
+
+# Generated events log
+
+# Usage ledger (SQLite, append-only; WAL/SHM sidecars)
+
+# Personal tool settings
+
+# Locally trained TTS models
+
+# Personal/extras tools — symlinked from outside the repo (e.g. ~/.openflip-extras/).
+# Framework-core tools (web_search, memory, files, etc.) are tracked; any other
+# file appearing in openflip/tools/ is treated as a local extra and ignored.
+# Loader in openflip/tools/__init__.py auto-imports them if present.
+openflip/tools/*
+!openflip/tools/__init__.py
+!openflip/tools/_base.py
+!openflip/tools/web_search.py
+!openflip/tools/memory.py
+!openflip/tools/files.py
+!openflip/tools/fetch_url.py
+!openflip/tools/run_command.py
+!openflip/tools/restart.py
+!openflip/tools/send_message.py
+!openflip/tools/talk_to_agent.py
+!openflip/tools/delete_message.py
+!openflip/tools/fetch_discord_message.py
+!openflip/tools/snapshots.py
+!openflip/tools/claude_code.py
+!openflip/tools/end_chain.py
+!openflip/tools/cron_jobs.py
+!openflip/tools/dream_tool.py
+!openflip/tools/inject_context.py
+
+
+api_config.json.bak
+
+# webapp credentials — never commit
+openflip/web/data/auth.json
+openflip/web/data/secret_key
+openflip/web/data/trigger_token
+
+# secrets / runtime state — never commit
+
+# sync-tool runtime dir (Syncthing/file-sync state — not project source)
+.sync/
+
+# quarantined editor backups pending deletion review
+
+# editing litter — per-session backups + working drafts
+*.bak
+*.bak.*
+*.pre_*.bak
+*.draft
+SECURITY_AUDIT.md
+
+# data/: ignore EVERYTHING except the framework script (secure default —
+# new files in data/ are ignored automatically, no whack-a-mole)
+data/*
+!data/secret_scrub.py

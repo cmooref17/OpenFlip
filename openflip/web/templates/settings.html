@@ -1,0 +1,29 @@
+{% extends 'base.html' %}
+{% block title %}Settings — openflip{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+
+<section class="panel">
+  <h2>Global config (config.json)</h2>
+  <p class="muted small">Read-only here for safety — edit on disk if you need to.</p>
+  <pre class="json-readonly">{{ global_config | tojson_pretty }}</pre>
+</section>
+
+<section class="panel" x-data="{ text: {{ tool_settings | tojson_pretty | tojson }}, status: '' }">
+  <h2>Tool settings (tool_settings.json)</h2>
+  <p class="muted small">Owner-controlled per-tool knobs.</p>
+  <textarea x-model="text" rows="16" class="json-editor"></textarea>
+  <div class="row">
+    <button @click="
+      let parsed;
+      try { parsed = JSON.parse(text); } catch (e) { status = 'Invalid JSON: ' + e.message; return; }
+      fetch('/settings/tools', {
+        method: 'POST',
+        headers: csrfHeaders({'Content-Type': 'application/json'}),
+        body: JSON.stringify(parsed),
+      }).then(r => r.json()).then(j => status = j.ok ? 'Saved.' : 'Save failed.')
+    ">Save</button>
+    <span x-text="status" class="muted small"></span>
+  </div>
+</section>
+{% endblock %}
