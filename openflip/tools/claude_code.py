@@ -41,7 +41,7 @@ _DEFAULT_TIMEOUT = 600  # 10 min — claude-code can chew through long sessions
 
 
 @tool
-async def claude_code(task: str, timeout: int = _DEFAULT_TIMEOUT) -> ToolResult:
+async def claude_code(task: str, timeout: int = _DEFAULT_TIMEOUT, model: str = "claude-opus-4-8") -> ToolResult:
     """Delegate a task to Claude Code (non-interactive subprocess).
 
     Claude Code runs from the openflip repo root with full file access
@@ -55,6 +55,11 @@ async def claude_code(task: str, timeout: int = _DEFAULT_TIMEOUT) -> ToolResult:
             you're handing off to another engineer.
         timeout: Max seconds to wait for Claude Code to finish (default 600,
             i.e. 10 minutes). Capped at 1800 (30 minutes).
+        model: Which Claude model Claude Code should run on. Defaults to
+            "claude-opus-4-8" (cost-safe). Pass "claude-fable-5" ONLY when
+            the owner has explicitly approved it — Fable is much more
+            expensive. This overrides whatever default is pinned in
+            ~/.claude/settings.json, so the stuck-default never matters.
     """
     from ..acl import current_caller_is_owner
     if not current_caller_is_owner():
@@ -67,6 +72,12 @@ async def claude_code(task: str, timeout: int = _DEFAULT_TIMEOUT) -> ToolResult:
         return ToolResult.fail(f"claude binary not found at {_CLAUDE_BIN}")
 
     timeout = max(30, min(int(timeout or _DEFAULT_TIMEOUT), 1800))
+
+    # Model selection. Default is cost-safe opus; Fable is the deliberate,
+    # owner-approved exception. We pin it per-call via --model so the value
+    # pinned in ~/.claude/settings.json (which can drift to Fable after a
+    # /model switch in an interactive session) never silently applies.
+    model = (model or "claude-opus-4-8").strip()
 
     # CLAUDECODE env var causes a "nested session" error if claude is
     # spawned from inside another claude session; strip it from the
@@ -84,6 +95,7 @@ async def claude_code(task: str, timeout: int = _DEFAULT_TIMEOUT) -> ToolResult:
             _CLAUDE_BIN,
             "--print",
             "--dangerously-skip-permissions",
+            "--model", model,
             task,
             cwd=_OPENFLIP_DIR,
             env=env,
