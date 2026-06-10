@@ -2314,8 +2314,38 @@ class AgentRunner:
                     # anthropic provider needs this pairing to emit a valid
                     # tool_use → tool_result round-trip on the next turn;
                     # without it, the API 400s on orphan tool_use blocks.
+                    # INGESTION CAP (2026-06-10): a tool result larger than
+                    # _TOOL_RESULT_MAX_CHARS enters the conversation truncated,
+                    # with a marker telling the model what happened and how to
+                    # retry. An unbounded result is how a conversation
+                    # soft-locked today: one 10.3MB API dump became a single
+                    # message bigger than the provider's hard context cap, so
+                    # it could neither be sent (400), compacted (compaction
+                    # rides inside an accepted request), nor trimmed (the trim
+                    # floor protects the recent tail). Capping here — the one
+                    # chokepoint where every tool result becomes a message —
+                    # makes such a message impossible. The request validator's
+                    # body_size_high warn stays as the early-warning layer;
+                    # this is the enforcement layer.
+                    _TOOL_RESULT_MAX_CHARS = 100_000
                     for (tname, tres), _tc_obj in zip(tool_results, new_calls):
                         feedback = build_model_feedback(tname, tres)
+                        if len(feedback) > _TOOL_RESULT_MAX_CHARS:
+                            _orig_chars = len(feedback)
+                            feedback = (
+                                feedback[:_TOOL_RESULT_MAX_CHARS]
+                                + f"\n\n[FRAMEWORK: tool result truncated — original was "
+                                f"{_orig_chars:,} characters (~{_orig_chars // 4:,} tokens), over "
+                                f"the {_TOOL_RESULT_MAX_CHARS:,}-char ingestion cap. Only the "
+                                f"beginning is kept. Narrow the query (limit/filter/fields) or "
+                                f"have the tool write large output to a file instead.]"
+                            )
+                            print_ts(
+                                f"{COLOR_YELLOW}{log_tag}tool result from '{tname}' truncated at "
+                                f"ingestion: {_orig_chars:,} chars > {_TOOL_RESULT_MAX_CHARS:,} cap"
+                                f"{COLOR_END}",
+                                agent=agent.id,
+                            )
                         tool_msg = ChatMessage('tool', feedback)
                         tu_id = getattr(_tc_obj, "tool_use_id", "") or ""
                         if tu_id:
