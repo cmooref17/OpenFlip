@@ -102,7 +102,15 @@ class AnthropicAIChatMessage(ChatMessage):
         self.is_framework_error: bool = is_framework_error
 
 
-_CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
+# Claude Code stores OAuth creds in this file on Linux AND Windows
+# (%USERPROFILE%\.claude\.credentials.json — confirmed by the official
+# authentication docs); macOS uses Keychain (read below). When
+# CLAUDE_CONFIG_DIR is set, Claude Code relocates the file under it —
+# honor that so we read the same creds the CLI refreshes.
+_CREDS_PATH = os.path.join(
+    os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser(os.path.join("~", ".claude")),
+    ".credentials.json",
+)
 _KEYCHAIN_SERVICE = "Claude Code-credentials"
 # On macOS, Claude Code stores credentials with account = $USER (the macOS
 # username), NOT the literal string "Claude Code". An older Claude Code
@@ -179,22 +187,20 @@ def _acquire_refresh_file_lock():
     release). Returns None if the lock couldn't be acquired within
     _REFRESH_LOCK_MAX_TRIES attempts.
 
-    Uses fcntl.flock (advisory, POSIX) — works on Linux + macOS. Windows
-    falls through (returns None) since fcntl is unavailable; on Windows
-    we rely solely on the in-process asyncio.Lock + the per-refresh-token
-    dedup, which is what we had before.
+    Uses fcntl.flock on POSIX (Linux + macOS) and msvcrt.locking on
+    Windows, via the shared _file_lock helper. On a platform with neither
+    (shouldn't exist), falls through (returns None) and we rely solely on
+    the in-process asyncio.Lock + the per-refresh-token dedup.
 
     Stale detection: if the lock file exists AND its mtime is older than
     _REFRESH_LOCK_STALE_S, the holder probably crashed — we forcibly
     truncate/recreate it. Mirrors Claude Code's hA6 stale handling.
     """
-    try:
-        import fcntl  # noqa: F401 — POSIX only
-    except ImportError:
+    from . import _file_lock
+    if not _file_lock.LOCKING_SUPPORTED:
         return None
 
     import random
-    import errno
 
     for attempt in range(_REFRESH_LOCK_MAX_TRIES):
         # Stale check before each attempt — if the lock file is old enough
@@ -225,24 +231,29 @@ def _acquire_refresh_file_lock():
             return None
 
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = _file_lock.try_lock_excl(fd)
+        except OSError as e:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            print_ts(
+                f"{COLOR_YELLOW}OAuth refresh: file lock failed unexpectedly: {e}{COLOR_END}",
+            )
+            return None
+        if acquired:
             # Got it. Touch the mtime so future stale checks know we're alive.
             try:
                 os.utime(_REFRESH_LOCK_PATH, None)
             except OSError:
                 pass
             return fd
-        except OSError as e:
-            # EWOULDBLOCK / EAGAIN = someone else holds it; sleep and retry.
+        else:
+            # Someone else holds it; sleep and retry.
             try:
                 os.close(fd)
             except OSError:
                 pass
-            if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
-                print_ts(
-                    f"{COLOR_YELLOW}OAuth refresh: flock failed unexpectedly: {e}{COLOR_END}",
-                )
-                return None
             sleep_s = _REFRESH_LOCK_BASE_SLEEP_S + random.random()
             print_ts(
                 f"OAuth refresh: cross-process lock held (attempt {attempt+1}/"
@@ -257,17 +268,12 @@ def _acquire_refresh_file_lock():
 
 
 def _release_refresh_file_lock(fd) -> None:
-    """Close the lock fd — flock is auto-released on close."""
+    """Unlock + close the lock fd — the lock is auto-released on close
+    (or process death) on every platform anyway; explicit unlock is tidy."""
     if fd is None:
         return
-    try:
-        import fcntl
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-    except ImportError:
-        pass
+    from . import _file_lock
+    _file_lock.unlock(fd)
     try:
         os.close(fd)
     except OSError:
@@ -1017,7 +1023,7 @@ class AnthropicConversation:
         """Sidecar JSON holding non-message state — compaction block, etc.
         Lives next to the .jsonl. Cleared by clear_history."""
         return os.path.join(
-            self._agent_dir(), "conversations", f"{self.conversation_id}.meta.json"
+            self._agent_dir(), "conversations", f"{_cio.fs_encode(self.conversation_id)}.meta.json"
         )
 
     def _content_extractor(self, m) -> str:

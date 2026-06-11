@@ -11,6 +11,22 @@ COLOR_GREEN = '\033[92m'
 COLOR_YELLOW = '\033[93m'
 COLOR_BLUE = '\033[94m'
 
+# Windows consoles need ENABLE_VIRTUAL_TERMINAL_PROCESSING switched on before
+# ANSI escapes render — without it, classic cmd.exe shows raw "[92m" noise
+# around every log line. Windows Terminal enables it by default; this makes
+# cmd/powershell hosts match. No-op anywhere else, never fatal.
+if os.name == "nt":
+    try:
+        import ctypes
+        _k32 = ctypes.windll.kernel32
+        for _std in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            _h = _k32.GetStdHandle(_std)
+            _mode = ctypes.c_uint32()
+            if _k32.GetConsoleMode(_h, ctypes.byref(_mode)):
+                _k32.SetConsoleMode(_h, _mode.value | 0x0004)
+    except Exception:
+        pass
+
 
 def remove_color_tags(raw_text: str) -> str:
     return re.sub(r'\033\[\d+(;\d+)*m', '', raw_text or '')
@@ -177,12 +193,14 @@ def _sensitive_path_roots() -> list[str]:
     return sorted((r for r in roots if r and r != "/"), key=len, reverse=True)
 
 
-# Trailing path segments after a sensitive root: zero or more `/segment`.
+# Trailing path segments after a sensitive root: zero or more `/segment` (or
+# `\segment` — Windows paths use backslashes, and both separators are accepted
+# on Windows so a leaked path may carry either).
 # The lookahead `(?![\w.\-])` after the root makes the root match a whole path
 # component only — so a project root of `.../.openflip` does NOT partial-match
 # `.../.openflip-extras/...` (which would leak the `-extras/...` tail). When the
 # root pattern declines, the broader home-dir root catches the full path.
-_REDACT_TAIL = r'(?![\w.\-])(?:/[\w.\-]+)*'
+_REDACT_TAIL = r'(?![\w.\-])(?:[/\\][\w.\-]+)*'
 
 
 def redact_paths(text: str) -> str:
@@ -206,7 +224,8 @@ def redact_paths(text: str) -> str:
             s = m.group(0)
             if s == root:
                 return "<path>"
-            return f"<path>/{s.rsplit('/', 1)[-1]}"
+            base = re.split(r"[/\\]", s)[-1]
+            return f"<path>/{base}"
 
         text = pattern.sub(_sub, text)
     return text
@@ -233,7 +252,7 @@ def safe_path_display(p) -> str:
             return os.path.relpath(rp, root)
     except Exception:
         pass
-    return os.path.basename(s.rstrip("/")) or "<path>"
+    return os.path.basename(s.rstrip("/\\")) or "<path>"
 
 
 # --- Shared aiohttp ClientSession --------------------------------------------

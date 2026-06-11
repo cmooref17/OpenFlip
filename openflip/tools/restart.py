@@ -8,8 +8,10 @@ Pattern (mirrors OpenClaw's restart sentinel):
    - which channel to announce in
    - the reason
    - an optional continuation prompt to fire as a synthetic turn after restart
-3. The tool then triggers `systemctl --user restart openflip`. The current
-   process dies.
+3. The tool then triggers `systemctl --user restart openflip` (Linux) or
+   `launchctl kickstart -k` (macOS). On Windows it runs OPENFLIP_RESTART_CMD
+   if set, else exits cleanly for a supervisor loop (start.bat / NSSM /
+   Task Scheduler) to respawn — see docs/WINDOWS.md. The current process dies.
 4. On startup, `main.py` scans `restart-sentinel/*.json`. For each:
    - Posts the reason to the saved channel via the saved agent's bot.
    - If a continuation is set, fires a synthetic turn so the agent can act on it.
@@ -441,21 +443,82 @@ async def restart_gateway(reason: str, continuation: str = "", force: bool = Fal
     # "openflip.main" with exclusion of our own PID nukes the rogues.
     # Systemd then restarts its own copy cleanly. Our process dies in
     # the systemctl restart a moment later.
-    try:
-        own_pid = os.getpid()
-        cleanup = await asyncio.create_subprocess_shell(
-            f"pgrep -f 'openflip\\.main' | grep -v '^{own_pid}$' | xargs -r kill -9",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+    # POSIX-only (pgrep/xargs/kill don't exist on Windows; the Windows
+    # restart path below is exit-and-respawn, which can't leak a rogue).
+    if sys.platform != "win32":
         try:
-            await asyncio.wait_for(cleanup.communicate(), timeout=3)
-        except asyncio.TimeoutError:
-            pass
-    except Exception as _kill_err:
-        print_ts(
-            f"{COLOR_YELLOW}restart_gateway: orphan-process cleanup failed (continuing): {_kill_err}{COLOR_END}",
-            agent=agent.id,
+            own_pid = os.getpid()
+            cleanup = await asyncio.create_subprocess_shell(
+                f"pgrep -f 'openflip\\.main' | grep -v '^{own_pid}$' | xargs -r kill -9",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                await asyncio.wait_for(cleanup.communicate(), timeout=3)
+            except asyncio.TimeoutError:
+                pass
+        except Exception as _kill_err:
+            print_ts(
+                f"{COLOR_YELLOW}restart_gateway: orphan-process cleanup failed (continuing): {_kill_err}{COLOR_END}",
+                agent=agent.id,
+            )
+
+    # Windows: there is no systemd/launchd. Two supported restart stories,
+    # in order of precedence:
+    #   1. OPENFLIP_RESTART_CMD — an operator-provided shell command that
+    #      restarts the service from outside (e.g. NSSM: `nssm restart
+    #      openflip`). We run it and expect it to kill us.
+    #   2. OPENFLIP_SUPERVISED=1 — set by start.bat's relaunch loop (or by
+    #      an NSSM / Task Scheduler config with restart-on-exit). "Restart"
+    #      then means: exit cleanly and let the supervisor respawn us; the
+    #      sentinel announces after the relaunch.
+    # With neither set, a restart would just take the framework DOWN with
+    # nothing to bring it back — refuse with instructions instead.
+    if sys.platform == "win32":
+        _win_cmd = os.environ.get("OPENFLIP_RESTART_CMD", "").strip()
+        if _win_cmd:
+            try:
+                await asyncio.create_subprocess_shell(
+                    _win_cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+            except Exception as e:
+                try:
+                    os.remove(os.path.join(sentinel_dir, f"{sid}.json"))
+                except Exception:
+                    pass
+                return ToolResult.fail(f"Failed to invoke OPENFLIP_RESTART_CMD ({_win_cmd!r}): {e}")
+            # The command is expected to terminate this process. If we're
+            # still alive after 20s, it didn't do its job.
+            await asyncio.sleep(20.0)
+            return ToolResult.fail(
+                f"OPENFLIP_RESTART_CMD ran but this process is still alive after 20s — "
+                f"check that {_win_cmd!r} actually restarts openflip."
+            )
+        if os.environ.get("OPENFLIP_SUPERVISED", "").strip() in ("1", "true", "yes"):
+            print_ts(
+                f"{COLOR_YELLOW}restart_gateway: exiting for supervisor relaunch "
+                f"(Windows, OPENFLIP_SUPERVISED set){COLOR_END}",
+                agent=agent.id,
+            )
+            # Short delay so the log line + any in-flight file writes land.
+            # os._exit skips cleanup the same way systemd's kill would.
+            asyncio.get_running_loop().call_later(2.0, os._exit, 0)
+            await asyncio.sleep(20.0)
+            return ToolResult.fail("process did not exit — supervisor relaunch path failed.")
+        # Neither configured — restarting would strand the framework offline.
+        for _f in (f"{sid}.json", f"{sid}.tool_result.json"):
+            try:
+                os.remove(os.path.join(sentinel_dir, _f))
+            except OSError:
+                pass
+        return ToolResult.fail(
+            "restart_gateway is not configured on this Windows host. Either run "
+            "openflip via start.bat (its relaunch loop sets OPENFLIP_SUPERVISED=1), "
+            "or set OPENFLIP_RESTART_CMD to a command that restarts the service "
+            "(e.g. `nssm restart openflip`). Without one of these, a restart would "
+            "leave the framework offline with nothing to bring it back."
         )
 
     # Trigger the restart. The current process will be terminated by the

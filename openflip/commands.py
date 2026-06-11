@@ -70,7 +70,10 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
             # Linked DMs store history under the canonical linked id, not
             # discord:<channel> — delete the file the conversation actually uses.
             conv_id = conv_key if isinstance(conv_key, str) else f"discord:{ch_id}"
-            jsonl_path = os.path.join(agent_dir, "conversations", conv_id + ".jsonl")
+            # conversation_path / fs_encode handle the Windows filename
+            # encoding (":" → "%3A") — never join a raw conv_id into a name.
+            from . import _conversation_io as _cio_reset
+            jsonl_path = _cio_reset.conversation_path(agent_dir, conv_id)
             # Pre-reset backup so /reset is recoverable. Only the .jsonl
             # is backed up; the .meta.json sidecar is just compaction
             # bookkeeping and gets regenerated cleanly.
@@ -104,7 +107,7 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
                         agent=runner.agent.id,
                     )
             for ext in (".jsonl", ".meta.json"):
-                target = os.path.join(agent_dir, "conversations", conv_id + ext)
+                target = os.path.join(agent_dir, "conversations", _cio_reset.fs_encode(conv_id) + ext)
                 try:
                     if os.path.exists(target):
                         os.remove(target)
@@ -225,9 +228,11 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         # Linked DMs store history under the canonical linked id.
         _uc_key = _conv_key_for_interaction(runner, interaction)
         conv_id = _uc_key if isinstance(_uc_key, str) else f"discord:{interaction.channel.id}"
-        live_path = os.path.join(agent_dir, f"{conv_id}.jsonl")
-        meta_path = os.path.join(agent_dir, f"{conv_id}.meta.json")
-        backups = sorted(glob.glob(os.path.join(agent_dir, f"{conv_id}.jsonl.compaction_*.bak.jsonl")))
+        from . import _conversation_io as _cio_uc
+        _fs_conv = _cio_uc.fs_encode(conv_id)  # Windows-safe filename stem
+        live_path = os.path.join(agent_dir, f"{_fs_conv}.jsonl")
+        meta_path = os.path.join(agent_dir, f"{_fs_conv}.meta.json")
+        backups = sorted(glob.glob(os.path.join(agent_dir, f"{_fs_conv}.jsonl.compaction_*.bak.jsonl")))
         if not backups:
             await interaction.response.send_message(
                 "No compaction backup found for this channel — nothing to undo. "
@@ -368,11 +373,14 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
                 _candidates = []
                 # Linked conversations: meta lives under the canonical id,
                 # which the channel-id glob below can't match.
+                from . import _conversation_io as _cio_st
                 if isinstance(_st_key, str):
-                    _lmp = os.path.join(_convs_dir, f"{_st_key}.meta.json")
+                    _lmp = os.path.join(_convs_dir, f"{_cio_st.fs_encode(_st_key)}.meta.json")
                     if os.path.exists(_lmp):
                         _candidates.append((os.path.getmtime(_lmp), _lmp))
-                for _mp in glob.glob(os.path.join(_convs_dir, f"*:{_ch_id}.meta.json")):
+                # fs_encode on the glob pattern too — on Windows the on-disk
+                # separator is "%3A", so the pattern must match that form.
+                for _mp in glob.glob(os.path.join(_convs_dir, _cio_st.fs_encode(f"*:{_ch_id}") + ".meta.json")):
                     try:
                         _candidates.append((os.path.getmtime(_mp), _mp))
                     except OSError:

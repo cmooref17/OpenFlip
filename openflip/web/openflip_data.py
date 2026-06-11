@@ -17,6 +17,10 @@ from .config import (
     OPENFLIP_TOOL_SETTINGS,
 )
 from .._constants import DANGEROUS_TOOL_NAMES
+# Conversation filename codec — on Windows the on-disk stem encodes ":" as
+# "%3A" (NTFS forbids colons); ids keep the colon form in memory and URLs.
+# Imported from the framework so the encoding has ONE source of truth.
+from .._conversation_io import fs_encode as _fs_encode, fs_decode as _fs_decode
 
 
 # ---------- agent discovery ----------
@@ -103,7 +107,7 @@ def _list_conversations(agent_dir: Path) -> List[Dict[str, Any]]:
         # matching the on-disk filename. Stripping the prefix was the source
         # of repeated display bugs (page header lost it, urls lost it, etc).
         # Use it everywhere; URL path looks like /agents/<id>/conversations/discord:<id>.
-        ch_id = f.stem  # full stem, e.g. "discord:1505657385492943008"
+        ch_id = _fs_decode(f.stem)  # full id, e.g. "discord:1505657385492943008"
         display = ch_id  # alias for template compatibility
         try:
             with f.open("rb") as fh:
@@ -136,13 +140,18 @@ def read_conversation(agent_id: str, channel_id: str,
     # the filename stem. The previous version stripped "discord:" and put
     # it back unconditionally, which broke iMessage / any other transport
     # whose conversations live under a different prefix.
-    f = OPENFLIP_AGENTS_DIR / agent_id / "conversations" / f"{channel_id}.jsonl"
+    try:
+        f = OPENFLIP_AGENTS_DIR / agent_id / "conversations" / f"{_fs_encode(channel_id)}.jsonl"
+    except ValueError:
+        # fs_encode fail-closes on empty/traversing/control-char ids — a
+        # malformed URL param reads as "no such conversation", never a path.
+        return []
     if not f.exists():
         # Back-compat: callers that pass just the bare numeric id (no
         # prefix) get the legacy Discord-only lookup. Drop this branch
         # once all callers are confirmed prefix-aware.
         if ":" not in channel_id:
-            alt_discord = OPENFLIP_AGENTS_DIR / agent_id / "conversations" / f"discord:{channel_id}.jsonl"
+            alt_discord = OPENFLIP_AGENTS_DIR / agent_id / "conversations" / f"{_fs_encode(f'discord:{channel_id}')}.jsonl"
             if alt_discord.exists():
                 f = alt_discord
             else:
@@ -183,14 +192,15 @@ def _resolve_system_file_path(agent_id: str, file_name: str) -> Optional[Path]:
     doesn't have to wade through resolved-path comparisons to spot abuse.
     """
     # Reject obvious traversal attempts in the raw input — fast-fail before
-    # touching the filesystem.
-    if not file_name or ".." in file_name.split("/"):
+    # touching the filesystem. Backslash is a path separator on Windows (and
+    # never legitimate in a system-file name), so reject it outright.
+    if not file_name or "\\" in file_name or ".." in file_name.split("/"):
         return None
     if file_name.startswith("_shared/"):
         candidate = OPENFLIP_AGENTS_DIR / file_name
     else:
         # Don't allow agent_id with path separators either.
-        if "/" in agent_id or ".." in agent_id or not agent_id:
+        if "/" in agent_id or "\\" in agent_id or ".." in agent_id or not agent_id:
             return None
         candidate = OPENFLIP_AGENTS_DIR / agent_id / file_name
     try:

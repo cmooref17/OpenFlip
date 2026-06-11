@@ -140,7 +140,9 @@ async def _process_one(path: str) -> None:
     if not isinstance(sentinel, dict):
         print_ts(f"{COLOR_YELLOW}restart-sentinel: bad sentinel at {path}; renaming{COLOR_END}")
         try:
-            os.rename(path, path + ".bad")
+            # os.replace, not os.rename — rename fails on Windows when the
+            # .bad target already exists from an earlier pass.
+            os.replace(path, path + ".bad")
         except OSError:
             pass
         return
@@ -158,7 +160,7 @@ async def _process_one(path: str) -> None:
             error=True,
         )
         try:
-            os.rename(path, path + ".forged")
+            os.replace(path, path + ".forged")
         except OSError:
             pass
         return
@@ -259,9 +261,13 @@ async def _process_one(path: str) -> None:
                 # outer except keep running so the marker still gets
                 # deleted at end (one-shot semantics preserved).
                 raise RuntimeError("marker missing conversation_id")
-            conv_path = os.path.join(
-                project_root(), "agents", agent_id, "conversations",
-                f"{marker_conv_id}.jsonl",
+            # conversation_path handles the Windows filename encoding
+            # (":" → "%3A") and re-validates the id — never join the raw
+            # conversation_id into a filename here.
+            from ._conversation_io import conversation_path as _conv_path_for
+            conv_path = _conv_path_for(
+                os.path.join(project_root(), "agents", agent_id),
+                marker_conv_id,
             )
             # Find the most recent assistant message with a
             # restart_gateway tool_use to learn its tool_use_id.
@@ -375,10 +381,16 @@ async def _process_one(path: str) -> None:
         # unanswered. Skip the continuation in that case; the human's
         # next Discord message will wake the agent up naturally with
         # their original question still at the tail of the conversation.
-        conv_path = os.path.join(
-            project_root(), "agents", agent_id, "conversations",
-            f"{marker_conv_id}.jsonl",
-        )
+        # marker_conv_id can legitimately be "" here (no marker file / stale
+        # marker) — conversation_path fail-closes on empty ids, so keep "" as
+        # a never-exists path and let the os.path.exists guard below skip it.
+        conv_path = ""
+        if marker_conv_id:
+            from ._conversation_io import conversation_path as _conv_path_for2
+            conv_path = _conv_path_for2(
+                os.path.join(project_root(), "agents", agent_id),
+                marker_conv_id,
+            )
         skip_continuation = False
         try:
             if os.path.exists(conv_path):

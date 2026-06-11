@@ -62,9 +62,12 @@ def _is_within(child: str, parent: str) -> bool:
     Both paths are realpath'd before comparison so symlinks don't bypass the
     boundary. Uses an explicit separator check so an allowlist of `/foo` does
     NOT match `/foobar` — `startswith` alone is wrong for path containment.
+    normcase makes the comparison case-insensitive on Windows (where
+    C:\\Secret and c:\\SECRET are the same directory — without it a deny
+    list entry could be bypassed by changing case). Identity on POSIX.
     """
-    parent = os.path.realpath(parent)
-    child = os.path.realpath(child)
+    parent = os.path.normcase(os.path.realpath(parent))
+    child = os.path.normcase(os.path.realpath(child))
     return child == parent or child.startswith(parent + os.sep)
 
 
@@ -178,7 +181,8 @@ def _check_access(full_path: str, mode: str) -> str | None:
     Phase 3.1 (ISSUES.md SAFE-3): an EMPTY allow list is no longer treated
     as "no restriction" (fail-open). Empty write allow list now denies by
     default; empty read allow list falls back to a safe default (the agent
-    dir plus /tmp). Wildcards (`"*"`) still allow everything explicitly.
+    dir plus the system temp dir — /tmp on POSIX, %TEMP% on Windows).
+    Wildcards (`"*"`) still allow everything explicitly.
 
     Phase 3.2 (ISSUES.md SAFE-5): framework code paths are denied for
     WRITE regardless of agent allow lists — even `["*"]` does not override.
@@ -213,12 +217,12 @@ def _check_access(full_path: str, mode: str) -> str | None:
             # old fail-open but still lets a freshly-installed agent do
             # basic work without being completely blind.
             agent_dir = os.path.dirname(agent.path)
-            for fallback in (agent_dir, "/tmp"):
+            for fallback in (agent_dir, tempfile.gettempdir()):
                 if _is_within(full_path, fallback):
                     return None
             return (
                 f"Access denied: {safe_path_display(full_path)} (no allowed_read_paths "
-                f"configured; default read scope is agent dir + /tmp)"
+                f"configured; default read scope is agent dir + the system temp dir)"
             )
         return (
             f"Access denied: {safe_path_display(full_path)} (no allowed_write_paths configured; "
