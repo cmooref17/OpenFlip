@@ -1150,20 +1150,39 @@ Owner-only slash command. Backs up the live `.jsonl` to
 file and `pop` the in-memory conversation by restarting or by
 `/uncompact` (which pops the cache).
 
-`/reset` is reliable even mid-turn. A turn already in flight on the
-channel holds its own reference to the conversation object and re-saves
-it at end-of-turn; without a guard, that re-save would silently rewrite
-the history `/reset` just deleted (file deleted, then resurrected). The
-runner therefore keeps a per-conversation **reset-generation epoch**
-(`AgentRunner._conv_epochs`, keyed by conv_key). Each turn captures the
-epoch at start (`_turn_epoch` in `_run_turn`); `/reset` calls
-`bump_conv_epoch(conv_key)` before deleting anything. Every end-of-turn
-save routes through the `_save_conv()` helper, which skips the save when
-the epoch has changed — so the in-flight turn cannot resurrect the
-cleared history, and the next message starts genuinely fresh (the
-conversation was also popped from the live cache). The bump runs
-synchronously before any `await`, so no turn can resume between the bump
-and the delete. Epochs are per-channel and never cross conversations.
+`/reset` is reliable even mid-turn, and a reset fired while the agent is
+mid-response is clean: it first **hard-interrupts the in-flight turn and
+drops any queued turns** for the channel, then wipes. Three things have to
+be handled, and `/reset` does all of them synchronously (no `await`) before
+deleting anything, so nothing can resume in the gap:
+
+1. **The in-flight turn's end-of-turn save.** A turn already running holds
+   its own reference to the conversation object and re-saves it at
+   end-of-turn (including from its cancellation + `finally` cleanup paths);
+   without a guard that re-save would silently rewrite the history `/reset`
+   just deleted (file deleted, then resurrected). The runner keeps a
+   per-conversation **reset-generation epoch** (`AgentRunner._conv_epochs`,
+   keyed by conv_key). Each turn captures the epoch at start (`_turn_epoch`
+   in `_run_turn`); `/reset` calls `bump_conv_epoch(conv_key)` FIRST — before
+   the interrupt — so even the cancelled turn's teardown save no-ops. Every
+   end-of-turn save routes through the `_save_conv()` helper, which skips the
+   save when the epoch has changed.
+
+2. **The actively-generating turn itself.** `/reset` calls
+   `runner._hard_interrupt(conv_key)` — the same machinery `/stop` uses — so
+   the turn is cancelled and its reply + save abandoned instead of left
+   orphaned (silently dropped reply, no resurrection).
+
+3. **Queued-but-not-yet-dispatched turns.** Synthetic/cron turns (which
+   enqueue without the soft-inject guard) or a same-channel message that
+   raced the guard can sit in the inbound queue behind the active turn.
+   `runner._drop_queued_turns(conv_key)` removes exactly those — scoped to
+   this conversation key, re-queuing every other channel's turns untouched —
+   so a queued turn can't run against the just-wiped history.
+
+Then the conversation is popped from the live cache and the files deleted,
+so the next message starts genuinely fresh. Epochs, interrupts, and the
+queue drain are all per-conversation and never cross conversations.
 
 ## /compact and /uncompact (Anthropic only)
 
