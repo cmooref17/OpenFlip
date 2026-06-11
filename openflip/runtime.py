@@ -750,11 +750,18 @@ class AgentRunner:
                         if _ret_channel:
                             _err_preview = str(e)[:200].replace("\n", " ")
                             _framed = f"{self.agent.id}: [CHAIN_ERROR] {_err_preview}"
+                            # Failure surfacing follows the chain root: a
+                            # human-awaited chain may surface the error in the
+                            # originator's channel; an agent-rooted chain
+                            # (cron/heartbeat/kairos/silent_agent_chain) logs
+                            # loudly but stays off human channels — same rule
+                            # as the success-path auto-route (2026-06 leak fix).
+                            _ce_visible = (_orig_vis or "") in ("", "operator_channel")
                             _ce_task = asyncio.create_task(_orig.run_synthetic_turn(
                                 _ret_channel,
                                 _framed,
-                                auto_post_final_text=True,
-                                silent=False,
+                                auto_post_final_text=_ce_visible,
+                                silent=not _ce_visible,
                                 depth=_depth + 1,
                                 originator_agent_id="",
                                 chain_id=_chain_id,
@@ -1130,6 +1137,7 @@ class AgentRunner:
         speaker_handle: str = "",
         originator_visibility: str = "",
         originator_channel_id: int = 0,
+        originator_session: Optional[Session] = None,
         force_tool_choice: dict | None = None,
     ) -> None:
         """Fire a turn for this agent without an inbound Discord message.
@@ -1151,6 +1159,12 @@ class AgentRunner:
         through this so inter-agent dispatches don't silently spoof the human
         as the speaker on every chain regardless of who triggered it.
         When 0, falls back to owner_id (cron / heartbeat / restart paths).
+
+        `originator_session` (when set) is the CALLER's Session on an
+        inter-agent dispatch. The auto-route block prefers it over
+        `originator_channel_id` for the reply return whenever the bare int
+        can't faithfully name the caller's conversation (internal peer
+        sessions, identity-linked conversations, handle-keyed iMessage 1:1s).
 
         `originator_visibility` tags the kind of channel ultimately awaiting
         a visible result from this chain. Values:
@@ -1234,6 +1248,11 @@ class AgentRunner:
             "auto_route_from_peer": auto_route_from_peer or "",
             "originator_visibility": originator_visibility or "",
             "originator_channel_id": int(originator_channel_id or 0),
+            # The CALLER's Session on inter-agent dispatches (talk_to_agent
+            # threads it). Used by the auto-route block to return the reply
+            # into the caller's own conversation when it has no routable bare
+            # channel id (internal peer / linked / handle-keyed sessions).
+            "originator_session": originator_session,
             "force_tool_choice": force_tool_choice,
         })
 
@@ -1456,6 +1475,7 @@ class AgentRunner:
         auto_route_from_peer: str = "",
         originator_visibility: str = "",
         originator_channel_id: int = 0,
+        originator_session: Optional[Session] = None,
         force_tool_choice: dict | None = None,
     ) -> None:
         """Shared agent loop — calls the model, runs tools, feeds results back,
@@ -1476,6 +1496,16 @@ class AgentRunner:
         # reads this flag only to inject a [returning from peer] context
         # extension so the model knows what the previous tool result was.
         is_chain_terminator = bool(auto_route_from_peer) and not originator_agent_id
+
+        # Chain-root classification for this turn. True when a human in a real
+        # channel is ultimately awaiting the outcome of the chain this turn
+        # belongs to ("" is the conservative legacy default — treat as
+        # operator-rooted). Used ONLY for failure surfacing (CHAIN_ERROR /
+        # empty-chain escalation) and for the chain-terminator prompt
+        # extension — NOT for auto-posting inter-agent replies: those are
+        # silent regardless of root (2026-06 leak fix; explicit send_message
+        # is the only way agent-to-agent traffic reaches a human channel).
+        _chain_root_operator = (originator_visibility or "") in ("", "operator_channel")
 
         # Tracks whether a HUMAN soft-inject was drained during this turn.
         # Set True in the three soft-inject drain blocks below. Used to gate
@@ -1652,6 +1682,7 @@ class AgentRunner:
             channel_id=channel.id,
             owner=owner,
             chain_terminator_mode=is_chain_terminator,
+            chain_root_operator=_chain_root_operator,
             handle=_acl_handle,
             tool_grants=_acl_tool_grants,
         )
@@ -3022,98 +3053,129 @@ class AgentRunner:
                                     f"{COLOR_RED}{log_tag}Failed to post inter-agent reply: {_post_err}{COLOR_END}",
                                     error=True, agent=agent.id,
                                 )
-                        # Resolve a channel the ORIGINATOR can actually
-                        # reach. The recipient's channel (channel.id) is
-                        # often not accessible to the originator's bot
-                        # (each bot has its own DMs). Without resolving,
-                        # the originator's run_synthetic_turn 403s and
-                        # the auto-route reply is lost. Priority: try
-                        # originator's DM with the human speaker (the
-                        # one whose user_id is in CURRENT_SPEAKER_ID).
-                        return_channel_id = 0
-                        # Transport-aware return-channel resolution:
-                        # - Discord originator: fetch_user → DM channel id
-                        #   (each bot has its own DM ids; recipient's channel
-                        #   often isn't accessible to originator).
-                        # - Non-Discord originator (iMessage, internal): the
-                        #   threaded originator_channel_id IS the caller's
-                        #   own session id (e.g. iMessage chat_id). Use it
-                        #   directly — originator.transport.send routes by
-                        #   that id natively, no DM resolution needed.
-                        _originator_channel_id = int(originator_channel_id or 0)
-                        # PRIORITY 1 (transport-native, every transport): the
-                        # threaded originator_channel_id is the originator's OWN
-                        # session id (iMessage chat_id / Discord channel /
-                        # internal). run_synthetic_turn routes by it natively, no
-                        # DM resolution. MUST come first — gating on
-                        # hasattr(originator,"bot") wrongly sent multi-transport
-                        # (Discord+iMessage) originators down the Discord path,
-                        # where fetch_user(imessage_hashed_speaker_id) 404s
-                        # (Unknown User 10013) and the reply was lost on iMessage.
-                        if _originator_channel_id:
-                            return_channel_id = _originator_channel_id
-                        # PRIORITY 2 (legacy fallback): no threaded channel id —
-                        # resolve the originator's Discord DM via the human
-                        # speaker. Only reached for Discord originators that
-                        # didn't thread a channel id.
-                        elif hasattr(originator, "bot"):
-                            try:
-                                sp_id = int(speaker_id or 0)
-                                if sp_id:
-                                    user = await asyncio.wait_for(
-                                        originator.bot.fetch_user(sp_id), timeout=10.0,
-                                    )
-                                    if user is not None:
-                                        dm = user.dm_channel or await asyncio.wait_for(
-                                            user.create_dm(), timeout=10.0,
+                        # Resolve where the ORIGINATOR's chain-terminator turn
+                        # runs — its own conversation, the one the dispatch to
+                        # us happened from.
+                        #
+                        # PRIORITY 0: the caller's threaded Session, whenever
+                        # the bare int can't faithfully name the caller's
+                        # conversation — non-numeric transport_id (internal
+                        # peer sessions, the talk_to_agent default since
+                        # 2026-06) or a conversation_id that diverges from
+                        # "<transport>:<transport_id>" (identity-linked
+                        # conversations, iMessage handle-keyed 1:1s — the int
+                        # path would fork their history onto a new key, or
+                        # abandon the turn entirely for internal sessions).
+                        # Plain Discord channels skip this and keep the int
+                        # path unchanged.
+                        _return_target: object = None
+                        if originator_session is not None:
+                            _os_tid = str(getattr(originator_session, "transport_id", "") or "")
+                            _os_conv = getattr(originator_session, "conversation_id", "") or ""
+                            _os_native = f"{getattr(originator_session, 'transport', '')}:{_os_tid}"
+                            if not _os_tid.isdigit() or (_os_conv and _os_conv != _os_native):
+                                _return_target = originator_session
+                        if _return_target is None:
+                            return_channel_id = 0
+                            # Transport-aware bare-id resolution:
+                            # - Discord originator: fetch_user → DM channel id
+                            #   (each bot has its own DM ids; recipient's channel
+                            #   often isn't accessible to originator).
+                            # - Non-Discord originator (iMessage, internal): the
+                            #   threaded originator_channel_id IS the caller's
+                            #   own session id (e.g. iMessage chat_id). Use it
+                            #   directly — originator.transport.send routes by
+                            #   that id natively, no DM resolution needed.
+                            _originator_channel_id = int(originator_channel_id or 0)
+                            # PRIORITY 1 (transport-native, every transport): the
+                            # threaded originator_channel_id is the originator's OWN
+                            # session id (iMessage chat_id / Discord channel /
+                            # internal). run_synthetic_turn routes by it natively, no
+                            # DM resolution. MUST come first — gating on
+                            # hasattr(originator,"bot") wrongly sent multi-transport
+                            # (Discord+iMessage) originators down the Discord path,
+                            # where fetch_user(imessage_hashed_speaker_id) 404s
+                            # (Unknown User 10013) and the reply was lost on iMessage.
+                            if _originator_channel_id:
+                                return_channel_id = _originator_channel_id
+                            # PRIORITY 2 (legacy fallback): no threaded channel id —
+                            # resolve the originator's Discord DM via the human
+                            # speaker. Only reached for Discord originators that
+                            # didn't thread a channel id.
+                            elif hasattr(originator, "bot"):
+                                try:
+                                    sp_id = int(speaker_id or 0)
+                                    if sp_id:
+                                        user = await asyncio.wait_for(
+                                            originator.bot.fetch_user(sp_id), timeout=10.0,
                                         )
-                                        if dm is not None:
-                                            return_channel_id = int(dm.id)
-                            except asyncio.TimeoutError:
-                                print_ts(
-                                    f"{COLOR_RED}inter-agent auto-route: "
-                                    f"timed out resolving {originator_agent_id}'s DM "
-                                    f"with speaker {speaker_id}; skipping post{COLOR_END}",
-                                    error=True, agent=agent.id,
-                                )
-                            except Exception as _resolve_err:
-                                print_ts(
-                                    f"{COLOR_YELLOW}inter-agent auto-route: "
-                                    f"couldn't resolve {originator_agent_id}'s DM "
-                                    f"with speaker {speaker_id}: {_resolve_err}{COLOR_END}",
-                                    agent=agent.id,
-                                )
-                        if not return_channel_id:
-                            # Last-resort: try the channel where this turn
-                            # was processing. Likely unreachable, but at
-                            # least we'll surface the 403 in logs instead
-                            # of silently dropping the reply.
-                            return_channel_id = int(channel.id)
+                                        if user is not None:
+                                            dm = user.dm_channel or await asyncio.wait_for(
+                                                user.create_dm(), timeout=10.0,
+                                            )
+                                            if dm is not None:
+                                                return_channel_id = int(dm.id)
+                                except asyncio.TimeoutError:
+                                    print_ts(
+                                        f"{COLOR_RED}inter-agent auto-route: "
+                                        f"timed out resolving {originator_agent_id}'s DM "
+                                        f"with speaker {speaker_id}; skipping post{COLOR_END}",
+                                        error=True, agent=agent.id,
+                                    )
+                                except Exception as _resolve_err:
+                                    print_ts(
+                                        f"{COLOR_YELLOW}inter-agent auto-route: "
+                                        f"couldn't resolve {originator_agent_id}'s DM "
+                                        f"with speaker {speaker_id}: {_resolve_err}{COLOR_END}",
+                                        agent=agent.id,
+                                    )
+                            if not return_channel_id:
+                                # Last-resort: try the channel where this turn
+                                # was processing. Likely unreachable, but at
+                                # least we'll surface the failure in logs instead
+                                # of silently dropping the reply.
+                                return_channel_id = int(channel.id)
+                            _return_target = return_channel_id
+                        _return_label = (
+                            _return_target.conversation_id
+                            if isinstance(_return_target, Session)
+                            else f"channel {_return_target}"
+                        )
                         print_ts(
                             f"inter-agent reply routed: {agent.id} -> "
                             f"{originator_agent_id} (depth {depth} -> {depth + 1}) "
-                            f"via channel {return_channel_id}",
+                            f"via {_return_label} (silent)",
                             agent=agent.id,
                         )
                         try:
                             _ar_task = asyncio.create_task(
                                 originator.run_synthetic_turn(
-                                    return_channel_id,
+                                    _return_target,
                                     framed_reply,
-                                    # ARCHITECTURE FIX 2026-05-19:
-                                    # Chain-terminator turns now behave
-                                    # like normal turns — plain text posts
-                                    # to the operator's DM, full toolset
-                                    # available. This eliminates the
-                                    # silent-failure bug class that came
-                                    # from asking the model to "produce
-                                    # output that gets discarded." See
-                                    # chain_terminator_architecture design
-                                    # doc (Option 4). Visibility tradeoff:
-                                    # operator now sees the originator's
-                                    # summary of inter-agent exchanges.
-                                    auto_post_final_text=True,
-                                    silent=False,
+                                    # LEAK FIX 2026-06-11: chain-terminator
+                                    # turns run SILENT. The 2026-05-19
+                                    # "Option 4" design dispatched them
+                                    # visible (auto_post=True) into the
+                                    # caller's originating channel, so every
+                                    # reply hop of an inter-agent exchange
+                                    # posted into whatever channel the caller
+                                    # was in — repeatedly dumping agent
+                                    # banter into the operator's DM, and
+                                    # contradicting the TOOLS.md contract
+                                    # ("talk_to_agent traffic runs silent
+                                    # end-to-end; send_message is the only
+                                    # human surface"). The originator still
+                                    # gets the reply as a full-toolset turn
+                                    # in its own conversation: it can
+                                    # continue the chain (talk_to_agent),
+                                    # deliver an answer a human is waiting
+                                    # on (send_message — the chain-terminator
+                                    # prompt extension spells this out when
+                                    # the chain root is operator-awaiting),
+                                    # or end with plain text, which is saved
+                                    # to history but posted nowhere.
+                                    auto_post_final_text=False,
+                                    silent=True,
                                     depth=depth + 1,
                                     # Don't propagate originator_agent_id —
                                     # the originator's turn ends the auto-
@@ -3182,21 +3244,31 @@ class AgentRunner:
                                 except Exception as e:
                                     print_ts(f"{COLOR_RED}{log_tag}Failed to post message: {e}{COLOR_END}", error=True, agent=agent.id)
                 elif silent:
-                    # Defense-in-depth assertion: this branch should be
-                    # unreachable now that chain-terminator turns force
-                    # tool_choice=any with a narrowed surface (talk_to_agent /
-                    # send_message / end_chain). If it fires, something slipped
-                    # past the forcing — log loudly so we can diagnose.
-                    # Ollama provider falls through here legitimately (no
-                    # tool_choice support) — that's expected and documented.
-                    _prov_tag = agent.provider or "ollama"
-                    print_ts(
-                        f"{COLOR_RED}ASSERTION: silent synthetic turn with no originator "
-                        f"reached plain-text drop branch (provider={_prov_tag}). "
-                        f"Chain-terminator forcing did not prevent plain-text reply. "
-                        f"Lost text preview: {(final_text or '')[:120].replace(chr(10),' ')!r}{COLOR_END}",
-                        agent=agent.id, error=True,
-                    )
+                    if is_chain_terminator:
+                        # Expected end-state since the 2026-06 leak fix:
+                        # chain-terminator turns run silent, so a plain-text
+                        # ending simply closes the chain — the text is saved
+                        # to history (dashboard-visible) but posts nowhere.
+                        # Explicit send_message is the only human surface.
+                        print_ts(
+                            f"{COLOR_YELLOW}chain ended silently (root="
+                            f"{originator_visibility or 'operator_channel'}): final text saved to "
+                            f"history, not posted. Preview: "
+                            f"{(final_text or '')[:120].replace(chr(10), ' ')!r}{COLOR_END}",
+                            agent=agent.id,
+                        )
+                    else:
+                        # Non-chain silent turn (cron/heartbeat/kairos) ended in
+                        # plain text — deliberate drop, but log loudly: the model
+                        # produced output nobody will see; send_message is the
+                        # intended surface for synthetic-turn output.
+                        _prov_tag = agent.provider or "ollama"
+                        print_ts(
+                            f"{COLOR_RED}silent synthetic turn with no originator "
+                            f"reached plain-text drop branch (provider={_prov_tag}). "
+                            f"Lost text preview: {(final_text or '')[:120].replace(chr(10),' ')!r}{COLOR_END}",
+                            agent=agent.id, error=True,
+                        )
                 elif auto_post_final_text and not (media_only and any_attachments_this_turn
                                                    and not _human_softinject_drained_this_turn):
                     try:
@@ -3251,9 +3323,26 @@ class AgentRunner:
             # a bogus "⚠️ Turn ended without a visible reply" warning, which
             # is exactly the channel noise the sentinel exists to avoid.
             _intentionally_silent = silent or not auto_post_final_text or _chose_silence
+            # DEAD operator-rooted chain exception: chain-terminator turns are
+            # dispatched silent since the 2026-06 leak fix, which would also
+            # silence this contract — but a chain a human is awaiting may not
+            # DIE silently ("operator_channel — empty/dead chains MUST surface
+            # a hard-failure message"). Only a truly dead turn (no text, no
+            # tool calls, after the in-loop retries) re-arms the contract; a
+            # terminator that ends with plain text made a choice (saved to
+            # history, visible in the dashboard) and stays quiet.
+            _terminator_dead = False
+            if is_chain_terminator and _chain_root_operator and not _chose_silence:
+                if last_ai_message is None:
+                    _terminator_dead = True
+                else:
+                    _td_calls = getattr(last_ai_message, "tool_calls", None) or []
+                    _td_text = (getattr(last_ai_message, "content_text", None) or
+                                getattr(last_ai_message, "content", "") or "").strip()
+                    _terminator_dead = not _td_text and not _td_calls
             _media_satisfied = (media_only and any_attachments_this_turn)
             _reply_via_tool = reply_equivalent_tool_fired
-            if (not _intentionally_silent
+            if ((not _intentionally_silent or _terminator_dead)
                     and not _media_satisfied
                     and not _reply_via_tool
                     and not _posted_assistant_text):
