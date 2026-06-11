@@ -194,6 +194,17 @@ class AgentRunner:
         # transport-native int id (slash commands, tools holding
         # CURRENT_CHANNEL_ID) can resolve the shared key via conv_key().
         self._linked_channel_keys: dict[int, str] = {}
+        # Reset/invalidation generation guard. Each conversation key carries a
+        # monotonic epoch (default 0). A turn captures the epoch when it begins
+        # (`_turn_epoch` in _run_turn); any history-invalidating op (currently
+        # /reset, via bump_conv_epoch) increments it. The end-of-turn save is
+        # skipped when the captured epoch no longer matches the current one —
+        # so a turn that was already mid-flight when /reset fired cannot
+        # resurrect the just-deleted history by re-appending its now-stale
+        # in-memory messages. Keyed by conv_key (int channel id, or
+        # "linked:<canonical>") — never crosses channels. Grows by one int per
+        # channel that's ever been reset; negligible.
+        self._conv_epochs: dict[int | str, int] = {}
         # Timestamp (ms since epoch) of the most recent INBOUND human
         # Discord message this agent received. Used by restart_gateway's
         # preflight to refuse restarting if a human just spoke in any
@@ -308,6 +319,22 @@ class AgentRunner:
         if isinstance(channel_id, str):
             return channel_id
         return self._linked_channel_keys.get(int(channel_id or 0), channel_id)
+
+    def conv_epoch(self, key: int | str) -> int:
+        """Current reset-generation epoch for a conversation key (0 if never
+        reset). See self._conv_epochs."""
+        return self._conv_epochs.get(key, 0)
+
+    def bump_conv_epoch(self, key: int | str) -> int:
+        """Invalidate any in-flight turn's pending save for this conversation.
+
+        Called by /reset (and any future history-invalidating op). After this,
+        a turn that captured the prior epoch will skip its end-of-turn save, so
+        it cannot re-write the history we just cleared. Returns the new epoch.
+        """
+        e = self._conv_epochs.get(key, 0) + 1
+        self._conv_epochs[key] = e
+        return e
 
     def _turn_key(self, channel, inbound=None, speaker_id: int = 0) -> int | str:
         """Conversation key for a queued turn (worker / handlers).
@@ -1714,6 +1741,33 @@ class AgentRunner:
             _conv_id if _conv_id.startswith("linked:")
             else int(getattr(channel, "id", 0) or 0)
         )
+        # Capture the conversation's reset-generation epoch at turn start. If
+        # /reset fires mid-turn it bumps this key's epoch (and deletes the
+        # on-disk history); _save_conv() below then skips our save so we don't
+        # resurrect the cleared history from this turn's stale in-memory copy.
+        _turn_epoch = self.conv_epoch(_conv_key)
+
+        def _save_conv(stage: str):
+            """Persist the conversation, unless it was reset out from under us.
+
+            All end-of-turn save() sites route through here so the epoch guard
+            is enforced in exactly one place. A no-op (with a log line) when the
+            conversation's epoch changed since this turn began — i.e. /reset ran
+            mid-turn. Best-effort: a save() failure is logged, never raised."""
+            if self.conv_epoch(_conv_key) != _turn_epoch:
+                print_ts(
+                    f"{log_tag}{stage}: skipping conv.save — conversation was reset "
+                    f"mid-turn (epoch changed); not resurrecting cleared history",
+                    agent=agent.id,
+                )
+                return
+            try:
+                conv.save()
+            except Exception as _err:
+                print_ts(
+                    f"{COLOR_RED}{log_tag}{stage}: conv.save failed: {_err}{COLOR_END}",
+                    error=True, agent=agent.id,
+                )
         # Derive `talking_with` so the openflip dashboard can render
         # who's-talking-to-whom. originator_agent_id (forward inter-agent
         # turn) or auto_route_from_peer (chain-terminator return turn)
@@ -2676,13 +2730,7 @@ class AgentRunner:
                     f"{COLOR_RED}{log_tag}cleanup: _restore_system failed: {_err}{COLOR_END}",
                     error=True, agent=agent.id,
                 )
-            try:
-                conv.save()
-            except Exception as _err:
-                print_ts(
-                    f"{COLOR_RED}{log_tag}cleanup: conv.save failed: {_err}{COLOR_END}",
-                    error=True, agent=agent.id,
-                )
+            _save_conv("cleanup")
             try:
                 _agent_state.on_turn_end(agent.id)
             except Exception:
@@ -2702,7 +2750,7 @@ class AgentRunner:
             except Exception:
                 pass
             await _restore_system()
-            conv.save()
+            _save_conv("timeout")
             try:
                 _agent_state.on_turn_end(agent.id)
             except Exception:
@@ -2736,7 +2784,7 @@ class AgentRunner:
             except Exception:
                 pass
             await _restore_system()
-            conv.save()
+            _save_conv("malformed")
             try:
                 _agent_state.on_turn_end(agent.id)
             except Exception:
@@ -2769,7 +2817,7 @@ class AgentRunner:
             except Exception:
                 pass
             await _restore_system()
-            conv.save()
+            _save_conv("error")
             try:
                 _agent_state.on_turn_end(agent.id)
             except Exception:
@@ -2828,13 +2876,7 @@ class AgentRunner:
             # finally-save closes that gap. Idempotent: if an except
             # handler already called save(), _persisted_count ==
             # len(non_system) so new_count <= 0 → immediate no-op.
-            try:
-                conv.save()
-            except Exception as _save_err:
-                print_ts(
-                    f"{COLOR_RED}{log_tag}finally: conv.save failed: {_save_err}{COLOR_END}",
-                    error=True, agent=agent.id,
-                )
+            _save_conv("finally")
 
         # Post-loop cleanup. Each step is independently guarded against
         # a secondary CancelledError so a cancel landing mid-cleanup can't
@@ -2883,10 +2925,7 @@ class AgentRunner:
             await _restore_system()
         except Exception as _err:
             print_ts(f"{COLOR_RED}{log_tag}cleanup: _restore_system failed: {_err}{COLOR_END}", error=True, agent=agent.id)
-        try:
-            conv.save()
-        except Exception as _err:
-            print_ts(f"{COLOR_RED}{log_tag}cleanup: conv.save failed: {_err}{COLOR_END}", error=True, agent=agent.id)
+        _save_conv("post-loop")
         # Kairos idle-tick pruning: if this was a kairos proactive turn
         # and the agent did nothing (no tool calls at all), prune the
         # tick user message + empty assistant response from the in-memory

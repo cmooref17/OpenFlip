@@ -1131,6 +1131,16 @@ The runtime appends new messages each turn (no full-file rewrites).
 History stays full on disk even as the in-memory list trims defensively
 for context-window protection.
 
+**In-flight-save model.** Saves happen at end-of-turn: `_run_turn`'s
+cleanup/except/finally paths call `_save_conv()`, which appends only the
+messages added since the last save (`save()` tracks `_persisted_count`
+and appends `non_system[-new_count:]`). The turn holds its own reference
+to the conversation object for the whole turn, so a save fired after a
+mid-turn `/reset` would otherwise re-append the stale in-memory messages
+and resurrect the deleted history. The reset-generation epoch guard (see
+`/reset` below) is the single chokepoint that prevents this: `_save_conv()`
+no-ops when the conversation's epoch changed since the turn began.
+
 ## /reset
 
 Owner-only slash command. Backs up the live `.jsonl` to
@@ -1140,13 +1150,48 @@ Owner-only slash command. Backs up the live `.jsonl` to
 file and `pop` the in-memory conversation by restarting or by
 `/uncompact` (which pops the cache).
 
+`/reset` is reliable even mid-turn. A turn already in flight on the
+channel holds its own reference to the conversation object and re-saves
+it at end-of-turn; without a guard, that re-save would silently rewrite
+the history `/reset` just deleted (file deleted, then resurrected). The
+runner therefore keeps a per-conversation **reset-generation epoch**
+(`AgentRunner._conv_epochs`, keyed by conv_key). Each turn captures the
+epoch at start (`_turn_epoch` in `_run_turn`); `/reset` calls
+`bump_conv_epoch(conv_key)` before deleting anything. Every end-of-turn
+save routes through the `_save_conv()` helper, which skips the save when
+the epoch has changed — so the in-flight turn cannot resurrect the
+cleared history, and the next message starts genuinely fresh (the
+conversation was also popped from the live cache). The bump runs
+synchronously before any `await`, so no turn can resume between the bump
+and the delete. Epochs are per-channel and never cross conversations.
+
 ## /compact and /uncompact (Anthropic only)
 
-`/compact` sets `conv.force_compact_next = True` and fires a synthetic
+`/compact` sets `conv.force_compact_next = True` **and**
+`conv.force_compact_trigger_override = True`, then fires a synthetic
 turn so Anthropic emits a fresh compaction block on the next request.
 On success: `compaction_block` lands in `.meta.json`, the live `.jsonl`
 is archived to `.compaction_<ts>.bak.jsonl`, and the live `.jsonl` is
 rewritten with only the post-compaction tail.
+
+The trigger override matters: the outgoing request carries a
+`context_management` compaction edit whose `trigger.value` tells
+Anthropic the input-token threshold above which it should compact. Auto
+-compaction (the threshold gate in `chat_stream`) and the retry-trim
+follow-up leave `force_compact_trigger_override` False and send the real
+per-model trigger from `get_compaction_trigger(...)` (e.g. 980k on a
+1m-context agent) — they only want compaction once input actually
+exceeds that. A **manual** `/compact` sets the override so the request
+sends the low `_MANUAL_COMPACT_TRIGGER` (50k — Anthropic's documented
+floor; smaller values 400) instead, making Anthropic compact regardless
+of current input size. (Historically the override was never wired: the
+body always sent the real trigger, so a manual `/compact` on a
+sub-threshold conversation was a silent no-op. Fixed — the override now
+selects the low trigger at the single body-build site in `chat_stream`,
+and is consumed alongside `force_compact_next` after the request.)
+Anthropic cannot compact a conversation whose input is below the 50k
+floor, so manual `/compact` on a tiny conversation is a genuine
+server-side no-op, not a framework bug.
 
 `/uncompact` finds the most recent `.compaction_<ts>.bak.jsonl`, copies
 the current live state to `.pre_uncompact_<ts>.bak.jsonl` (in case the
