@@ -1645,7 +1645,18 @@ class AnthropicConversation:
                     f"tool_use was returned."
                 )
             else:
-                msg = "⚠️ Empty reply: no content blocks and no stop_reason."
+                # No content, no tool_use, AND no stop_reason — a transient
+                # API glitch, not a model decision. Return the plain empty
+                # response so runtime.py's empty-reply nudge-and-retry path
+                # handles it (one-shot per turn). Returning a framework
+                # error here short-circuits that path and posts the warning
+                # straight to Discord — the 2026-06-10 regression.
+                print_ts(
+                    f"{COLOR_YELLOW}empty reply with no stop_reason — "
+                    f"deferring to runtime nudge-and-retry{COLOR_END}",
+                    agent=self.agent.id,
+                )
+                return response
             print_ts(
                 f"{COLOR_RED}{msg}{COLOR_END}",
                 agent=self.agent.id, error=True,
