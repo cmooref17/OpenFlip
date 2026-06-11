@@ -93,28 +93,34 @@ async def handle_text_command(
     arg = parts[1].strip() if len(parts) > 1 else ""
 
     ch_id = int(getattr(channel, "id", 0) or 0)
+    # Conversation key for the dicts (conversations/_pending_inject): the
+    # native int unless the session is identity-linked, in which case the
+    # shared "linked:<canonical>" key. ch_id itself stays native — it backs
+    # reply routing (CURRENT_CHANNEL_ID in /restart) and channel-scoped ACL
+    # checks (/help), which must never follow the link.
+    conv_key = runner.conv_key_for_session(session, ch_id) if session is not None else runner.conv_key(ch_id)
 
     # Transport-aware owner identity for the gated commands below.
     tname = getattr(session, "transport", "discord") or "discord"
     handle = getattr(session, "handle", "") or ""
 
     if head == "/reset":
-        await _do_reset(runner, ch_id, channel, transport, session_id)
+        await _do_reset(runner, conv_key, channel, transport, session_id)
         return True
 
     if head == "/compact":
-        await _do_compact(runner, ch_id, channel, transport, session_id)
+        await _do_compact(runner, conv_key, channel, transport, session_id)
         return True
 
     if head == "/uncompact":
         if not is_owner(speaker_id, transport=tname, handle=handle):
             await _send(transport, session_id, channel, "Owner only.")
             return True
-        await _do_uncompact(runner, ch_id, channel, transport, session_id)
+        await _do_uncompact(runner, conv_key, channel, transport, session_id)
         return True
 
     if head == "/status":
-        await _do_status(runner, ch_id, channel, transport, session_id)
+        await _do_status(runner, conv_key, channel, transport, session_id)
         return True
 
     if head == "/reload":
@@ -152,8 +158,14 @@ def _conversation_id_for_channel(channel: Any, ch_id: int) -> str:
     fall back to assuming "discord:" — that breaks iMessage and any other
     non-Discord transport (a real bug I shipped on first cut).
     """
+    # Linked conversations: the dict key IS the conversation id
+    # ("linked:<canonical>") — no session lookup needed.
+    if isinstance(ch_id, str) and ch_id.startswith("linked:"):
+        return ch_id
     try:
-        sess = getattr(channel, "session", None)
+        # TransportChannel/_SessionChannel expose `_session`; accept a plain
+        # `session` attribute too for any future channel-likes.
+        sess = getattr(channel, "session", None) or getattr(channel, "_session", None)
         if sess is not None:
             cid = getattr(sess, "conversation_id", None)
             if cid:
@@ -288,7 +300,7 @@ async def _do_status(runner, ch_id, channel, transport, session_id) -> None:
     if usage:
         total = usage["total_input"]
         lines.append(f"• Context: {total:,} / {window:,}")
-        if agent.provider == "anthropic":
+        if agent.provider in ("anthropic", "openai"):
             lines.append(
                 f"• Cache: read {usage['cache_read_input_tokens']:,} • "
                 f"create {usage['cache_creation_input_tokens']:,}"

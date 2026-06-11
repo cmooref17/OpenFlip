@@ -84,8 +84,35 @@ def _is_claude_model(model: str) -> bool:
     )
 
 
+def _openai_models() -> list[str]:
+    """OpenAI model names from config.json's `models` block (provider ==
+    "openai"). Same single-source-of-truth pattern as _claude_models. No
+    fallback list — an operator who hasn't configured any openai models
+    gets none in the picker (the provider needs an API key configured
+    anyway)."""
+    try:
+        from .config_global import get_config
+        models = (get_config() or {}).get("models", {}) or {}
+        return [
+            name for name, meta in models.items()
+            if (meta or {}).get("provider") == "openai"
+        ]
+    except Exception:
+        return []
+
+
+def _is_openai_model(model: str) -> bool:
+    """Return True only for explicitly-prefixed `openai/...` names. A bare
+    "gpt-" prefix is deliberately NOT enough — ollama hosts models named
+    gpt-oss etc., and mis-inferring openai there would silently flip the
+    agent's provider."""
+    return model.startswith("openai/")
+
+
 def _provider_for_model(model: str) -> str:
     """Infer the provider from a model name."""
+    if _is_openai_model(model):
+        return "openai"
     return "anthropic" if _is_claude_model(model) else "ollama"
 
 
@@ -105,11 +132,13 @@ async def _fetch_ollama_models() -> list[str]:
 
 
 async def _fetch_all_models() -> list[str]:
-    """Fetch Ollama models and append Anthropic Claude models."""
+    """Fetch Ollama models and append Anthropic + OpenAI API models."""
     ollama = await _fetch_ollama_models()
-    # Add Claude models with a prefix to distinguish them in the picker
+    # Prefix API-provider models to distinguish them in the picker (the
+    # prefix also drives _provider_for_model on selection).
     claude = [f"anthropic/{m}" for m in _claude_models()]
-    return ollama + claude
+    openai = [f"openai/{m}" for m in _openai_models()]
+    return ollama + claude + openai
 
 
 def _runner_for(agent_id: str):
@@ -217,15 +246,22 @@ class _ModelPicker(nextcord.ui.StringSelect):
         choices: list[str] = list(model_list)
         if current and current not in choices:
             choices.insert(0, current)
-        # Keep `current` at the front, then never let Claude get sliced off.
+        # Keep `current` at the front, then never let the API-provider
+        # models (Claude/OpenAI) get sliced off — Ollama fills what's left.
         head = [current] if current else []
-        claude = [c for c in choices if _is_claude_model(c) and c not in head]
-        ollama = [c for c in choices if not _is_claude_model(c) and c not in head]
-        choices = (head + claude + ollama)[:25]
+        api_models = [c for c in choices
+                      if (_is_claude_model(c) or _is_openai_model(c)) and c not in head]
+        ollama = [c for c in choices
+                  if not (_is_claude_model(c) or _is_openai_model(c)) and c not in head]
+        choices = (head + api_models + ollama)[:25]
         opts = []
         for name in choices:
-            is_claude = _is_claude_model(name)
-            desc = "Anthropic (Max subscription)" if is_claude else "Ollama"
+            if _is_claude_model(name):
+                desc = "Anthropic (Max subscription)"
+            elif _is_openai_model(name):
+                desc = "OpenAI (API key)"
+            else:
+                desc = "Ollama"
             opts.append(nextcord.SelectOption(
                 label=_truncate(name, 100), value=name,
                 description=desc,

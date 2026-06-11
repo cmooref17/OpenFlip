@@ -267,9 +267,15 @@ class ContentBlockStopEvent:
 @dataclass(frozen=True)
 class MessageDeltaEvent:
     """Final stop_reason + usage update. Arrives AFTER all
-    ContentBlockStopEvents. Consumer updates last_usage here."""
+    ContentBlockStopEvents. Consumer updates last_usage here.
+
+    stop_details carries the structured reason when stop_reason is
+    "refusal" (category + explanation) — the API populates it on a
+    policy/ToS decline, which otherwise produces zero content blocks
+    and looks like a silent blank reply. Default None for normal stops."""
     stop_reason: str | None
     usage: dict
+    stop_details: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -490,8 +496,11 @@ async def _yield_for_sse_event(
     if event == "message_delta":
         delta = data.get("delta") or {}
         stop_reason = delta.get("stop_reason")
+        stop_details = delta.get("stop_details")  # populated on refusal: {type, category, explanation}
         usage = dict(data.get("usage") or {})
-        yield MessageDeltaEvent(stop_reason=stop_reason, usage=usage)
+        yield MessageDeltaEvent(
+            stop_reason=stop_reason, usage=usage, stop_details=stop_details
+        )
         return
 
     if event == "message_stop":

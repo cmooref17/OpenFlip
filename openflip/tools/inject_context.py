@@ -156,8 +156,19 @@ async def inject_context(agent_id: str, channel_id: int = 0, text: str = "", ses
         # conversation (loads from disk on demand) keyed by the bare int — for
         # Discord/internal/imessage-group this int matches TransportChannel.id.
         if target_runner is not None:
-            was_loaded = ch_id in target_runner.conversations
-            live_conv = target_runner.get_conversation(ch_id, conv_id)
+            # Identity links: if the runner knows this channel id belongs to a
+            # linked conversation, inject into THAT shared key/file instead of
+            # a parallel "<transport>:<id>" file the linked conversation never
+            # reads.
+            _key = ch_id
+            if hasattr(target_runner, "conv_key"):
+                _k = target_runner.conv_key(ch_id)
+                if isinstance(_k, str):
+                    _key = _k
+                    conv_id = _k
+                    conv_label = _k
+            was_loaded = _key in target_runner.conversations
+            live_conv = target_runner.get_conversation(_key, conv_id)
 
     marked_text = f"[INJECTED CONTEXT]: {text}"
 
@@ -171,12 +182,9 @@ async def inject_context(agent_id: str, channel_id: int = 0, text: str = "", ses
         # on provider. Append to conv.messages (the live list), then save()
         # — after a fresh load() _persisted_count == len(history), so save()
         # appends ONLY this new message, no duplication.
-        if target_agent.provider == "anthropic":
-            from ..anthropic_conversation import ChatMessage as _AntMsg
-            live_conv.messages.append(_AntMsg("user", marked_text))
-        else:
-            from ..ollama_api import ChatMessage as _OllamaMsg
-            live_conv.messages.append(_OllamaMsg("user", marked_text))
+        from ..providers import chat_message_class
+        _Msg = chat_message_class(target_agent.provider)
+        live_conv.messages.append(_Msg("user", marked_text))
         live_conv.save()
         _how = "in-memory (already loaded)" if was_loaded else "in-memory (loaded on demand)"
         print_ts(f"inject_context tool: injected into {agent_id} conv {conv_label} [{_how}] + disk",

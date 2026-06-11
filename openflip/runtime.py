@@ -11,6 +11,8 @@ from nextcord.ext import commands
 from .agent import Agent
 from .conversation import DiscordConversation
 from .anthropic_conversation import AnthropicConversation, MalformedRequestError
+from .openai_conversation import OpenAIConversation
+from .providers import make_conversation, chat_message_class
 from .pipeline import build_user_prompt, should_respond, build_visible_tools, extract_image_attachments, build_inbound_from_discord
 from .session import InboundMessage, Session
 from .tool_executor import execute_tool_calls, build_model_feedback
@@ -130,7 +132,13 @@ class AgentRunner:
                 t.attach_runner(self)
         # Per-transport task tracking for start/stop lifecycle.
         self._transport_tasks: list[asyncio.Task] = []
-        self.conversations: dict[int, DiscordConversation | AnthropicConversation] = {}
+        # Keyed by "conversation key": the int transport-native channel id for
+        # normal conversations (unchanged legacy behavior), or the canonical
+        # "linked:<canonical>" conversation_id STRING for identity-linked
+        # conversations — so a linked person's Discord DM and iMessage chat
+        # resolve to ONE live conversation object instead of two objects
+        # fighting over the same JSONL. See conv_key_for_session().
+        self.conversations: dict[int | str, DiscordConversation | AnthropicConversation | OpenAIConversation] = {}
         self._task: Optional[asyncio.Task] = None
         # Inbound queue: every turn (real Discord message OR synthetic turn from
         # cron / restart_gateway / talk_to_agent) goes through this. A single
@@ -172,14 +180,20 @@ class AgentRunner:
         # (re-pointed at a live predecessor or popped) by the worker's
         # `_on_turn_done` done-callback, plus a dispatch-time chase in
         # `_inbound_worker` for the pre-first-step-cancel race (B2).
-        self._active_turns: dict[int, asyncio.Task] = {}
+        self._active_turns: dict[int | str, asyncio.Task] = {}
         # Per-channel soft-inject buffer. Holds operator messages typed
         # mid-turn that haven't been delivered to the model yet. Drained
         # inside _run_turn (after each tool-result append + at post-loop
         # cleanup) by appending each pending text as a user-role
         # [FRAMEWORK] marker, so the model naturally sees them on the
         # next chat() call. Wiped on hard interrupt and on /reset.
-        self._pending_inject: dict[int, list[str]] = {}
+        self._pending_inject: dict[int | str, list[str]] = {}
+        # Native channel id → linked conversation key. Populated whenever a
+        # session whose conversation_id is "linked:<canonical>" passes through
+        # inbound handling / get_conversation, so consumers that only have a
+        # transport-native int id (slash commands, tools holding
+        # CURRENT_CHANNEL_ID) can resolve the shared key via conv_key().
+        self._linked_channel_keys: dict[int, str] = {}
         # Timestamp (ms since epoch) of the most recent INBOUND human
         # Discord message this agent received. Used by restart_gateway's
         # preflight to refuse restarting if a human just spoke in any
@@ -256,37 +270,119 @@ class AgentRunner:
                 pass
         return True
 
-    def get_conversation(self, channel_id: int, conversation_id: str) -> DiscordConversation | AnthropicConversation:
+    # ---- Conversation-key resolution (identity links) ----
+    #
+    # The three per-conversation dicts (conversations / _active_turns /
+    # _pending_inject) are keyed by "conversation key": the transport-native
+    # int channel id for normal conversations (byte-identical to the pre-link
+    # behavior), or the "linked:<canonical>" conversation_id string for
+    # identity-linked conversations, so every transport a linked person uses
+    # resolves to the SAME live conversation object, active-turn slot, and
+    # soft-inject buffer. ROUTING/AUTH NOTE: keys govern conversation state
+    # only. Replies still post to the originating transport's channel object,
+    # and ACL evaluation still uses the session's native transport + handle —
+    # neither consults these keys.
+
+    def conv_key_for_session(self, session, native_channel_id: int) -> int | str:
+        """Conversation-dict key for a session.
+
+        Linked sessions (conversation_id "linked:...") key by that string —
+        and the native id → key alias is recorded so raw-int consumers can
+        resolve it later via conv_key(). Everything else keys by the native
+        int channel id, exactly as before identity links existed.
+        """
+        conv_id = getattr(session, "conversation_id", "") or "" if session is not None else ""
+        if isinstance(conv_id, str) and conv_id.startswith("linked:"):
+            if native_channel_id:
+                self._linked_channel_keys[int(native_channel_id)] = conv_id
+            return conv_id
+        return native_channel_id
+
+    def conv_key(self, channel_id: int | str) -> int | str:
+        """Conversation-dict key when only a transport-native id is known.
+
+        Resolves through the linked-alias map (populated the first time a
+        linked session passes through this process); unknown ids return
+        unchanged, preserving legacy behavior for unlinked conversations.
+        """
+        if isinstance(channel_id, str):
+            return channel_id
+        return self._linked_channel_keys.get(int(channel_id or 0), channel_id)
+
+    def _turn_key(self, channel, inbound=None, speaker_id: int = 0) -> int | str:
+        """Conversation key for a queued turn (worker / handlers).
+
+        Prefers the inbound's session, then a session carried by the channel
+        (TransportChannel / _SessionChannel), then the alias map for a bare
+        nextcord channel. For a bare Discord DM channel with a known speaker
+        (legacy raw-int synthetic turns), the identity-link map is consulted
+        directly — mirroring the rewrite _run_turn's synthesized session will
+        do — so the active-turn slot is keyed identically to the conversation
+        even when the alias map is cold (fresh process).
+        """
+        ch_id = int(getattr(channel, "id", 0) or 0)
+        session = getattr(inbound, "session", None) if inbound is not None else None
+        if session is None:
+            session = getattr(channel, "_session", None)
+        if session is not None:
+            return self.conv_key_for_session(session, ch_id)
+        key = self.conv_key(ch_id)
+        if key == ch_id and speaker_id:
+            _ch_type = str(getattr(channel, "type", "") or "").lower()
+            if "dm" in _ch_type or "private" in _ch_type:
+                from .config_global import resolve_linked_conversation_id
+                linked = resolve_linked_conversation_id("discord", speaker_id)
+                if linked:
+                    if ch_id:
+                        self._linked_channel_keys[ch_id] = linked
+                    key = linked
+        return key
+
+    def get_conversation(self, channel_id: int | str, conversation_id: str) -> DiscordConversation | AnthropicConversation | OpenAIConversation:
         """Get-or-create the conversation for this channel.
 
         `conversation_id` must be the full transport-prefixed id from the
-        Session object (e.g. "discord:<id>", "imessage:<chat_id>"). No
-        fallback — callers must thread the real value through from the
-        session. Hardcoding a default here was the bug that produced
-        cross-transport collisions and `discord:` filenames for iMessage
-        conversations.
+        Session object (e.g. "discord:<id>", "imessage:<chat_id>",
+        "linked:<canonical>"). No fallback — callers must thread the real
+        value through from the session. Hardcoding a default here was the bug
+        that produced cross-transport collisions and `discord:` filenames for
+        iMessage conversations.
 
-        In-memory dict key stays as the int channel_id for fast lookup,
-        but the on-disk filename is governed by `conversation_id`.
+        In-memory dict key: the int channel_id for normal conversations (fast
+        lookup, unchanged), or `conversation_id` itself when it is a linked id
+        — so two transports sharing a linked conversation get ONE live object.
+        The on-disk filename is always governed by `conversation_id`.
         """
         if not conversation_id:
             raise ValueError(
                 f"get_conversation requires conversation_id (channel_id={channel_id}). "
                 f"Pass session.conversation_id from the inbound message."
             )
-        c = self.conversations.get(channel_id)
+        key: int | str = channel_id
+        if conversation_id.startswith("linked:"):
+            key = conversation_id
+            try:
+                _native = int(channel_id)
+            except (TypeError, ValueError):
+                _native = 0
+            if _native:
+                self._linked_channel_keys[_native] = conversation_id
+        c = self.conversations.get(key)
         if c is None:
-            if self.agent.provider == "anthropic":
-                c = AnthropicConversation(conversation_id, self.agent)
-            else:
-                c = DiscordConversation(conversation_id, self.agent)
+            # Provider routing lives in openflip/providers.py — anthropic →
+            # AnthropicConversation, openai → OpenAIConversation, everything
+            # else (ollama default) → DiscordConversation.
+            c = make_conversation(self.agent, conversation_id)
             c.load()
-            self.conversations[channel_id] = c
+            self.conversations[key] = c
         return c
 
 
-    def _hard_interrupt(self, channel_id: int) -> int:
+    def _hard_interrupt(self, channel_id: int | str) -> int:
         """Hard-interrupt the active turn (if any) for `channel_id`.
+
+        `channel_id` is a conversation key — int for normal conversations,
+        "linked:<canonical>" for identity-linked ones (see conv_key).
 
         Cancels the in-flight `_run_turn` task and clears the channel's
         pending soft-inject buffer. Transport-agnostic — called by both:
@@ -318,8 +414,9 @@ class AgentRunner:
         active_task.cancel()
         return pending_count
 
-    def _drain_pending_injects(self, channel_id: int, conv) -> int:
-        """Soft-inject drain. Pops everything in _pending_inject[channel_id]
+    def _drain_pending_injects(self, channel_id: int | str, conv) -> int:
+        """Soft-inject drain. `channel_id` is a conversation key (int or
+        "linked:<canonical>" — see conv_key). Pops everything in _pending_inject[channel_id]
         and appends each message as a user-role [FRAMEWORK] marker on the
         conversation so the model sees it at its next chat() call.
 
@@ -337,10 +434,7 @@ class AgentRunner:
         pending = self._pending_inject.pop(channel_id, None)
         if not pending:
             return 0
-        if self.agent.provider == "anthropic":
-            from .anthropic_conversation import ChatMessage
-        else:
-            from openflip.ollama_api import ChatMessage
+        ChatMessage = chat_message_class(self.agent.provider)
         for text in pending:
             marker = (
                 f"[FRAMEWORK]: The operator sent this message while you were "
@@ -449,7 +543,16 @@ class AgentRunner:
             except asyncio.CancelledError:
                 return
             channel = kwargs.get("channel")
-            channel_id = int(getattr(channel, "id", 0) or 0)
+            # Conversation key, not raw channel.id: identity-linked sessions
+            # on different transports must serialize behind each other (they
+            # share one conversation object), so the slot key must match the
+            # conversation key used everywhere else. Unlinked turns get the
+            # same int channel.id as before.
+            channel_id = self._turn_key(
+                channel,
+                kwargs.get("inbound"),
+                speaker_id=int(kwargs.get("speaker_id") or 0),
+            )
             # Snapshot any prior same-channel turn SYNCHRONOUSLY (no await
             # between get() and the _active_turns write) so the enqueue-time
             # interrupt check always sees a live marker the instant an item
@@ -535,7 +638,7 @@ class AgentRunner:
         except Exception:
             pass
 
-    async def _serialized_turn(self, channel_id: int, prev_task: Optional[asyncio.Task], kwargs: dict):
+    async def _serialized_turn(self, channel_id: int | str, prev_task: Optional[asyncio.Task], kwargs: dict):
         """Run one turn, serialized behind any prior same-channel turn. Spawned
         (not awaited) by `_inbound_worker` so different channels overlap; the
         same-channel wait below keeps one channel serial.
@@ -785,17 +888,20 @@ class AgentRunner:
             )
 
         # Soft-inject vs hard-interrupt — same shape as _handle_message.
-        active_task = self._active_turns.get(ch_id) if ch_id else None
+        # Keyed by conversation key (linked sessions share one slot/buffer
+        # across transports); ch_id stays the native id for reply routing.
+        _conv_key = self.conv_key_for_session(inbound.session, ch_id)
+        active_task = self._active_turns.get(_conv_key) if _conv_key else None
         is_hard_interrupt = raw_text.lower().startswith("/stop")
         if active_task is not None and not active_task.done():
             if is_hard_interrupt:
-                self._hard_interrupt(ch_id)
+                self._hard_interrupt(_conv_key)
                 # Fall through to enqueue path below.
             else:
-                self._pending_inject.setdefault(ch_id, []).append(user_text)
+                self._pending_inject.setdefault(_conv_key, []).append(user_text)
                 print_ts(
-                    f"{COLOR_YELLOW}soft-inject queued on channel {ch_id} "
-                    f"(pending count: {len(self._pending_inject[ch_id])}) "
+                    f"{COLOR_YELLOW}soft-inject queued on channel {_conv_key} "
+                    f"(pending count: {len(self._pending_inject[_conv_key])}) "
                     f"— from {inbound.sender_display_name}{COLOR_END}",
                     agent=self.agent.id,
                 )
@@ -955,21 +1061,24 @@ class AgentRunner:
                 agent=self.agent.id,
             )
 
-        active_task = self._active_turns.get(ch_id) if ch_id else None
+        # Keyed by conversation key (linked sessions share one slot/buffer
+        # across transports); ch_id stays the native id for reply routing.
+        _conv_key = self.conv_key_for_session(inbound.session, ch_id)
+        active_task = self._active_turns.get(_conv_key) if _conv_key else None
         is_hard_interrupt = raw_text.lower().startswith("/stop")
         if active_task is not None and not active_task.done():
             if is_hard_interrupt:
-                self._hard_interrupt(ch_id)
+                self._hard_interrupt(_conv_key)
                 # Falls through to the enqueue path below — `/stop` lands
                 # as a fresh turn after the cancelled one cleans up.
             else:
                 # Soft inject: queue the framed user_text (attribution-
                 # preserved) and return WITHOUT enqueueing a new turn.
                 # The active turn's drain picks it up at the next boundary.
-                self._pending_inject.setdefault(ch_id, []).append(user_text)
+                self._pending_inject.setdefault(_conv_key, []).append(user_text)
                 print_ts(
-                    f"{COLOR_YELLOW}soft-inject queued on channel {ch_id} "
-                    f"(pending count: {len(self._pending_inject[ch_id])}) "
+                    f"{COLOR_YELLOW}soft-inject queued on channel {_conv_key} "
+                    f"(pending count: {len(self._pending_inject[_conv_key])}) "
                     f"— from {message.author.name}{COLOR_END}",
                     agent=self.agent.id,
                 )
@@ -1210,10 +1319,19 @@ class AgentRunner:
                 # iMessage tool ACL fails, tools never reach the API request, and
                 # the model emits its tool_use as raw JSON in chat.
                 _display = speaker_handle or f"synthetic:{_ch_int}"
+                # Identity links: a synthetic turn aimed at a linked handle's
+                # 1:1 chat must land in the same shared conversation the
+                # inbound path uses (make_imessage_session rewrites it there).
+                _synth_conv_id = f"{_t_name}:{_ch_int}"
+                if speaker_handle:
+                    from .config_global import resolve_linked_conversation_id
+                    _linked = resolve_linked_conversation_id(_t_name, speaker_handle)
+                    if _linked:
+                        _synth_conv_id = _linked
                 _session_for_chan = _Session(
                     transport=_t_name,
                     transport_id=str(_ch_int),
-                    conversation_id=f"{_t_name}:{_ch_int}",
+                    conversation_id=_synth_conv_id,
                     speaker_id=speaker_id,
                     speaker_role_ids=[],
                     is_owner=False,
@@ -1437,12 +1555,19 @@ class AgentRunner:
                 from .session import make_discord_session
                 _ch_id = int(getattr(channel, "id", 0) or 0)
                 if _ch_id:
+                    # DM detection: nextcord DM channels have
+                    # ChannelType.private (str "private"); the TransportChannel
+                    # shim uses the literal "dm". Both must count — identity
+                    # links are DM-gated in make_discord_session, so missing
+                    # "private" here would fork a linked DM's history on
+                    # synthetic turns (cron, /compact, follow-ups).
+                    _ch_type = str(getattr(channel, "type", "") or "").lower()
                     _synth_session = make_discord_session(
                         channel_id=_ch_id,
                         speaker_id=int(speaker_id),
                         speaker_role_ids=list(role_ids) if role_ids else [],
                         is_owner=bool(owner),
-                        is_dm=getattr(channel, "type", None) and "dm" in str(getattr(channel, "type", "")).lower(),
+                        is_dm=("dm" in _ch_type or "private" in _ch_type),
                         display_name=getattr(channel, "name", None) or "synthetic",
                     )
                     CURRENT_SESSION.set(_synth_session)
@@ -1548,6 +1673,16 @@ class AgentRunner:
             except Exception:
                 pass
         conv = self.get_conversation(channel.id, conversation_id=_conv_id)
+        # Conversation key for every _pending_inject/_active_turns access in
+        # this turn. For identity-linked conversations this is the
+        # "linked:<canonical>" string (shared across transports); otherwise
+        # the native int channel.id, exactly as before. CURRENT_CHANNEL_ID
+        # (set above) deliberately stays the NATIVE id — it routes replies
+        # and tool I/O to the originating transport, never to the link.
+        _conv_key: int | str = (
+            _conv_id if _conv_id.startswith("linked:")
+            else int(getattr(channel, "id", 0) or 0)
+        )
         # Derive `talking_with` so the openflip dashboard can render
         # who's-talking-to-whom. originator_agent_id (forward inter-agent
         # turn) or auto_route_from_peer (chain-terminator return turn)
@@ -1585,13 +1720,14 @@ class AgentRunner:
             pass
 
         # Image attachments → download + queue for vision.
-        # Only fires for anthropic agents (ollama vision path isn't wired
-        # in this framework). Filters Discord attachments to image/* and
-        # downloads each into a tempfile, then appends to the
+        # Fires for anthropic + openai agents (ollama vision path isn't
+        # wired in this framework). Filters Discord attachments to image/*
+        # and downloads each into a tempfile, then appends to the
         # conversation's _pending_image_attachments list which
-        # AnthropicConversation drains on its next chat() / chat_stream().
+        # AnthropicConversation / OpenAIConversation drains on its next
+        # chat() / chat_stream().
         _img_tmp_paths: list[str] = []
-        if (agent.provider == "anthropic"
+        if (agent.provider in ("anthropic", "openai")
                 and discord_message is not None
                 and getattr(discord_message, "attachments", None)):
             try:
@@ -1649,10 +1785,7 @@ class AgentRunner:
             if conv.messages and conv.messages[0].role == 'system':
                 conv.messages[0]['content'] = conv.system_message
 
-        if self.agent.provider == "anthropic":
-            from .anthropic_conversation import ChatMessage
-        else:
-            from openflip.ollama_api import ChatMessage
+        ChatMessage = chat_message_class(self.agent.provider)
         CHAT_TIMEOUT_S = 300
         MAX_TOOL_TURNS = 100
         callable_names = {f.__name__ for f in callable_funcs}
@@ -2009,10 +2142,7 @@ class AgentRunner:
                                 agent=agent.id,
                             )
                             try:
-                                if agent.provider == "anthropic":
-                                    from .anthropic_conversation import ChatMessage as _CM
-                                else:
-                                    from openflip.ollama_api import ChatMessage as _CM
+                                _CM = chat_message_class(agent.provider)
                                 _nudge = build_peer_prose_nudge(_detected_peer)
                                 conv.messages.append(_CM('user', _nudge))
                             except Exception as _nudge_err:
@@ -2260,7 +2390,7 @@ class AgentRunner:
                         break
                     ai_message.tool_calls = new_calls
 
-                    _ch_id_ic = int(getattr(channel, "id", 0) or 0)
+                    _ch_id_ic = _conv_key
                     tool_results = await execute_tool_calls(
                         agent=agent,
                         conversation=conv,
@@ -2359,7 +2489,7 @@ class AgentRunner:
                     # message at its next decision point). See
                     # _drain_pending_injects for the marker format.
                     try:
-                        _ch_id_drain = int(getattr(channel, "id", 0) or 0)
+                        _ch_id_drain = _conv_key
                         _drained_n = self._drain_pending_injects(_ch_id_drain, conv)
                         if _drained_n > 0:
                             # Turn-cumulative: this per-iteration drain is the
@@ -2456,7 +2586,7 @@ class AgentRunner:
             # over. Drop them so they don't bleed into the next turn's
             # history.
             try:
-                _ch_id_cx = int(getattr(channel, "id", 0) or 0)
+                _ch_id_cx = _conv_key
                 if _ch_id_cx:
                     _dropped = len(self._pending_inject.pop(_ch_id_cx, []) or [])
                     if _dropped:
@@ -2537,7 +2667,7 @@ class AgentRunner:
             if conv.messages and conv.messages[-1].role == 'user':
                 conv.messages.pop()
             try:
-                self._drain_pending_injects(int(getattr(channel, "id", 0) or 0), conv)
+                self._drain_pending_injects(_conv_key, conv)
             except Exception:
                 pass
             await _restore_system()
@@ -2571,7 +2701,7 @@ class AgentRunner:
             if conv.messages and conv.messages[-1].role == 'user':
                 conv.messages.pop()
             try:
-                self._drain_pending_injects(int(getattr(channel, "id", 0) or 0), conv)
+                self._drain_pending_injects(_conv_key, conv)
             except Exception:
                 pass
             await _restore_system()
@@ -2604,7 +2734,7 @@ class AgentRunner:
                     except Exception:
                         pass
             try:
-                self._drain_pending_injects(int(getattr(channel, "id", 0) or 0), conv)
+                self._drain_pending_injects(_conv_key, conv)
             except Exception:
                 pass
             await _restore_system()
@@ -2631,7 +2761,7 @@ class AgentRunner:
             # the cause, this is a no-op — the wipe is intentional and
             # this drain finds nothing.
             try:
-                _ch_id_safety = int(getattr(channel, "id", 0) or 0)
+                _ch_id_safety = _conv_key
                 if _ch_id_safety and self._pending_inject.get(_ch_id_safety):
                     # Capture BEFORE drain pops the dict — needed by the
                     # post-loop follow-up-turn fire-check.
@@ -2694,7 +2824,7 @@ class AgentRunner:
         # some future control path skips the finally; emits nothing if
         # there's nothing to drain.
         try:
-            _ch_id_drain = int(getattr(channel, "id", 0) or 0)
+            _ch_id_drain = _conv_key
             if _ch_id_drain and self._pending_inject.get(_ch_id_drain):
                 _drained_texts = _drained_texts or list(self._pending_inject.get(_ch_id_drain, []))
                 _post_drained = self._drain_pending_injects(_ch_id_drain, conv)
@@ -2768,7 +2898,16 @@ class AgentRunner:
         if _drained_count > 0 and _drained_texts:
             try:
                 follow_up_prompt = _drained_texts[0]
-                follow_up_ch_id = int(getattr(channel, "id", 0) or 0)
+                # Prefer the turn's Session as the target: run_synthetic_turn
+                # keys history off Session.conversation_id, so a linked
+                # conversation's follow-up lands in the SAME shared history.
+                # A bare int here would re-synthesize a transport-native
+                # session and fork the linked history. Unlinked conversations
+                # resolve identically either way.
+                _fu_session = (
+                    getattr(inbound, "session", None) if inbound is not None else None
+                ) or getattr(channel, "_session", None)
+                follow_up_target = _fu_session if _fu_session is not None else follow_up_ch_id
                 follow_up_speaker = int(speaker_id or 0)
                 print_ts(
                     f"{COLOR_YELLOW}{log_tag}drained {_drained_count} soft-inject(s) "
@@ -2777,7 +2916,7 @@ class AgentRunner:
                 )
                 _fu_task = asyncio.create_task(
                     self.run_synthetic_turn(
-                        follow_up_ch_id,
+                        follow_up_target,
                         follow_up_prompt,
                         auto_post_final_text=True,
                         speaker_id=follow_up_speaker,

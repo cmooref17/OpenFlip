@@ -142,10 +142,13 @@ them), not in any agent.json.
 
 ## Provider + model
 
-- `provider` — `"anthropic"` or `"ollama"`. Default `"ollama"`. Picks
-  which conversation class wraps the agent: `AnthropicConversation` for
-  direct API calls through the operator's Claude OAuth, or
-  `DiscordConversation` (Ollama-backed) for local models.
+- `provider` — `"anthropic"`, `"openai"`, or `"ollama"`. Default
+  `"ollama"`. Picks which conversation class wraps the agent (routing
+  lives in `openflip/providers.py`): `AnthropicConversation` for direct
+  API calls through the operator's Claude OAuth, `OpenAIConversation`
+  for direct API-key calls to OpenAI's Chat Completions endpoint, or
+  `DiscordConversation` (Ollama-backed) for local models. All three are
+  NATIVE providers — the agent's own turns run on that API.
 - `model` — provider-specific model name. **For Anthropic, the working
   format is `anthropic/<model-id>[-1m]`** — note the `anthropic/` provider
   prefix (stripped by `_normalize_model` before the API call) and the
@@ -155,20 +158,73 @@ them), not in any agent.json.
   (`context-1m-2025-08-07`) — this is encoded as a name suffix in the
   field but sent as an `anthropic-beta` header, not a different model id.
   So a 1M Opus 4.8 agent reads exactly:
-  `"model": "anthropic/claude-opus-4-8-1m"`. For Ollama: a bare tag like
+  `"model": "anthropic/claude-opus-4-8-1m"`. **For OpenAI, the same
+  convention: `openai/<model-id>`** (prefix stripped before the API
+  call; a bare model id also works). Any Chat-Completions model id is
+  valid — gpt-series (`gpt-5.1`, `gpt-4o`), o-series reasoning models
+  (`o4-mini`), codex models (`gpt-5.1-codex`) — whatever the configured
+  API key can access. There is no hardcoded list; declare each model you
+  use in `config.json`'s `models.<id>` block so its real
+  `context_window` is known (unlisted openai models default to a
+  conservative 128k). An empty `model` field on an openai agent falls
+  back to `integrations.openai.default_model` (default `gpt-5.1`).
+  For Ollama: a bare tag like
   `qwen3.5:cloud` (no provider prefix). Changing the value takes effect on
   the next `/reload` or restart — agent.json's bytes are part of the
   reload fingerprint, so the conversation rebuilds against the new model
   without a full restart.
 - `think` — Anthropic only. `true`/`false`/`null` toggles the
   extended-thinking budget. Default `null` = framework picks based on
-  model.
+  model. Ignored by the openai provider (use the per-model `effort`
+  knob below for reasoning models).
 - Reasoning **`effort`** is NOT an agent.json field — it's a model
   capability, so it lives per-model in `config.json` under
   `models.<id>.effort`, right next to `compaction_trigger`. A
   per-conversation override can be set with `/effort` (owner-only,
   Anthropic-only), which wins over the model config. See "What's
   the current model / context window?" below.
+
+### The "openai" provider — setup + what's supported
+
+Auth is a plain API key — no OAuth, no token refresh. Configure it in
+`config.json` (or set the standard `OPENAI_API_KEY` environment variable
+as a fallback):
+
+```json
+"integrations": {
+  "openai": {
+    "api_key": "sk-...",
+    "base_url": "https://api.openai.com",   // optional; for proxies/gateways
+    "default_model": "gpt-5.1"              // optional; used when agent.model is empty
+  }
+}
+```
+
+Then in the agent's `agent.json`: `"provider": "openai"`,
+`"model": "openai/gpt-5.1"`. Declare the model in `config.json`'s
+`models` block (`{"gpt-5.1": {"provider": "openai", "context_window":
+400000}}`) so the picker lists it and the context window is right.
+
+Supported (same UX as an anthropic agent): streaming, full tool calling
+(every framework tool works unchanged), JSONL conversation persistence +
+`/reset`, image attachments (vision via base64 data URLs), REMINDER.md
+injection, `/status` (context + cache-read stats), usage-ledger
+recording, malformed-tool-call retry, mid-turn soft-inject.
+
+NOT supported (deliberate differences — these commands answer
+"Anthropic-only"):
+- **No server-side compaction** → `/compact` and `/uncompact` don't
+  apply. Context is bounded by a local pre-flight trim EVERY turn
+  (oldest messages dropped once the estimated input nears the window),
+  like the ollama provider. Nothing is summarized — trimmed history
+  stays on disk but leaves the model's context.
+- **No `/effort` session override** — only the per-model
+  `models.<id>.effort` config knob (see below; openai vocabulary is
+  `minimal`/`low`/`medium`/`high`).
+- **No explicit prompt-cache control** — OpenAI caches prompt prefixes
+  automatically; cache reads show up in `/status` and the ledger as
+  `cache_read` tokens, and `cache_creation` is always 0.
+- **No `-1m`-style beta suffixes** and no `think` toggle.
 
 ## System prompt
 
@@ -339,8 +395,8 @@ stays list-only in both editors.
 
 - `ollama_options` (alias: `options`) — passed to Ollama's chat API.
   `temperature`, `num_ctx`, `num_predict`, `repeat_penalty`, etc.
-  Ignored when `provider == "anthropic"`. `num_predict: -1` is rejected
-  by cloud Ollama — keep it positive.
+  Ignored when `provider == "anthropic"` or `"openai"`. `num_predict: -1`
+  is rejected by cloud Ollama — keep it positive.
 
 ## Example minimal agent.json
 
@@ -377,11 +433,11 @@ nested object. `respond_to_bots`, `memory_enabled`, etc. are top-level.
 |---|---|---|---|
 | `id` | string | directory name | Stable id; should match the dir. Used in logs, routing, `RUNNERS`. |
 | `display_name` | string | `id` | Human label in commands/panels. |
-| `provider` | string | `"ollama"` | `"anthropic"` or `"ollama"`. Picks the conversation class. |
+| `provider` | string | `"ollama"` | `"anthropic"`, `"openai"`, or `"ollama"`. Picks the conversation class. |
 | `model` | string | `""` | Provider-specific tag. Anthropic: `anthropic/<id>[-1m]` (e.g. `anthropic/claude-opus-4-8-1m`); the `anthropic/` prefix is required and the `-1m` suffix flips on the 1M-context beta header. Ollama: bare tag, no prefix. |
 | `think` | bool \| null | `null` | Anthropic only. Toggles extended-thinking budget; `null` = framework decides. |
 | `system_files` | list[string] | `[]` | Ordered; concatenated with `\n\n`. `_shared/` prefix resolves to shared dir. New agents bootstrap with the 5-file default (SOUL → FRAMEWORK → AGENT.md → shared TOOLS → personal TOOLS.md); `AGENT.md` + personal `TOOLS.md` auto-created and injected by default, empty = no-op. |
-| `ollama_options` (alias `options`) | object | `{}` | Passed to Ollama chat API. Ignored when `provider=="anthropic"`. |
+| `ollama_options` (alias `options`) | object | `{}` | Passed to Ollama chat API. Ignored when `provider=="anthropic"` or `"openai"`. |
 | `allowed_tools` | list[object] | `[]` | ACL entries (see §5). Unlisted tools auto-injected with blank (deny) auth. |
 | `tool_response_mode` | string | `"media_only"` | `"media_only"` suppresses text on attachment turns; any other value disables that. |
 | `respond_to_bots` | bool | `false` | Top-level. `true` lets the agent reply to other bots. |
@@ -920,7 +976,80 @@ agents/<id>/conversations/
 └── <conversation_id>.jsonl.pre_uncompact_<ts>.bak.jsonl # Made by /uncompact.
 ```
 
-`<conversation_id>` is `discord:<channel_id>` or `imessage:<chat_id>`.
+`<conversation_id>` is `discord:<channel_id>`, `imessage:<handle>` (1:1) /
+`imessage:<chat_id>` (group), or `linked:<canonical>` for identity-linked
+conversations (see below).
+
+## Cross-transport identity links (`identity_links`)
+
+One person talking to the same agent on Discord AND iMessage normally gets
+two separate conversation histories (`discord:<dm_channel>` and
+`imessage:<handle>`). The top-level `identity_links` map in `config.json`
+merges them into ONE shared history:
+
+```json
+"identity_links": {
+  "discord:139243578504249344": "flip",
+  "imessage:+15551234567": "flip"
+}
+```
+
+- **Keys** are `<transport>:<native_id>` — the Discord **user id** (not a
+  channel id) or the raw iMessage **handle** (phone/email). Keys are
+  case-folded on load, so handle casing doesn't matter.
+- **Values** are an arbitrary canonical string. Every identity mapped to the
+  same value shares one conversation.
+
+**How it works.** At session construction, if the speaker's
+`<transport>:<id>` is in the map, the session's `conversation_id` is
+rewritten to `linked:<canonical>` — so history lives in
+`conversations/linked:<canonical>.jsonl` and the runtime's in-memory
+conversation state (live conversation object, active-turn slot, soft-inject
+buffer) is keyed by that same string on every transport. Both transports see
+each other's turns live, no restart needed. Turns from the two transports
+serialize against each other like two messages in one channel (they ARE one
+conversation).
+
+**1:1 only.** The rewrite applies to DMs / 1:1 chats. Guild channels and
+iMessage group chats are shared spaces keyed by channel — they are never
+rewritten, even when a linked person speaks in them.
+
+**Unlinked users are untouched.** Anyone not in the map behaves exactly as
+before — same conversation ids, same files, same in-memory keying.
+
+**Routing vs auth — the security line.** A link rewrites conversation
+ROUTING only (which history a session resolves to). It NEVER confers
+privilege across transports:
+
+- Replies post to the transport the message arrived on. A linked person
+  writing on Discord gets the answer on Discord; writing on iMessage gets it
+  on iMessage. The link never redirects outbound traffic.
+- ACL/owner/admin evaluation is recomputed every turn from the session's
+  native transport + identity (Discord user id, iMessage handle) and never
+  consults `identity_links`. Being owner on Discord does NOT make the linked
+  iMessage handle owner — grant each transport identity its own privileges
+  explicitly (`integrations.<transport>.owner_id` / `admin_ids` /
+  per-tool `auth` blocks). The iMessage `allowlist_senders` gate also still
+  applies independently.
+
+**Adding a link.**
+1. Add both `<transport>:<id>` entries to `identity_links` in `config.json`
+   pointing at the same canonical value.
+2. Restart the gateway (config.json is read at startup).
+3. New messages from either transport now land in
+   `linked:<canonical>.jsonl`. Existing per-transport histories are NOT
+   auto-merged — they stay on disk under their old names. To carry one
+   forward, stop the gateway and rename/concatenate the old `.jsonl` into
+   `linked:<canonical>.jsonl` first.
+
+**Tools and commands.** `/reset`, `/compact`, `/uncompact`, `/status`,
+`/stop` and the text-command mirrors operate on the linked conversation when
+fired from a linked DM on either transport (one `/reset` wipes the shared
+history). `inject_context` / `talk_to_agent` accept
+`session_id: "linked:<canonical>"` to target the shared history directly;
+for `talk_to_agent` the visible reply still needs a real channel to land on
+(inter-agent auto-route handles that), since a linked conversation spans two
+native channels and has no single posting target of its own.
 
 ## JSONL shape
 
@@ -959,8 +1088,9 @@ operator changes their mind again), restores the backup over the live
 file, strips `compaction_block` from `.meta.json`, and pops the
 in-memory conversation so the next message reloads from disk.
 
-Ollama has no equivalent. Both commands return "Anthropic-only" if the
-provider doesn't match.
+Ollama and OpenAI have no equivalent (neither has server-side
+compaction). Both commands return "Anthropic-only" if the provider
+doesn't match.
 
 ## Context-window protection
 
@@ -968,6 +1098,12 @@ provider doesn't match.
 defensively — if the assembled request would otherwise exceed the
 model's window. Anthropic's server-side auto-compaction handles
 overflow in normal operation.
+
+The openai provider has no server-side compaction, so its
+`_trim_to_fit_window` (in `openai_conversation.py`) runs pre-flight on
+EVERY turn, like the ollama provider — oldest messages drop from the
+model's context once the estimated input nears the window. Full history
+stays on disk regardless.
 
 ---
 
@@ -1789,15 +1925,19 @@ bare model id — the `-1m` suffix is part of the key, so a 1m-context model key
 - `context_window` — token window; feeds `get_model_context_window`.
 - `compaction_trigger` — overrides the `window - reserve` default; floored at
   Anthropic's 50k minimum. See `get_compaction_trigger`.
-- `effort` — Anthropic-only reasoning depth, sent as `output_config.effort`
-  on every `/v1/messages` request. It's a **model capability, not an agent
-  trait** — opus-only — so it lives here next to `compaction_trigger`, read
-  via `config_global.get_effort`. Valid values (the ONLY five accepted):
-  `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. **Omitting it — or
-  setting anything else — sends no `output_config` at all, so the API falls
-  back to its default, which is `"high"`.** Junk values (wrong type, typo,
-  unknown level) resolve to "absent". `get_effort` also returns None for any
-  non-Anthropic provider, so an Ollama model never builds an `output_config`.
+- `effort` — reasoning depth. It's a **model capability, not an agent
+  trait**, so it lives here next to `compaction_trigger`, read via
+  `config_global.get_effort`. For Anthropic models it's sent as
+  `output_config.effort` on every `/v1/messages` request; valid values (the
+  ONLY five accepted): `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`.
+  For OpenAI models it's sent as `reasoning_effort` on the Chat Completions
+  request; valid values: `"minimal"`, `"low"`, `"medium"`, `"high"` — and it
+  must ONLY be set on reasoning-capable models (o-series / gpt-5 family);
+  other OpenAI models 400 on the parameter. **Omitting it — or setting
+  anything else — sends no effort field at all, so the API falls back to its
+  default (Anthropic: `"high"`).** Junk values (wrong type, typo, unknown
+  level) resolve to "absent". `get_effort` also returns None for the ollama
+  provider, so an Ollama model never builds an effort field.
   **Model-gating caveat:** `xhigh` is opus-4-7/opus-4-8 only and `max` is
   opus-4.6+ only. Anthropic may **400** on a level the configured model
   doesn't support (it does not silently clamp), so only set a level the model
@@ -1821,8 +1961,9 @@ caveat applies: don't set `xhigh`/`max` on a model that doesn't support it.
 
 ### `/usage` — aggregated API usage (owner-only)
 
-`/usage [window] [group_by]` shows aggregated Anthropic API usage over a time
-window, read from the usage ledger (below). Owner-only, ephemeral response.
+`/usage [window] [group_by]` shows aggregated model-API usage (Anthropic +
+OpenAI turns) over a time window, read from the usage ledger (below).
+Owner-only, ephemeral response.
 
 - `window` — `24h` (default) / `7d` / `30d` / `all`.
 - `group_by` — `agent` (default) / `channel` / `user` / `model`.
@@ -1836,7 +1977,7 @@ truncated). An empty window replies `No usage recorded in the last <window> yet.
 
 ### Usage ledger
 
-Every completed Anthropic turn appends ONE raw row to an append-only SQLite
+Every completed Anthropic or OpenAI turn appends ONE raw row to an append-only SQLite
 ledger at `data/usage_ledger.db` (WAL mode; gitignored). The row carries the
 full token breakdown (input / output / cache-read / cache-creation), a computed
 total, an estimated USD cost, the outcome (`ok` / `compaction` / `error`), and

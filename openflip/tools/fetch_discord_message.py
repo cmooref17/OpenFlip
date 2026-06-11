@@ -138,7 +138,9 @@ async def fetch_discord_message(url: str) -> ToolResult:
                 ch_id_for_conv = session.channel_id_int
             else:
                 ch_id_for_conv = int(CURRENT_CHANNEL_ID.get())
-            conv = runner.conversations.get(ch_id_for_conv)
+            # conv_key resolves identity-linked channels to their shared
+            # "linked:<canonical>" dict key; unlinked ids pass through.
+            conv = runner.conversations.get(runner.conv_key(ch_id_for_conv))
         except (LookupError, KeyError, ValueError):
             conv = None
         base = url_s.split('?', 1)[0]
@@ -223,7 +225,8 @@ async def fetch_discord_message(url: str) -> ToolResult:
             ch_id_for_conv = session.channel_id_int
         else:
             ch_id_for_conv = int(CURRENT_CHANNEL_ID.get())
-        conv = runner.conversations.get(ch_id_for_conv)
+        # conv_key: identity-linked channels share a "linked:<canonical>" key.
+        conv = runner.conversations.get(runner.conv_key(ch_id_for_conv))
     except (LookupError, KeyError, ValueError):
         conv = None
     if conv is not None:

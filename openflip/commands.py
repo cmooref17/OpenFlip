@@ -21,6 +21,28 @@ def _project_root_path() -> str:
     return project_root()
 
 
+def _conv_key_for_interaction(runner, interaction) -> int | str:
+    """Conversation-dict key for the channel a slash command fired in.
+
+    Mirrors the runtime's conversation keying: an identity-linked DM resolves
+    to the shared "linked:<canonical>" key — via the runner's alias map, or
+    the link map directly when the alias isn't registered yet this process
+    (in a DM the invoking user IS the conversation peer, so the lookup is
+    deterministic). Everything else returns the native channel id, unchanged.
+    Routing and auth never use this key — it only selects conversation state.
+    """
+    ch_id = int(getattr(interaction.channel, "id", 0) or 0)
+    key = runner.conv_key(ch_id)
+    if key == ch_id and isinstance(interaction.channel, nextcord.DMChannel):
+        from .config_global import resolve_linked_conversation_id
+        linked = resolve_linked_conversation_id("discord", int(interaction.user.id))
+        if linked:
+            if ch_id:
+                runner._linked_channel_keys[ch_id] = linked
+            key = linked
+    return key
+
+
 def register_commands(bot: nextcord.ext.commands.Bot, runner):
     # registry holds the shared agent/runner state; main holds the lifecycle
     # functions. Importing both via `from . import …` inside the function
@@ -34,7 +56,8 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
     async def reset_cmd(interaction: nextcord.Interaction):
         import os
         ch_id = interaction.channel.id
-        conv = runner.conversations.pop(ch_id, None)
+        conv_key = _conv_key_for_interaction(runner, interaction)
+        conv = runner.conversations.pop(conv_key, None)
         if conv and hasattr(conv, "clear_history"):
             conv.clear_history()
         else:
@@ -44,7 +67,9 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
             # would reload all the old turns. Delete the canonical files
             # directly so the operator actually gets a fresh history.
             agent_dir = os.path.dirname(runner.agent.path)
-            conv_id = f"discord:{ch_id}"
+            # Linked DMs store history under the canonical linked id, not
+            # discord:<channel> — delete the file the conversation actually uses.
+            conv_id = conv_key if isinstance(conv_key, str) else f"discord:{ch_id}"
             jsonl_path = os.path.join(agent_dir, "conversations", conv_id + ".jsonl")
             # Pre-reset backup so /reset is recoverable. Only the .jsonl
             # is backed up; the .meta.json sidecar is just compaction
@@ -91,7 +116,7 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         # Wipe any pending soft-inject buffer for this channel — the operator
         # is starting over, queued mid-turn messages from the prior session
         # would be noise in the fresh history.
-        runner._pending_inject.pop(ch_id, None)
+        runner._pending_inject.pop(conv_key, None)
         await interaction.response.send_message("Conversation reset.", ephemeral=True)
 
     @bot.slash_command(name="compact", description="Force compaction on the next message in this channel.")
@@ -104,7 +129,7 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         # compaction trigger to 50k for the next chat() call. Anthropic will
         # then issue a fresh compaction block on the next turn regardless of
         # input size. Ollama has no equivalent — surface that to the user.
-        conv = runner.conversations.get(interaction.channel.id)
+        conv = runner.conversations.get(_conv_key_for_interaction(runner, interaction))
         if conv is None or not hasattr(conv, "force_compact_next"):
             await interaction.response.send_message(
                 "`/compact` is Anthropic-only and there's no active conversation in this channel.",
@@ -146,7 +171,7 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         # Anthropic-only: only AnthropicConversation carries `effort_override`.
         # Ollama/DiscordConversation have no such attr — surface that, same
         # shape as /compact's hasattr(force_compact_next) check.
-        conv = runner.conversations.get(interaction.channel.id)
+        conv = runner.conversations.get(_conv_key_for_interaction(runner, interaction))
         if conv is None or not hasattr(conv, "effort_override"):
             await interaction.response.send_message(
                 "`/effort` is Anthropic-only and there's no active conversation in this channel.",
@@ -197,7 +222,9 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
             )
             return
         agent_dir = os.path.join(os.path.dirname(runner.agent.path), "conversations")
-        conv_id = f"discord:{interaction.channel.id}"
+        # Linked DMs store history under the canonical linked id.
+        _uc_key = _conv_key_for_interaction(runner, interaction)
+        conv_id = _uc_key if isinstance(_uc_key, str) else f"discord:{interaction.channel.id}"
         live_path = os.path.join(agent_dir, f"{conv_id}.jsonl")
         meta_path = os.path.join(agent_dir, f"{conv_id}.meta.json")
         backups = sorted(glob.glob(os.path.join(agent_dir, f"{conv_id}.jsonl.compaction_*.bak.jsonl")))
@@ -228,7 +255,7 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         # the copy could load the pre-restore .jsonl into memory, and the
         # post-restore pop below would only catch loads that completed AFTER
         # the restore — leaving the rare mid-copy window unhandled.
-        runner.conversations.pop(interaction.channel.id, None)
+        runner.conversations.pop(_uc_key, None)
         try:
             shutil.copy2(live_path, safety_copy)
             shutil.copy2(latest_backup, live_path)
@@ -266,7 +293,7 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
             )
             return
         # Pop the in-memory conv so the next message reloads from the restored .jsonl.
-        runner.conversations.pop(interaction.channel.id, None)
+        runner.conversations.pop(_uc_key, None)
         backup_basename = os.path.basename(latest_backup)
         live_size_kb = os.path.getsize(live_path) // 1024
         await interaction.response.send_message(
@@ -316,7 +343,8 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         agent = runner.agent
         from .config_global import get_model_context_window
 
-        conv = runner.conversations.get(interaction.channel.id)
+        _st_key = _conv_key_for_interaction(runner, interaction)
+        conv = runner.conversations.get(_st_key)
         window = get_model_context_window(agent.model, agent.provider)
 
         lines = [f"**{agent.display_name}**"]
@@ -338,6 +366,12 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
                 # (discord:<id>.meta.json, imessage:<id>.meta.json, etc.).
                 # Match any prefix on the same channel id.
                 _candidates = []
+                # Linked conversations: meta lives under the canonical id,
+                # which the channel-id glob below can't match.
+                if isinstance(_st_key, str):
+                    _lmp = os.path.join(_convs_dir, f"{_st_key}.meta.json")
+                    if os.path.exists(_lmp):
+                        _candidates.append((os.path.getmtime(_lmp), _lmp))
                 for _mp in glob.glob(os.path.join(_convs_dir, f"*:{_ch_id}.meta.json")):
                     try:
                         _candidates.append((os.path.getmtime(_mp), _mp))
@@ -355,8 +389,9 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         if usage:
             total = usage["total_input"]
             lines.append(f"• Context: {total:,} / {window:,}")
-            # Cache stats only meaningful for anthropic (ollama always 0).
-            if agent.provider == "anthropic":
+            # Cache stats only meaningful for anthropic + openai (ollama
+            # always 0). Both populate the same cache_* keys in last_usage.
+            if agent.provider in ("anthropic", "openai"):
                 lines.append(
                     f"• Cache: read {usage['cache_read_input_tokens']:,} • "
                     f"create {usage['cache_creation_input_tokens']:,}"
@@ -369,7 +404,11 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
             in_mem = len([m for m in conv.messages if m.get("role") != "system"])
             try:
                 from . import _conversation_io as _cio
-                path = _cio.conversation_path(os.path.dirname(agent.path), f"discord:{interaction.channel.id}")
+                # The conversation object knows its real id (handles linked
+                # conversations and any transport prefix); fall back to the
+                # legacy discord:<id> guess only if the attr is missing.
+                _st_conv_id = getattr(conv, "conversation_id", "") or f"discord:{interaction.channel.id}"
+                path = _cio.conversation_path(os.path.dirname(agent.path), _st_conv_id)
                 on_disk = sum(1 for _ in open(path)) if os.path.exists(path) else in_mem
             except Exception:
                 on_disk = in_mem
@@ -568,7 +607,9 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         # identical regardless of how the operator fired it.
         if not await _owner_check(interaction): return
         ch_id = int(getattr(interaction.channel, "id", 0) or 0)
-        runner._hard_interrupt(ch_id)
+        # Interrupt by conversation key: a linked DM's active turn is slotted
+        # under "linked:<canonical>", not the native channel id.
+        runner._hard_interrupt(_conv_key_for_interaction(runner, interaction))
         # Form the synthetic user_text exactly as the text-prefix path
         # would land it ("/stop" or "/stop <instruction>") so the model
         # sees a consistent message on both Discord paths.
@@ -654,6 +695,16 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
 
         conv_id = f"discord:{ch_id}"
         marked_text = f"[INJECTED CONTEXT]: {text}"
+        # Identity links: if the target runner knows this channel belongs to a
+        # linked conversation, inject into THAT history (key + file), not a
+        # parallel discord:<id> file the linked conversation never reads.
+        _link_key = None
+        target_runner_early = registry.RUNNERS.get(agent_id)
+        if target_runner_early is not None and hasattr(target_runner_early, "conv_key"):
+            _k = target_runner_early.conv_key(ch_id)
+            if isinstance(_k, str):
+                _link_key = _k
+                conv_id = _k
 
         # The LIVE in-memory conversation list is the source of truth for the
         # target's next model turn — a bare JSONL append is invisible until the
@@ -667,18 +718,16 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
             # and registers it in runner.conversations. Either way the list we
             # append to IS the one the next turn reads. (was_loaded only labels
             # the log line.)
-            was_loaded = ch_id in target_runner.conversations
-            conv = target_runner.get_conversation(ch_id, conv_id)
+            _inj_key = _link_key if _link_key is not None else ch_id
+            was_loaded = _inj_key in target_runner.conversations
+            conv = target_runner.get_conversation(_inj_key, conv_id)
             # Same ChatMessage construction _drain_pending_injects uses, branched
             # on provider. Append to conv.messages (the live list), then save()
             # — after a fresh load() _persisted_count == len(history), so save()
             # appends ONLY this new message, no duplication.
-            if target_agent.provider == "anthropic":
-                from .anthropic_conversation import ChatMessage as _AntMsg
-                conv.messages.append(_AntMsg("user", marked_text))
-            else:
-                from .ollama_api import ChatMessage as _OllamaMsg
-                conv.messages.append(_OllamaMsg("user", marked_text))
+            from .providers import chat_message_class
+            _Msg = chat_message_class(target_agent.provider)
+            conv.messages.append(_Msg("user", marked_text))
             conv.save()
             _how = "in-memory (already loaded)" if was_loaded else "in-memory (loaded on demand)"
             print_ts(f"/inject_context: injected into {agent_id} channel {ch_id} [{_how}] + disk",
@@ -923,7 +972,7 @@ async def _dump_conversation(interaction: nextcord.Interaction, *, runner, inclu
     from .acl import is_owner
 
     channel_id = interaction.channel.id
-    conv = runner.conversations.get(channel_id)
+    conv = runner.conversations.get(_conv_key_for_interaction(runner, interaction))
 
     # Channel label: prefer a real human-readable name when nextcord exposes it.
     # DMs and partial channels won't have one; surface that explicitly instead

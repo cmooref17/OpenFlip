@@ -14,13 +14,14 @@ from .utils import load_json, save_json, project_root, print_ts
 _SHARED_PREFIX = "_shared/"
 
 
-# The only provider values the framework actually routes on: "anthropic" is
-# special-cased in runtime.py to build AnthropicConversation; everything else
-# (including "ollama", the default) falls through to DiscordConversation/ollama.
+# The only provider values the framework actually routes on: "anthropic" and
+# "openai" are routed via openflip/providers.py to AnthropicConversation /
+# OpenAIConversation; everything else (including "ollama", the default) falls
+# through to DiscordConversation/ollama.
 # A typo like "antropic" or the stale "claude-cli" would therefore route
 # SILENTLY to ollama — _valid_provider warns on an unknown value instead so the
 # mistake surfaces at load instead of as mysterious wrong-provider behavior.
-_VALID_PROVIDERS = frozenset({"ollama", "anthropic"})
+_VALID_PROVIDERS = frozenset({"ollama", "anthropic", "openai"})
 
 
 def _valid_provider(raw: Any, *, agent_id: str) -> str:
