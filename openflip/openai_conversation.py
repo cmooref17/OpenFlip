@@ -1,9 +1,22 @@
 """Direct OpenAI API conversation wrapper.
 
 Native third provider: an agent with `"provider": "openai"` runs its own
-turns against OpenAI's Chat Completions API (`/v1/chat/completions`,
-SSE streaming + function calling). NOT a delegation tool — this is the
-agent's brain, exactly like AnthropicConversation is for Claude agents.
+turns against OpenAI. NOT a delegation tool — this is the agent's brain,
+exactly like AnthropicConversation is for Claude agents.
+
+TWO auth/API paths, chosen per turn by credential precedence:
+  1. ChatGPT/Codex subscription OAuth (PREFERRED — exists when `codex login`
+     has written `$CODEX_HOME/auth.json` with auth_mode=="chatgpt"): the
+     **Responses API** at `https://chatgpt.com/backend-api/codex/responses`
+     — `input` items, `function_call`/`function_call_output` items,
+     `response.output_text.delta` / `response.output_item.done` /
+     `response.completed` SSE events. Token borrow/refresh lives in
+     `_codex_auth.py` (protocol mirrored from simonw/llm-openai-via-codex).
+  2. Plain API key (FALLBACK — config_global.get_openai_api_key): the
+     standard Chat Completions API (`/v1/chat/completions`, messages array,
+     tool_calls deltas). The original path, kept verbatim.
+Both translate into the same StreamEvent taxonomy, so everything downstream
+(runtime, /status, ledger) is identical regardless of path.
 
 Mirrors the PUBLIC interface of `AnthropicConversation` so `runtime.py`
 treats the two polymorphically:
@@ -17,8 +30,6 @@ treats the two polymorphically:
   - same `last_usage` dict shape (+ meta sidecar) so /status works unchanged
 
 Deliberate differences from the anthropic sibling (document, don't "fix"):
-  - Auth is a plain API key (config_global.get_openai_api_key) — no OAuth,
-    no refresh machinery, no cross-process locks.
   - NO server-side compaction (OpenAI has no equivalent of Anthropic's
     compact beta). Context is bounded by a pre-flight local trim EVERY turn,
     like the ollama provider — see _trim_to_fit_window.
@@ -41,6 +52,7 @@ import aiohttp
 from .agent import Agent
 from .utils import print_ts, COLOR_YELLOW, COLOR_RED, COLOR_END, load_json, save_json
 from . import _conversation_io as _cio
+from ._codex_auth import CodexAuthError, borrow_codex_key, codex_creds_exist
 from .config_global import (
     get_config,
     get_effort,
@@ -79,6 +91,34 @@ _FINISH_TO_STOP_REASON = {
     "length": "max_tokens",
     "content_filter": "refusal",
 }
+
+# Subscription-mode (Codex OAuth) request base — the ChatGPT backend's
+# Responses API, NOT api.openai.com. Verified protocol constant from the
+# llm-openai-via-codex reference; get_openai_base_url() does not apply here.
+_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+
+# Reasoning-effort vocabulary on the codex backend differs from Chat
+# Completions: low/medium/high/xhigh (no "minimal"). Validated here rather
+# than through get_effort() so a config of "xhigh" works in subscription
+# mode without loosening the Chat-Completions validation (where xhigh 400s).
+_CODEX_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
+
+
+def _codex_effort(model_name: str) -> str | None:
+    """Per-model `models.<bare>.effort` for subscription mode → the
+    `reasoning.effort` request field, or None to omit. "minimal" (valid for
+    Chat Completions, absent from the codex vocabulary) maps to "low" so one
+    config value stays usable across both paths."""
+    bare = model_name.split("/", 1)[1] if "/" in model_name else model_name
+    entry = ((get_config().get("models") or {}).get(bare)) or {}
+    level = entry.get("effort")
+    if isinstance(level, str):
+        lv = level.strip().lower()
+        if lv == "minimal":
+            return "low"
+        if lv in _CODEX_EFFORT_LEVELS:
+            return lv
+    return None
 
 
 def _build_openai_tool_schemas(tools: list[Callable]) -> list[dict]:
@@ -136,6 +176,56 @@ def _translate_tool_choice(tool_choice: dict | None) -> Any:
         return "none"
     if kind == "tool" and tool_choice.get("name"):
         return {"type": "function", "function": {"name": tool_choice["name"]}}
+    return None
+
+
+def _build_responses_tool_schemas(tools: list[Callable]) -> list[dict]:
+    """Convert openflip tool callables to the Responses API's FLAT function
+    format: {"type": "function", "name", "description", "parameters",
+    "strict": False} — no nested "function" envelope (that's the
+    Chat-Completions shape). Same source data as the other builders."""
+    schemas = []
+    for func in tools or []:
+        spec = getattr(func, "tool_spec", None)
+        if spec and isinstance(spec, dict):
+            schemas.append({
+                "type": "function",
+                "name": spec.get("name") or func.__name__,
+                "description": spec.get("description") or (func.__doc__ or "").strip()[:1000],
+                "parameters": spec.get("input_schema") or spec.get("parameters") or {
+                    "type": "object", "properties": {},
+                },
+                "strict": False,
+            })
+        else:
+            schemas.append({
+                "type": "function",
+                "name": func.__name__,
+                "description": (func.__doc__ or "").strip()[:1000],
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": True,
+                },
+                "strict": False,
+            })
+    return schemas
+
+
+def _translate_tool_choice_responses(tool_choice: dict | None) -> Any:
+    """Responses-API sibling of _translate_tool_choice: same string modes,
+    but a forced specific tool is flat {"type": "function", "name": X}."""
+    if not isinstance(tool_choice, dict):
+        return None
+    kind = tool_choice.get("type")
+    if kind == "any":
+        return "required"
+    if kind == "auto":
+        return "auto"
+    if kind == "none":
+        return "none"
+    if kind == "tool" and tool_choice.get("name"):
+        return {"type": "function", "name": tool_choice["name"]}
     return None
 
 
@@ -269,6 +359,186 @@ def _openflip_msgs_to_openai(messages: list, system_prompt: str) -> list[dict]:
     if system_text:
         api_msgs.insert(0, {"role": "system", "content": system_text})
     return api_msgs
+
+
+def _openflip_msgs_to_responses_input(
+    messages: list, system_prompt: str,
+) -> tuple[str, list[dict]]:
+    """Convert the local ChatMessage list to Responses-API form for the codex
+    subscription path. Returns (instructions, input_items).
+
+    The system prompt does NOT become a message — the Responses API takes it
+    as the top-level `instructions` field; mid-history system messages are
+    folded into it (same sys_parts behavior as the Chat-Completions
+    converter).
+
+    Tool-use round-tripping (the Responses item vocabulary): an assistant
+    message with paired tool calls becomes an optional assistant message item
+    (its text), then one {"type": "function_call", "call_id", "name",
+    "arguments"} item per call, then one {"type": "function_call_output",
+    "call_id", "output"} item per result.
+
+    If pairing is incomplete, degradation is IDENTICAL in policy to the
+    Chat-Completions converter: tool results demote to `[Previous tool
+    result: ...]` user items and the assistant message stays text-only.
+    Lossy but never 400s.
+    """
+    items: list[dict] = []
+    sys_parts: list[str] = []
+    if system_prompt:
+        sys_parts.append(system_prompt)
+
+    def _msg_role(m):
+        return m.get("role") if hasattr(m, "get") else getattr(m, "role", None)
+
+    def _msg_content(m):
+        return (m.get("content_text", None) if hasattr(m, "get") else None) \
+            or (m.get("content", "") if hasattr(m, "get") else getattr(m, "content", "")) \
+            or ""
+
+    def _msg_tool_calls(m):
+        if hasattr(m, "get"):
+            tcs = m.get("tool_calls", None)
+        else:
+            tcs = getattr(m, "tool_calls", None)
+        return tcs or []
+
+    def _user_item(text: str) -> dict:
+        return {"role": "user", "content": [{"type": "input_text", "text": text}]}
+
+    def _assistant_item(text: str) -> dict:
+        return {"role": "assistant", "content": [{"type": "output_text", "text": text}]}
+
+    i = 0
+    n = len(messages)
+    while i < n:
+        m = messages[i]
+        role = _msg_role(m)
+        content = _msg_content(m)
+
+        if role == "system":
+            if content:
+                sys_parts.append(content)
+            i += 1
+            continue
+
+        if role == "tool":
+            # Stray tool message (not consumed by the paired-assistant branch
+            # below) — demote to user text, same policy as the CC converter.
+            items.append(_user_item(f"[Previous tool result: {content}]"))
+            i += 1
+            continue
+
+        if role == "assistant":
+            tool_calls = _msg_tool_calls(m)
+            if tool_calls:
+                lookahead_results: list[tuple[int, str, str]] = []  # (idx, id, content)
+                j = i + 1
+                while j < n and _msg_role(messages[j]) == "tool":
+                    tm = messages[j]
+                    tid = tm.get("tool_use_id", "") if hasattr(tm, "get") else ""
+                    lookahead_results.append((j, tid, _msg_content(tm)))
+                    j += 1
+
+                call_ids = [getattr(tc, "tool_use_id", "") or "" for tc in tool_calls]
+                pair_ok = (
+                    len(lookahead_results) == len(tool_calls)
+                    and all(rid for _, rid, _ in lookahead_results)
+                    and all(cid for cid in call_ids)
+                    and {rid for _, rid, _ in lookahead_results} == set(call_ids)
+                )
+
+                if pair_ok:
+                    if content:
+                        items.append(_assistant_item(content))
+                    for tc in tool_calls:
+                        items.append({
+                            "type": "function_call",
+                            "call_id": tc.tool_use_id,
+                            "name": tc.function_name,
+                            "arguments": json.dumps(tc.args or {}, ensure_ascii=False),
+                        })
+                    for _, rid, rcontent in lookahead_results:
+                        items.append({
+                            "type": "function_call_output",
+                            "call_id": rid,
+                            "output": rcontent,
+                        })
+                    i = j  # skip past the paired tool messages
+                    continue
+
+                # Pairing failed — text-only assistant; following tool
+                # messages hit the demotion branch above.
+                if content:
+                    items.append(_assistant_item(content))
+                i += 1
+                continue
+
+            # Empty assistant text carries nothing — skip the item rather
+            # than send a zero-length output_text part.
+            if content:
+                items.append(_assistant_item(content))
+            i += 1
+            continue
+
+        if role == "user":
+            items.append(_user_item(content))
+            i += 1
+            continue
+
+        # Unknown role — skip.
+        i += 1
+
+    return "\n\n".join(p for p in sys_parts if p), items
+
+
+def _inject_pending_image_attachments_responses(
+    input_items: list[dict], pending: list[dict],
+) -> int:
+    """Responses-API sibling of _inject_pending_image_attachments: queued
+    images become {"type": "input_image", "image_url": "data:..."} parts
+    prepended to the LAST user message item's content list. Returns the
+    count injected. Validation shared via `_image_validator`."""
+    import base64
+    from ._image_validator import validate_and_normalize_image
+    if not pending or not input_items:
+        return 0
+    last_user = None
+    for item in reversed(input_items):
+        if item.get("role") == "user":
+            last_user = item
+            break
+    if last_user is None:
+        return 0
+    content = last_user.get("content")
+    if not isinstance(content, list):
+        return 0
+    image_parts: list[dict] = []
+    for entry in pending:
+        path = entry.get("path") if isinstance(entry, dict) else None
+        if not path:
+            continue
+        declared = (entry.get("content_type") or "image/png").lower()
+        normalized, mt_or_reason = validate_and_normalize_image(path, declared)
+        if normalized is None:
+            print_ts(
+                f"{COLOR_YELLOW}image attachment ({path}) rejected at "
+                f"inject-side safety net: {mt_or_reason}{COLOR_END}",
+            )
+            continue
+        try:
+            b64 = base64.b64encode(normalized).decode("ascii")
+        except Exception:
+            continue
+        image_parts.append({
+            "type": "input_image",
+            "image_url": f"data:{mt_or_reason};base64,{b64}",
+        })
+    if not image_parts:
+        return 0
+    # Image-then-text ordering, matching the other injectors.
+    last_user["content"] = image_parts + content
+    return len(image_parts)
 
 
 def _inject_pending_image_attachments(api_messages: list[dict], pending: list[dict]) -> int:
@@ -495,10 +765,217 @@ async def _stream_openai_events(resp_content) -> AsyncIterator:
     yield MessageStopEvent()
 
 
+async def _stream_codex_events(resp_content) -> AsyncIterator:
+    """Async generator translating Responses-API SSE events (codex
+    subscription backend) into the framework's StreamEvent taxonomy.
+
+    Responses SSE frames carry the event name BOTH as an `event:` line and
+    as the data object's `type` field — we key off the data `type` (more
+    robust than tracking `event:` lines across chunk boundaries). Events
+    handled (the shapes from the llm-openai-via-codex reference):
+      - response.output_text.delta   → text delta (`delta` field, block 0)
+      - response.output_item.added   → tool-block start when item.type ==
+                                       "function_call"
+      - response.output_item.done    → completed tool block (item carries
+                                       call_id / name / arguments-JSON-string)
+      - response.completed           → usage (response.usage.input_tokens /
+                                       output_tokens / input_tokens_details.
+                                       cached_tokens) + stop_reason
+      - response.failed / error      → FrameworkErrorEvent
+    Everything else (created, in_progress, content_part.*, delta echoes of
+    items we finalize on .done) is ignored.
+
+    Block-index convention matches _stream_openai_events: text is block 0;
+    tool call k is block k+1. Usage is normalized to the Chat-Completions
+    key shape (prompt_tokens / completion_tokens / prompt_tokens_details.
+    cached_tokens) so the caller's last_usage/ledger code is shared.
+    """
+    text_acc = ""
+    saw_text_start = False
+    sent_message_start = False
+    tool_block_by_key: dict[str, int] = {}  # item id/call_id → block index
+    next_tool_block = 1
+    any_tool = False
+    usage: dict = {}
+    stop_reason: str | None = None
+    failed_msg: str | None = None
+
+    line_buffer = ""
+    try:
+        async for raw_chunk in resp_content:
+            text = raw_chunk.decode("utf-8", errors="replace")
+            line_buffer += text
+            if "\n" not in line_buffer:
+                continue
+            parts = line_buffer.split("\n")
+            line_buffer = parts[-1]
+            for raw_line in parts[:-1]:
+                line = raw_line.rstrip("\r")
+                if not line.startswith("data:"):
+                    # `event:` lines / blank separators / comments: ignore.
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    yield FrameworkErrorEvent(
+                        message="SSE JSON decode error on codex chunk",
+                        kind="json_decode",
+                    )
+                    continue
+
+                etype = chunk.get("type", "")
+
+                if not sent_message_start:
+                    sent_message_start = True
+                    model = ((chunk.get("response") or {}).get("model")) or ""
+                    yield MessageStartEvent(model=model, usage={})
+
+                if etype == "response.output_text.delta":
+                    piece = chunk.get("delta") or ""
+                    if piece:
+                        if not saw_text_start:
+                            saw_text_start = True
+                            yield ContentBlockStartEvent(
+                                index=0, block_type="text",
+                                partial_block={"type": "text", "text": ""},
+                            )
+                        text_acc += piece
+                        yield ContentBlockDeltaEvent(
+                            index=0, delta={"type": "text_delta", "text": piece},
+                        )
+                    continue
+
+                if etype == "response.output_item.added":
+                    item = chunk.get("item") or {}
+                    if item.get("type") == "function_call":
+                        key = item.get("id") or item.get("call_id") \
+                            or f"out_{chunk.get('output_index', next_tool_block)}"
+                        idx = next_tool_block
+                        next_tool_block += 1
+                        tool_block_by_key[key] = idx
+                        yield ContentBlockStartEvent(
+                            index=idx, block_type="tool_use",
+                            partial_block={
+                                "type": "tool_use",
+                                "id": item.get("call_id") or "",
+                                "name": item.get("name") or "",
+                                "input": {},
+                            },
+                        )
+                    continue
+
+                if etype == "response.output_item.done":
+                    item = chunk.get("item") or {}
+                    if item.get("type") != "function_call":
+                        continue  # message items finalize via text_acc below
+                    any_tool = True
+                    key = item.get("id") or item.get("call_id") \
+                        or f"out_{chunk.get('output_index', '')}"
+                    idx = tool_block_by_key.get(key)
+                    if idx is None:
+                        # .done without a preceding .added — synthesize the
+                        # start so consumers always see paired events.
+                        idx = next_tool_block
+                        next_tool_block += 1
+                        yield ContentBlockStartEvent(
+                            index=idx, block_type="tool_use",
+                            partial_block={
+                                "type": "tool_use",
+                                "id": item.get("call_id") or "",
+                                "name": item.get("name") or "",
+                                "input": {},
+                            },
+                        )
+                    raw_args = item.get("arguments") or ""
+                    try:
+                        parsed = json.loads(raw_args) if raw_args else {}
+                        if not isinstance(parsed, dict):
+                            parsed = {}
+                    except json.JSONDecodeError:
+                        # Malformed arguments — leave empty; chat()'s
+                        # malformed-tool_use detector handles it.
+                        parsed = {}
+                    yield ContentBlockStopEvent(
+                        index=idx,
+                        completed_block={
+                            "type": "tool_use",
+                            "id": item.get("call_id") or item.get("id") or f"call_{idx}",
+                            "name": item.get("name") or "",
+                            "input": parsed,
+                        },
+                    )
+                    continue
+
+                if etype == "response.completed":
+                    response = chunk.get("response") or {}
+                    u = response.get("usage") or {}
+                    in_t = int(u.get("input_tokens", 0) or 0)
+                    out_t = int(u.get("output_tokens", 0) or 0)
+                    cached = int(((u.get("input_tokens_details") or {})
+                                  .get("cached_tokens", 0)) or 0)
+                    usage = {
+                        "prompt_tokens": in_t,
+                        "completion_tokens": out_t,
+                        "prompt_tokens_details": {"cached_tokens": cached},
+                        "responses_raw": dict(u),
+                    }
+                    inc_reason = ((response.get("incomplete_details") or {})
+                                  .get("reason") or "")
+                    if response.get("status") == "incomplete" and inc_reason == "max_output_tokens":
+                        stop_reason = "max_tokens"
+                    continue
+
+                if etype in ("response.failed", "error"):
+                    response = chunk.get("response") or {}
+                    err = response.get("error") or chunk.get("error") or {}
+                    failed_msg = (err.get("message") if isinstance(err, dict) else str(err)) \
+                        or "response.failed with no error detail"
+                    continue
+    except Exception as e:
+        yield FrameworkErrorEvent(
+            message=f"Stream transport error: {e}",
+            kind="transport",
+        )
+        return
+
+    if failed_msg:
+        yield FrameworkErrorEvent(
+            message=f"⚠️ OpenAI (codex) response failed: {failed_msg[:300]}",
+            kind="bad_request",
+        )
+        return
+
+    # ── Finalization: text block + terminal events ──
+    if text_acc:
+        yield ContentBlockStopEvent(
+            index=0, completed_block={"type": "text", "text": text_acc},
+        )
+    if stop_reason is None:
+        stop_reason = "tool_use" if any_tool else "end_turn"
+    yield MessageDeltaEvent(stop_reason=stop_reason, usage=dict(usage))
+
+    if not sent_message_start:
+        yield FrameworkErrorEvent(
+            message=(
+                "⚠️ OpenAI (codex) stream closed without sending any data. "
+                "Likely upstream degradation; retry in a moment."
+            ),
+            kind="empty_stream",
+        )
+        return
+    yield MessageStopEvent()
+
+
 class OpenAIConversation:
     """OpenAI-direct provider used when agent.provider == 'openai'.
 
-    Plain API-key auth against {base}/v1/chat/completions with SSE streaming.
+    Auth precedence per turn: Codex subscription OAuth (Responses API at
+    chatgpt.com/backend-api/codex) when `codex login` creds exist, else
+    plain API key against {base}/v1/chat/completions. Both stream SSE and
+    yield the same StreamEvent taxonomy.
     """
 
     def __init__(self, conversation_id: str, agent: Agent):
@@ -810,7 +1287,17 @@ class OpenAIConversation:
                     f"tool call was returned."
                 )
             else:
-                msg = "⚠️ Empty reply: no content and no finish_reason."
+                # No content, no tool call, AND no finish_reason — a transient
+                # API glitch, not a model decision. Return the plain empty
+                # response so runtime.py's empty-reply nudge-and-retry path
+                # handles it (one-shot per turn) instead of posting a
+                # framework-error warning straight to Discord.
+                print_ts(
+                    f"{COLOR_YELLOW}empty reply with no finish_reason — "
+                    f"deferring to runtime nudge-and-retry{COLOR_END}",
+                    agent=self.agent.id,
+                )
+                return response
             print_ts(
                 f"{COLOR_RED}{msg}{COLOR_END}",
                 agent=self.agent.id, error=True,
@@ -826,9 +1313,104 @@ class OpenAIConversation:
         tool_choice: dict | None = None,
         _retry_attempt: int = 0,
     ):
-        """Streaming worker — POSTs to /v1/chat/completions with stream=true
-        and yields StreamEvent objects (same taxonomy as the anthropic
-        provider, translated from OpenAI's chunk format by
+        """Streaming entry — dispatches on auth precedence:
+          1. Codex subscription creds present (auth.json, auth_mode chatgpt)
+             → _chat_stream_codex (Responses API, subscription billing).
+          2. Else API key configured → _chat_stream_apikey (Chat Completions).
+          3. Else → clear auth error naming both options.
+        Checked per turn, so `codex login` (or deleting auth.json) takes
+        effect without a restart."""
+        if codex_creds_exist():
+            worker = self._chat_stream_codex(
+                tools=tools, think=think,
+                tool_choice=tool_choice, _retry_attempt=_retry_attempt,
+            )
+        elif get_openai_api_key():
+            worker = self._chat_stream_apikey(
+                tools=tools, think=think,
+                tool_choice=tool_choice, _retry_attempt=_retry_attempt,
+            )
+        else:
+            yield FrameworkErrorEvent(
+                message=("⚠️ OpenAI auth unconfigured — either `codex login` "
+                         "with a ChatGPT subscription (writes ~/.codex/auth.json; "
+                         "preferred), or set integrations.openai.api_key in "
+                         "config.json / the OPENAI_API_KEY environment variable."),
+                kind="auth",
+            )
+            return
+        async for ev in worker:
+            yield ev
+
+    def _record_usage(self, final_usage: dict, stream_failed: bool) -> None:
+        """Shared post-stream bookkeeping for both auth paths: update
+        last_usage (+ meta sidecar) and append a usage-ledger row.
+        `final_usage` is in Chat-Completions key shape — the codex stream
+        translator normalizes Responses usage into it."""
+        prompt_tokens = int(final_usage.get("prompt_tokens", 0) or 0)
+        completion_tokens = int(final_usage.get("completion_tokens", 0) or 0)
+        cached = int(((final_usage.get("prompt_tokens_details") or {})
+                      .get("cached_tokens", 0)) or 0)
+        # Ledger/status key mapping: OpenAI's prompt_tokens INCLUDES cached
+        # tokens (Anthropic's input_tokens excludes them), so split here to
+        # keep total_input = input + cache_read across providers.
+        self.last_usage = {
+            "input_tokens": max(prompt_tokens - cached, 0),
+            "output_tokens": completion_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": cached,
+            "total_input": prompt_tokens,
+            "ts": time.time(),
+            "partial": stream_failed,
+        }
+        try:
+            self._save_meta()
+        except Exception:
+            pass
+        print_ts(
+            f"openai usage: in={prompt_tokens} out={completion_tokens} "
+            f"cache_read={cached}"
+            f"{' (partial)' if stream_failed else ''}",
+            agent=self.agent.id,
+        )
+        try:
+            from . import usage_ledger
+            _conv_id = getattr(self, "conversation_id", "") or ""
+            if ":" in _conv_id:
+                _transport, _channel_id = _conv_id.split(":", 1)
+            else:
+                _transport, _channel_id = None, (_conv_id or None)
+            # record_usage reads the anthropic-shaped keys; merge in the raw
+            # OpenAI fields so raw_usage preserves everything the API returned.
+            _ledger_usage = dict(self.last_usage)
+            _ledger_usage["openai_raw"] = final_usage
+            usage_ledger.record_usage(
+                agent_id=self.agent.id,
+                transport=_transport,
+                channel_id=_channel_id,
+                session_id=_conv_id or None,
+                user_id=None,
+                user_handle=None,
+                model=self.model,
+                usage=_ledger_usage,
+                outcome=("error" if stream_failed else "ok"),
+            )
+        except Exception as _led_e:
+            print_ts(
+                f"usage_ledger record failed (continuing): {_led_e}",
+                agent=self.agent.id, error=True,
+            )
+
+    async def _chat_stream_apikey(
+        self,
+        tools: list[Callable] = None,
+        think: bool = None,
+        tool_choice: dict | None = None,
+        _retry_attempt: int = 0,
+    ):
+        """API-key fallback worker — POSTs to /v1/chat/completions with
+        stream=true and yields StreamEvent objects (same taxonomy as the
+        anthropic provider, translated from OpenAI's chunk format by
         _stream_openai_events).
 
         Side effects matching the anthropic sibling:
@@ -1005,7 +1587,9 @@ class OpenAIConversation:
                         )
                         self._retry_budget = new_budget
                         try:
-                            async for ev in self.chat_stream(
+                            # Recurse into THIS worker, not the dispatcher —
+                            # the retry must stay on the same auth path.
+                            async for ev in self._chat_stream_apikey(
                                 tools=tools, think=think,
                                 tool_choice=tool_choice,
                                 _retry_attempt=_retry_attempt + 1,
@@ -1047,61 +1631,7 @@ class OpenAIConversation:
                     )
                 finally:
                     if _final_usage:
-                        prompt_tokens = int(_final_usage.get("prompt_tokens", 0) or 0)
-                        completion_tokens = int(_final_usage.get("completion_tokens", 0) or 0)
-                        cached = int(((_final_usage.get("prompt_tokens_details") or {})
-                                      .get("cached_tokens", 0)) or 0)
-                        # Ledger/status key mapping: OpenAI's prompt_tokens
-                        # INCLUDES cached tokens (Anthropic's input_tokens
-                        # excludes them), so split here to keep
-                        # total_input = input + cache_read across providers.
-                        self.last_usage = {
-                            "input_tokens": max(prompt_tokens - cached, 0),
-                            "output_tokens": completion_tokens,
-                            "cache_creation_input_tokens": 0,
-                            "cache_read_input_tokens": cached,
-                            "total_input": prompt_tokens,
-                            "ts": time.time(),
-                            "partial": _stream_failed,
-                        }
-                        try:
-                            self._save_meta()
-                        except Exception:
-                            pass
-                        print_ts(
-                            f"openai usage: in={prompt_tokens} out={completion_tokens} "
-                            f"cache_read={cached}"
-                            f"{' (partial)' if _stream_failed else ''}",
-                            agent=self.agent.id,
-                        )
-                        try:
-                            from . import usage_ledger
-                            _conv_id = getattr(self, "conversation_id", "") or ""
-                            if ":" in _conv_id:
-                                _transport, _channel_id = _conv_id.split(":", 1)
-                            else:
-                                _transport, _channel_id = None, (_conv_id or None)
-                            # record_usage reads the anthropic-shaped keys;
-                            # merge in the raw OpenAI fields so raw_usage
-                            # preserves everything the API returned.
-                            _ledger_usage = dict(self.last_usage)
-                            _ledger_usage["openai_raw"] = _final_usage
-                            usage_ledger.record_usage(
-                                agent_id=self.agent.id,
-                                transport=_transport,
-                                channel_id=_channel_id,
-                                session_id=_conv_id or None,
-                                user_id=None,
-                                user_handle=None,
-                                model=self.model,
-                                usage=_ledger_usage,
-                                outcome=("error" if _stream_failed else "ok"),
-                            )
-                        except Exception as _led_e:
-                            print_ts(
-                                f"usage_ledger record failed (continuing): {_led_e}",
-                                agent=self.agent.id, error=True,
-                            )
+                        self._record_usage(_final_usage, _stream_failed)
 
                 if _stream_failed:
                     return
@@ -1119,6 +1649,275 @@ class OpenAIConversation:
             )
             yield FrameworkErrorEvent(
                 message=f"⚠️ OpenAI API error: {e}",
+                kind="transport",
+            )
+            return
+
+    async def _chat_stream_codex(
+        self,
+        tools: list[Callable] = None,
+        think: bool = None,
+        tool_choice: dict | None = None,
+        _retry_attempt: int = 0,
+    ):
+        """Subscription-mode worker — POSTs to the Responses API at
+        {_CODEX_BASE_URL}/responses with the Codex OAuth bearer token and
+        yields StreamEvent objects (translated by _stream_codex_events).
+
+        Auth: borrow_codex_key() refreshes on JWT expiry (30s skew) before
+        the request; a 401 forces one refresh-and-retry (mirroring the
+        anthropic provider's 401 path), then surfaces a terminal auth error.
+        Side effects (last_usage / meta sidecar / usage ledger / pre-flight
+        trim / REMINDER.md / image injection) match the api-key worker.
+        Recovery paths: 429 → rate_limit; 400 context overflow → halve
+        budget + retry (≤3); other non-200 → bad_request.
+        """
+        try:
+            access_token, account_id = await borrow_codex_key()
+        except CodexAuthError as e:
+            yield FrameworkErrorEvent(message=f"⚠️ {e}", kind="auth")
+            return
+
+        dropped = self._trim_to_fit_window()
+        if dropped:
+            print_ts(
+                f"{COLOR_YELLOW}pre-flight trim: dropped {dropped} oldest message(s) "
+                f"to fit context window (openai-codex){COLOR_END}",
+                agent=self.agent.id,
+            )
+
+        instructions, input_items = _openflip_msgs_to_responses_input(
+            self.messages, self.system_message or ""
+        )
+
+        # Inject queued image attachments (vision). Pop the queue first so a
+        # failed request doesn't double-attach on retry.
+        _pending_imgs = getattr(self, "_pending_image_attachments", None) or []
+        if _pending_imgs:
+            self._pending_image_attachments = []
+            _injected = _inject_pending_image_attachments_responses(
+                input_items, _pending_imgs
+            )
+            if _injected:
+                print_ts(
+                    f"  → injected {_injected} image attachment(s) into request (openai-codex)",
+                    agent=self.agent.id,
+                )
+
+        # REMINDER.md injection — same semantics as the other providers:
+        # uncached tail position, before the newest user message, never
+        # persisted. Skipped unless the last item is a user message (a
+        # function_call_output tail must stay adjacent to its call).
+        try:
+            agent_dir = os.path.dirname(self.agent.path) if getattr(self.agent, "path", None) else None
+            if agent_dir:
+                reminder_path = os.path.join(agent_dir, "REMINDER.md")
+                if os.path.exists(reminder_path):
+                    with open(reminder_path, "r", encoding="utf-8") as _f:
+                        reminder_text = _f.read().strip()
+                    if reminder_text:
+                        if len(reminder_text) > 2000:
+                            print_ts(
+                                f"{COLOR_YELLOW}REMINDER.md is {len(reminder_text)} chars "
+                                f"(~{len(reminder_text) // 4} tokens) — paid every turn. "
+                                f"Consider trimming.{COLOR_END}",
+                                agent=self.agent.id,
+                            )
+                        if input_items and input_items[-1].get("role") == "user":
+                            reminder_item = {
+                                "role": "user",
+                                "content": [{
+                                    "type": "input_text",
+                                    "text": f"[SYSTEM REMINDER]: {reminder_text}",
+                                }],
+                            }
+                            input_items = (
+                                input_items[:-1] + [reminder_item] + [input_items[-1]]
+                            )
+        except Exception as _rem_err:
+            print_ts(
+                f"{COLOR_YELLOW}REMINDER.md injection failed (continuing without): "
+                f"{_rem_err}{COLOR_END}",
+                agent=self.agent.id,
+            )
+
+        body: dict[str, Any] = {
+            "model": self.model,
+            "input": input_items,
+            "stream": True,
+            # Subscription requests must not be stored server-side (the
+            # reference plugin always sends store=False on this backend).
+            "store": False,
+        }
+        if instructions:
+            body["instructions"] = instructions
+        _max_out = self._max_output_tokens()
+        if _max_out:
+            body["max_output_tokens"] = _max_out
+        _effort = _codex_effort(self.agent.model)
+        if _effort:
+            body["reasoning"] = {"effort": _effort}
+
+        tool_schemas = _build_responses_tool_schemas(tools or [])
+        if tool_schemas:
+            body["tools"] = tool_schemas
+            _tc = _translate_tool_choice_responses(tool_choice)
+            if _tc is not None:
+                body["tool_choice"] = _tc
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "content-type": "application/json",
+        }
+        if account_id:
+            headers["ChatGPT-Account-ID"] = account_id
+
+        session = await self._ensure_http_session()
+
+        # Request dump — same env knobs as the other providers.
+        if os.environ.get("OPENFLIP_REQUEST_DUMP") == "1" or os.environ.get("OPENFLIP_REQUEST_DUMP_FULL") == "1":
+            try:
+                _stamp = f"{self.agent.id}_{int(time.time() * 1000)}"
+                from .utils import project_root as _pr
+                _dump_dir = os.path.join(_pr(), "data", "request_dumps")
+                os.makedirs(_dump_dir, exist_ok=True)
+                _dump_path = os.path.join(_dump_dir, f"{_stamp}.req.json")
+                if os.environ.get("OPENFLIP_REQUEST_DUMP_FULL") == "1":
+                    _body_summary = body
+                else:
+                    _body_summary = {k: body[k] for k in ("model", "stream") if k in body}
+                    if input_items:
+                        _body_summary["last_item"] = input_items[-1]
+                with open(_dump_path, "w") as _df:
+                    json.dump({
+                        "url": f"{_CODEX_BASE_URL}/responses",
+                        "body_summary": _body_summary,
+                    }, _df, indent=2)
+            except Exception as _dump_e:
+                print_ts(f"{COLOR_YELLOW}request_dump failed: {_dump_e}{COLOR_END}", agent=self.agent.id)
+
+        try:
+            async with session.post(
+                f"{_CODEX_BASE_URL}/responses",
+                json=body,
+                headers=headers,
+            ) as resp:
+                status = resp.status
+
+                if status != 200:
+                    text = await resp.text()
+                    if status == 401:
+                        if _retry_attempt == 0:
+                            print_ts(
+                                f"{COLOR_YELLOW}Codex 401 — forcing token refresh "
+                                f"and retrying{COLOR_END}",
+                                agent=self.agent.id,
+                            )
+                            try:
+                                await borrow_codex_key(force_refresh=True)
+                            except CodexAuthError as e:
+                                yield FrameworkErrorEvent(message=f"⚠️ {e}", kind="auth")
+                                return
+                            async for ev in self._chat_stream_codex(
+                                tools=tools, think=think,
+                                tool_choice=tool_choice,
+                                _retry_attempt=_retry_attempt + 1,
+                            ):
+                                yield ev
+                            return
+                        yield FrameworkErrorEvent(
+                            message=("⚠️ Codex subscription token rejected (401) "
+                                     "even after refresh. Run `codex login` again."),
+                            kind="auth",
+                        )
+                        return
+                    if status == 429:
+                        snippet = text[:200].replace("\n", " ")
+                        yield FrameworkErrorEvent(
+                            message=(f"⚠️ OpenAI rate/usage limit (429) on the "
+                                     f"ChatGPT subscription. {snippet}"),
+                            kind="rate_limit",
+                        )
+                        return
+                    # Context overflow → shrink budget and retry (≤3), same
+                    # recovery shape as the api-key worker.
+                    _lower = text.lower()
+                    if (
+                        status == 400
+                        and _retry_attempt < 3
+                        and ("context_length_exceeded" in _lower
+                             or "maximum context length" in _lower
+                             or "context window" in _lower)
+                    ):
+                        window = get_model_context_window(self.agent.model, "openai")
+                        new_budget = max(window // (2 ** (_retry_attempt + 1)), 8_000)
+                        print_ts(
+                            f"{COLOR_YELLOW}context overflow — retry "
+                            f"{_retry_attempt + 1}/3 with budget {new_budget:,} (openai-codex){COLOR_END}",
+                            agent=self.agent.id,
+                        )
+                        self._retry_budget = new_budget
+                        try:
+                            async for ev in self._chat_stream_codex(
+                                tools=tools, think=think,
+                                tool_choice=tool_choice,
+                                _retry_attempt=_retry_attempt + 1,
+                            ):
+                                yield ev
+                            return
+                        finally:
+                            self._retry_budget = None
+                    print_ts(
+                        f"{COLOR_RED}OpenAI (codex) API {status}: {text[:600]}{COLOR_END}",
+                        agent=self.agent.id, error=True,
+                    )
+                    snippet = text[:200].replace("\n", " ")
+                    yield FrameworkErrorEvent(
+                        message=f"⚠️ OpenAI (codex) API {status}: {snippet}",
+                        kind="bad_request",
+                    )
+                    return
+
+                # Status 200 — translate the Responses SSE stream.
+                _final_usage: dict = {}
+                _stream_failed = False
+                try:
+                    async for ev in _stream_codex_events(resp.content):
+                        if isinstance(ev, FrameworkErrorEvent):
+                            _stream_failed = True
+                        elif isinstance(ev, MessageDeltaEvent) and ev.usage:
+                            _final_usage = dict(ev.usage)
+                        yield ev
+                except Exception as _stream_e:
+                    _stream_failed = True
+                    print_ts(
+                        f"{COLOR_RED}Stream consumption error: {_stream_e}{COLOR_END}",
+                        agent=self.agent.id, error=True,
+                    )
+                    yield FrameworkErrorEvent(
+                        message=f"⚠️ Stream error: {_stream_e}",
+                        kind="transport",
+                    )
+                finally:
+                    if _final_usage:
+                        self._record_usage(_final_usage, _stream_failed)
+
+                if _stream_failed:
+                    return
+
+        except asyncio.TimeoutError:
+            yield FrameworkErrorEvent(
+                message="⚠️ OpenAI (codex) API timed out (5 min).",
+                kind="timeout",
+            )
+            return
+        except Exception as e:
+            print_ts(
+                f"{COLOR_RED}chat_stream exception (codex): {e}{COLOR_END}",
+                agent=self.agent.id, error=True,
+            )
+            yield FrameworkErrorEvent(
+                message=f"⚠️ OpenAI (codex) API error: {e}",
                 kind="transport",
             )
             return

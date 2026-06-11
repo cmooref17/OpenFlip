@@ -146,7 +146,8 @@ them), not in any agent.json.
   `"ollama"`. Picks which conversation class wraps the agent (routing
   lives in `openflip/providers.py`): `AnthropicConversation` for direct
   API calls through the operator's Claude OAuth, `OpenAIConversation`
-  for direct API-key calls to OpenAI's Chat Completions endpoint, or
+  for direct OpenAI calls (ChatGPT-subscription OAuth preferred, API key
+  as fallback — see the openai-provider section below), or
   `DiscordConversation` (Ollama-backed) for local models. All three are
   NATIVE providers — the agent's own turns run on that API.
 - `model` — provider-specific model name. **For Anthropic, the working
@@ -186,19 +187,58 @@ them), not in any agent.json.
 
 ### The "openai" provider — setup + what's supported
 
-Auth is a plain API key — no OAuth, no token refresh. Configure it in
-`config.json` (or set the standard `OPENAI_API_KEY` environment variable
-as a fallback):
+TWO auth paths, checked in this order on every turn (no restart needed
+to switch):
+
+**1. ChatGPT/Codex subscription OAuth (PREFERRED).** Run `codex login`
+once with the ChatGPT-subscription flow — it writes
+`~/.codex/auth.json` (`auth_mode: "chatgpt"` + OAuth tokens). When that
+file exists, openflip uses it: requests go to the **Responses API** at
+`https://chatgpt.com/backend-api/codex` (NOT api.openai.com), billed
+against the subscription instead of metered API credits. openflip reads
+and auto-refreshes the tokens itself (`openflip/_codex_auth.py` —
+JWT-expiry check with 30s skew, refresh against auth.openai.com, atomic
+0o600 write-back, same cross-process refresh-lock discipline as the
+anthropic provider), so the login is one-time until OpenAI invalidates
+the refresh token (then the bot says to `codex login` again).
+- `CODEX_HOME` env var overrides the `~/.codex` directory.
+- Cross-platform: the path resolves via `expanduser` — works on Linux
+  and macOS identically (Windows too; the cross-process refresh flock
+  is POSIX-only there and degrades to in-process locking).
+- An `auth.json` with `auth_mode: "apikey"` is ignored (falls through
+  to path 2) — only the subscription OAuth mode is supported here.
+
+**2. Plain API key (FALLBACK).** Used only when no subscription creds
+exist. Requests go to the standard **Chat Completions API**
+(`{base_url}/v1/chat/completions`). Configure in `config.json` (or set
+the standard `OPENAI_API_KEY` environment variable):
 
 ```json
 "integrations": {
   "openai": {
     "api_key": "sk-...",
-    "base_url": "https://api.openai.com",   // optional; for proxies/gateways
+    "base_url": "https://api.openai.com",   // optional; for proxies/gateways (api-key path only)
     "default_model": "gpt-5.1"              // optional; used when agent.model is empty
   }
 }
 ```
+
+If neither is configured, the agent surfaces a clear auth error naming
+both options.
+
+The two paths use DIFFERENT request/response protocols under the hood
+(Responses API `input`/`function_call` items + per-event SSE vs Chat
+Completions `messages`/`tool_calls` + chunk deltas), but both translate
+into the same framework stream events — behavior, tools, persistence,
+and `/status` are identical regardless of path. Path-specific notes:
+- `base_url` does NOT apply to subscription mode (its base is fixed).
+- Model ids must be ones the auth can access: subscription mode serves
+  the codex model family (e.g. `gpt-5.1-codex`); the api-key path
+  serves whatever the key can access.
+- `models.<id>.effort` vocabulary differs per path: Chat Completions
+  accepts `minimal`/`low`/`medium`/`high`; the codex backend accepts
+  `low`/`medium`/`high`/`xhigh` (`minimal` is auto-mapped to `low`
+  there, `xhigh` only works in subscription mode).
 
 Then in the agent's `agent.json`: `"provider": "openai"`,
 `"model": "openai/gpt-5.1"`. Declare the model in `config.json`'s
@@ -219,8 +259,9 @@ NOT supported (deliberate differences — these commands answer
   like the ollama provider. Nothing is summarized — trimmed history
   stays on disk but leaves the model's context.
 - **No `/effort` session override** — only the per-model
-  `models.<id>.effort` config knob (see below; openai vocabulary is
-  `minimal`/`low`/`medium`/`high`).
+  `models.<id>.effort` config knob (see below; vocabulary differs by
+  auth path — api-key: `minimal`/`low`/`medium`/`high`; subscription:
+  `low`/`medium`/`high`/`xhigh`).
 - **No explicit prompt-cache control** — OpenAI caches prompt prefixes
   automatically; cache reads show up in `/status` and the ledger as
   `cache_read` tokens, and `cache_creation` is always 0.
@@ -574,14 +615,20 @@ entry before invocation. The owner ID is always allowed on Discord (see
   session_id: str = "")`**
   — fire a synthetic turn at another running agent. Fire-and-forget.
   Framed as `"<your_id>: <message>"` to the recipient.
-  **`session_id` is the canonical target conversation key** — pass the
+  **`session_id` is the explicit target conversation key** — pass the
   transport-prefixed id (e.g. `"discord:12345"`, `"imessage:you@example.com"`,
-  `"internal:email-support"`) and it is used DIRECTLY: all the
-  return-channel guessing is bypassed. `channel_id` is the
+  `"internal:email-support"`) and it is used DIRECTLY as the recipient's
+  conversation; do this only when the recipient genuinely needs a specific
+  (usually human-facing) conversation's context. `channel_id` is the
   deprecated-but-supported bare-int fallback, used only when `session_id`
-  is empty. When BOTH are omitted, the return channel auto-resolves via:
-  (1) caller's current channel if recipient can access, (2) recipient's DM
-  with the originating human, (3) caller's channel. Chain depth cap: 20.
+  is empty. **When BOTH are omitted (the normal case), the recipient
+  processes the message in a dedicated per-peer conversation in its own
+  namespace — `internal:peer-<caller>` — never in a human-facing channel.**
+  (The old default resolved a real channel — caller's channel, else the
+  recipient's DM with the originating human — which leaked inter-agent
+  traffic into operator-facing conversations; removed 2026-06.) The
+  recipient's reply auto-routes back to the caller's own conversation as a
+  silent chain-terminator turn. Chain depth cap: 20.
   Generates a fresh chain_id per dispatch; a reply on a superseded chain_id is delivered with a `[FRAMEWORK]` late-reply prefix (it used to be silently dropped).
 - **`end_chain()`** — explicitly end a chain-terminator turn without
   dispatching anywhere. Use when silence is correct (recipient agent
@@ -1046,10 +1093,13 @@ privilege across transports:
 `/stop` and the text-command mirrors operate on the linked conversation when
 fired from a linked DM on either transport (one `/reset` wipes the shared
 history). `inject_context` / `talk_to_agent` accept
-`session_id: "linked:<canonical>"` to target the shared history directly;
-for `talk_to_agent` the visible reply still needs a real channel to land on
-(inter-agent auto-route handles that), since a linked conversation spans two
-native channels and has no single posting target of its own.
+`session_id: "linked:<canonical>"` to target the shared history directly.
+A `talk_to_agent` recipient's reply doesn't post anywhere (inter-agent
+traffic is silent end-to-end) — it auto-routes back into the caller's own
+conversation; when the caller is itself in a linked conversation, the
+threaded `originator_session` keeps the return on the shared
+`linked:<canonical>` history instead of forking it onto a native channel
+key.
 
 ## JSONL shape
 
@@ -1476,17 +1526,33 @@ intermediate tool output still flows through `tool_response_mode`.
 
 ## Inter-agent communication
 
-`talk_to_agent(agent_id, message, channel_id=0)` — fire-and-forget.
-The recipient sees `"<your_id>: <message>"` as a synthetic user turn.
+`talk_to_agent(agent_id, message, channel_id=0, session_id="")` —
+fire-and-forget. The recipient sees `"<your_id>: <message>"` as a
+synthetic user turn. With no explicit `session_id`/`channel_id` (the
+normal case) the recipient processes it in a dedicated per-peer
+conversation in its own namespace (`internal:peer-<caller>`), never in a
+human-facing channel conversation.
 
 ## Visibility
 
-- **Operator-initiated chains** (chain root = a human in a channel):
-  the recipient's final reply auto-routes back to the operator's
-  channel as if you said it.
-- **Agent-initiated chains** (chain root = cron, heartbeat, or another
-  silent context): chains run silent unless the agent explicitly calls
-  `send_message`. Chain root is tagged via `originator_visibility`.
+**Inter-agent traffic is silent end-to-end (enforced 2026-06).** Neither
+the recipient's turns nor the chain-terminator return turns at the caller
+auto-post to any human channel, regardless of how the chain started. The
+ONLY way agent-to-agent traffic reaches a human is an explicit
+`send_message`. The operator's window into inter-agent conversations is
+the OpenFlip dashboard (reads conversation files directly).
+
+Chain root still matters for two things (tagged via
+`originator_visibility`, propagated along the whole chain):
+
+- **Operator-rooted chains** (root = a human message, or legacy ""):
+  the caller's chain-terminator turn gets a prompt extension telling it a
+  human is waiting and to deliver the answer via `send_message` (which
+  defaults to the conversation the chain started from). FAILURES surface:
+  a chain-terminator turn that dies empty, or a `[CHAIN_ERROR]`, posts a
+  hard-failure notice to the originating channel rather than vanishing.
+- **Agent-rooted chains** (root = cron, heartbeat, kairos, another
+  silent context): failures log loudly but stay off human channels too.
 
 ## Chain mechanics
 
@@ -1494,10 +1560,19 @@ The recipient sees `"<your_id>: <message>"` as a synthetic user turn.
   cap.
 - **Chain IDs.** Each `talk_to_agent` dispatch generates a fresh UUID
   stored at `_current_chain_to[recipient_id]` and persisted to
-  `chain_state.json`. Replies on stale chain_ids drop silently.
-- **End-of-chain.** `end_chain()` is the explicit "nothing further to
-  return" terminator. Otherwise: a normal text reply from the recipient
-  routes back through the chain.
+  `chain_state.json`. A reply on a superseded chain_id is delivered with
+  a `[FRAMEWORK]` late-reply prefix (not dropped).
+- **Return routing.** The recipient's reply returns to the caller's OWN
+  conversation — the one the dispatch happened from. `talk_to_agent`
+  threads the caller's full Session (`originator_session`), so returns
+  work even when that conversation has no routable bare channel id
+  (internal peer sessions, identity-linked conversations, iMessage
+  handle-keyed 1:1s). Plain Discord channels use the bare channel id as
+  before.
+- **End-of-chain.** A chain-terminator turn that ends in plain text
+  simply closes the chain — the text is saved to history (dashboard-
+  visible) but posted nowhere. `end_chain()` remains as an explicit
+  no-op terminator where it's in the toolset.
 
 ## Discovering peers
 
@@ -1847,6 +1922,16 @@ openflip --since "10 minutes ago"`.
      response (reason: ...). Try `/reset` if it persists." When the
      in-loop framework-error branch already posted the error to the
      channel, the terminal contract stays silent (no double-post).
+   - `empty reply with no stop_reason — deferring to runtime
+     nudge-and-retry` (anthropic/openai provider). A turn that came
+     back with no content, no tool_use, AND no stop_reason is a
+     transient API glitch, not a model decision — it is NOT posted to
+     the channel. The runtime injects a [FRAMEWORK] nudge and retries
+     once (`OPENFLIP_DISABLE_EMPTY_RETRY=1` to disable); only if the
+     retry is also empty does the terminal contract surface the
+     "empty response" message above. A real refusal
+     (`stop_reason=refusal` → "⚠️ Model declined ...") or an empty
+     reply WITH a stop_reason still posts immediately.
    - `OAuth token unavailable` (refresh failed; see section 13).
    - `MalformedRequestError` (request body failed pre-flight
      validation; Anthropic 400 short-circuited).
@@ -1930,10 +2015,13 @@ bare model id — the `-1m` suffix is part of the key, so a 1m-context model key
   `config_global.get_effort`. For Anthropic models it's sent as
   `output_config.effort` on every `/v1/messages` request; valid values (the
   ONLY five accepted): `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`.
-  For OpenAI models it's sent as `reasoning_effort` on the Chat Completions
-  request; valid values: `"minimal"`, `"low"`, `"medium"`, `"high"` — and it
-  must ONLY be set on reasoning-capable models (o-series / gpt-5 family);
-  other OpenAI models 400 on the parameter. **Omitting it — or setting
+  For OpenAI models on the api-key path it's sent as `reasoning_effort` on
+  the Chat Completions request; valid values: `"minimal"`, `"low"`,
+  `"medium"`, `"high"` — and it must ONLY be set on reasoning-capable models
+  (o-series / gpt-5 family); other OpenAI models 400 on the parameter. In
+  subscription (codex) mode it's sent as `reasoning.effort` on the Responses
+  request instead, with the codex vocabulary `"low"`/`"medium"`/`"high"`/
+  `"xhigh"` (`"minimal"` auto-maps to `"low"` there). **Omitting it — or setting
   anything else — sends no effort field at all, so the API falls back to its
   default (Anthropic: `"high"`).** Junk values (wrong type, typo, unknown
   level) resolve to "absent". `get_effort` also returns None for the ollama
