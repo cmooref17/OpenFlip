@@ -190,7 +190,9 @@ async def _do_reset(runner, ch_id, channel, transport, session_id) -> None:
             await _send(transport, session_id, channel,
                         "⚠️ /reset: could not resolve conversation id for this channel.")
             return
-        jsonl_path = os.path.join(agent_dir, "conversations", conv_id + ".jsonl")
+        # conversation_path handles the Windows filename encoding (":" → "%3A").
+        from . import _conversation_io as _cio_reset
+        jsonl_path = _cio_reset.conversation_path(agent_dir, conv_id)
         if os.path.exists(jsonl_path):
             try:
                 backup = f"{jsonl_path}.pre_reset_{int(time.time())}.bak.jsonl"
@@ -218,7 +220,7 @@ async def _do_reset(runner, ch_id, channel, transport, session_id) -> None:
                     agent=runner.agent.id,
                 )
         for ext in (".jsonl", ".meta.json"):
-            target = os.path.join(agent_dir, "conversations", conv_id + ext)
+            target = os.path.join(agent_dir, "conversations", _cio_reset.fs_encode(conv_id) + ext)
             try:
                 if os.path.exists(target):
                     os.remove(target)
@@ -260,8 +262,9 @@ async def _do_uncompact(runner, ch_id, channel, transport, session_id) -> None:
         await _send(transport, session_id, channel,
                     "⚠️ /uncompact: could not resolve conversation id for this channel.")
         return
-    jsonl_path = os.path.join(agent_dir, "conversations", conv_id + ".jsonl")
-    meta_path = os.path.join(agent_dir, "conversations", conv_id + ".meta.json")
+    from . import _conversation_io as _cio_uc
+    jsonl_path = _cio_uc.conversation_path(agent_dir, conv_id)
+    meta_path = os.path.join(agent_dir, "conversations", _cio_uc.fs_encode(conv_id) + ".meta.json")
     baks = sorted(glob.glob(f"{jsonl_path}.compaction_*.bak.jsonl"))
     if not baks:
         await _send(transport, session_id, channel,

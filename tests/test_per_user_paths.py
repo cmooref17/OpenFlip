@@ -98,12 +98,19 @@ def _check_access_OLD(agent, full_path, mode):
     if not allowed_:
         if mode == "read":
             agent_dir = os.path.dirname(agent.path)
-            for fallback in (agent_dir, "/tmp"):
+            # 2026-06-11 Windows-compat: the live implementation switched the
+            # universal read fallback from literal "/tmp" to
+            # tempfile.gettempdir() (same dir on POSIX) and reworded the
+            # denial message. Mirrored here so the string-equality comparison
+            # keeps proving per-user-resolution parity, which is this test's
+            # actual subject.
+            import tempfile as _tempfile
+            for fallback in (agent_dir, _tempfile.gettempdir()):
                 if _is_within(full_path, fallback):
                     return None
             return (
                 f"Access denied: {safe_path_display(full_path)} (no allowed_read_paths "
-                f"configured; default read scope is agent dir + /tmp)"
+                f"configured; default read scope is agent dir + the system temp dir)"
             )
         return (
             f"Access denied: {safe_path_display(full_path)} (no allowed_write_paths configured; "

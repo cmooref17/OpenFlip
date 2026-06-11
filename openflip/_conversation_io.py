@@ -51,14 +51,44 @@ def _safe_conversation_id(conversation_id: str) -> str:
     return cid
 
 
+# Windows forbids ":" in filenames — NTFS treats it as the alternate-data-
+# stream separator, so opening "discord:123.jsonl" would silently write to
+# a stream named "123.jsonl" hanging off a zero-byte file called "discord",
+# collapsing every conversation into invisible streams of one file. The
+# conversation_id keeps its canonical "transport:id" shape everywhere in
+# memory and in URLs; ONLY the on-disk filename swaps ":" for "%3A" (the
+# URL-encoding of ":" — unambiguous because "%" never appears in a real
+# conversation_id). POSIX filenames are unchanged, so existing Linux/macOS
+# deployments keep their files byte-for-byte.
+_FS_COLON = "%3A"
+
+
+def fs_encode(conversation_id: str) -> str:
+    """Conversation id → on-disk filename stem. Identity on POSIX; on
+    Windows the ":" separator is encoded as "%3A". Safe to call on glob
+    patterns too ("*:123" → "*%3A123"). Raises on unsafe ids — same
+    fail-closed contract as conversation_path."""
+    cid = _safe_conversation_id(conversation_id)
+    if os.name == "nt":
+        return cid.replace(":", _FS_COLON)
+    return cid
+
+
+def fs_decode(stem: str) -> str:
+    """On-disk filename stem → conversation id. Inverse of fs_encode."""
+    if os.name == "nt":
+        return stem.replace(_FS_COLON, ":")
+    return stem
+
+
 def conversation_path(agent_dir: str, conversation_id: str) -> str:
     """JSONL message log for one channel."""
-    return os.path.join(agent_dir, "conversations", f"{_safe_conversation_id(conversation_id)}.jsonl")
+    return os.path.join(agent_dir, "conversations", f"{fs_encode(conversation_id)}.jsonl")
 
 
 def legacy_path(agent_dir: str, conversation_id: str) -> str:
     """Pre-JSONL single-blob `.json` location. Migrated on first load."""
-    return os.path.join(agent_dir, "conversations", f"{_safe_conversation_id(conversation_id)}.json")
+    return os.path.join(agent_dir, "conversations", f"{fs_encode(conversation_id)}.json")
 
 
 def read_all_messages(jsonl_path: str) -> list[dict]:

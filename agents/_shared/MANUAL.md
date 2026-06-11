@@ -202,9 +202,13 @@ JWT-expiry check with 30s skew, refresh against auth.openai.com, atomic
 anthropic provider), so the login is one-time until OpenAI invalidates
 the refresh token (then the bot says to `codex login` again).
 - `CODEX_HOME` env var overrides the `~/.codex` directory.
-- Cross-platform: the path resolves via `expanduser` — works on Linux
-  and macOS identically (Windows too; the cross-process refresh flock
-  is POSIX-only there and degrades to in-process locking).
+- Cross-platform: the path resolves via `expanduser` — works on Linux,
+  macOS, and Windows (`%USERPROFILE%\.codex\auth.json`). The cross-process
+  refresh lock works everywhere too (`fcntl.flock` on POSIX,
+  `msvcrt.locking` on Windows — see `openflip/_file_lock.py`). Windows
+  caveat: newer Codex CLI builds may store creds in the OS keyring instead
+  of auth.json; set `cli_auth_credentials_store = "file"` in
+  `~/.codex/config.toml` and re-run `codex login` if auth.json is absent.
 - An `auth.json` with `auth_mode: "apikey"` is ignored (falls through
   to path 2) — only the subscription OAuth mode is supported here.
 
@@ -583,14 +587,20 @@ entry before invocation. The owner ID is always allowed on Discord (see
 
 ## System
 
-- **`run_command(command: str, timeout: int = 30)`** — `/bin/sh -c
-  <command>`. Timeout 1–120s, default 30. Output capped at 50k chars.
+- **`run_command(command: str, timeout: int = 30)`** — runs via the
+  system shell (`/bin/sh -c` on Linux/macOS, `cmd.exe /c` on Windows).
+  Timeout 1–120s, default 30. Output capped at 50k chars.
   Silent to Discord. ACL-gated tightly; usually owner-only.
 - **`restart_gateway(reason: str, continuation: str = "", force:
-  bool = False)`** — restart the openflip systemd unit. Preflight
-  checks: no peer agent mid-turn, no queued inbound, no human-spoken
-  message in the last 5s, no syntax errors in `openflip/`, all
-  `agent.json` files valid. Pass `force=True` ONLY when the operator
+  bool = False)`** — restart the framework via the platform's service
+  manager: `systemctl --user restart` on Linux, `launchctl kickstart -k`
+  on macOS. On Windows it runs `OPENFLIP_RESTART_CMD` if set, else exits
+  cleanly for the supervisor to respawn (start.bat's loop / NSSM /
+  Task Scheduler — requires `OPENFLIP_SUPERVISED=1`); with neither
+  configured it refuses rather than strand the framework offline.
+  Preflight checks: no peer agent mid-turn, no queued inbound, no
+  human-spoken message in the last 5s, no syntax errors in `openflip/`,
+  all `agent.json` files valid. Pass `force=True` ONLY when the operator
   asked for it. The optional `continuation` fires as a synthetic turn
   after restart so you can resume what you were doing. Persists
   in-flight conversation state first.
@@ -1025,7 +1035,13 @@ agents/<id>/conversations/
 
 `<conversation_id>` is `discord:<channel_id>`, `imessage:<handle>` (1:1) /
 `imessage:<chat_id>` (group), or `linked:<canonical>` for identity-linked
-conversations (see below).
+conversations (see below). On Windows the on-disk filename encodes the
+`:` as `%3A` (NTFS forbids colons) — e.g. `discord%3A12345.jsonl`. The
+conversation_id itself keeps the colon form everywhere in memory, URLs,
+and config; only the filename differs. The codec is
+`fs_encode`/`fs_decode` in `openflip/_conversation_io.py` — always build
+conversation file paths through `conversation_path()`/`fs_encode()`,
+never by joining the raw id.
 
 ## Cross-transport identity links (`identity_links`)
 
@@ -1652,8 +1668,13 @@ Defense in depth against path traversal via the unsigned marker.
 
 ## Where creds live
 
-`~/.claude/.credentials.json`. Owned by the OS user running the
-process. Contains:
+`~/.claude/.credentials.json` on Linux **and Windows**
+(`%USERPROFILE%\.claude\.credentials.json` — per the official Claude
+Code docs, Windows uses the same flat file, not Credential Manager).
+If `CLAUDE_CONFIG_DIR` is set, the file lives under that directory
+instead — openflip honors it. On macOS, Claude Code keeps creds in the
+Keychain; openflip reads/writes Keychain first there and uses the file
+as fallback. Owned by the OS user running the process. Contains:
 
 ```json
 {
@@ -1689,7 +1710,8 @@ endpoint is Cloudflare-fronted and rejects bare requests:
 
 Multiple agents in the same process refresh through a single asyncio
 Future (`_REFRESH_INFLIGHT`). Cross-process coordination uses a file
-lock at `~/.claude/.oauth_refresh.lock` (fcntl flock). Other openflip
+lock at `~/.claude/.oauth_refresh.lock` (`fcntl.flock` on POSIX,
+`msvcrt.locking` on Windows — `openflip/_file_lock.py`). Other openflip
 *and* Claude Code itself contend on the same lock. Stale-window is 10s
 (`_REFRESH_LOCK_STALE_S`) — if a process crashed mid-refresh, the next
 caller waits at most that long before treating the lock as abandoned.

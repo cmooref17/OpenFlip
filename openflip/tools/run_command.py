@@ -25,7 +25,8 @@ async def run_command(command: str, timeout: int = 30) -> ToolResult:
     """Run a shell command and return its output. Use for system tasks, file operations, checking status, running scripts, etc. Commands run as the bot's system user with a timeout.
 
     Args:
-        command: The shell command to run (passed to /bin/sh -c).
+        command: The shell command to run (passed to the system shell —
+            /bin/sh -c on Linux/macOS, cmd.exe /c on Windows).
         timeout: Max seconds to wait before killing the process (default 30, max 120).
     """
     from ..acl import current_caller_is_owner

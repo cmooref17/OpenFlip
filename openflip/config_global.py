@@ -232,10 +232,28 @@ def get_integration_tokens(integration: str = "discord") -> dict[str, str]:
 
 # ── OpenAI provider accessors ──
 #
-# The "openai" provider (OpenAIConversation) authenticates with a plain API
-# key — no OAuth. The key lives in config.json under `integrations.openai.
-# api_key`, with the standard OPENAI_API_KEY environment variable as a
-# fallback so a deployment can keep the secret out of the config file.
+# The "openai" provider (OpenAIConversation) has two auth paths, checked in
+# order:
+#   1. ChatGPT/Codex subscription OAuth (preferred): `codex login` writes
+#      `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`); openflip reads
+#      and refreshes those tokens (see _codex_auth.py) and talks to the
+#      Responses API at chatgpt.com/backend-api/codex.
+#   2. Plain API key (fallback): `integrations.openai.api_key` in config.json,
+#      with the standard OPENAI_API_KEY environment variable as a secondary
+#      fallback, against the Chat Completions API.
+
+
+def get_codex_home() -> str:
+    """Return the Codex home directory (where `codex login` keeps auth.json).
+
+    `CODEX_HOME` environment variable overrides; default is `~/.codex`.
+    Resolved with os.path.expanduser, which handles the user home correctly
+    on Linux, macOS, and Windows — never a hardcoded path.
+    """
+    env = os.environ.get("CODEX_HOME", "").strip()
+    if env:
+        return os.path.expanduser(env)
+    return os.path.expanduser(os.path.join("~", ".codex"))
 
 def get_openai_api_key() -> str:
     """Return the OpenAI API key, or "" if unconfigured.

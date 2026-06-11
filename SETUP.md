@@ -43,7 +43,7 @@ pip install -r requirements.txt
 ## 4. First run (generates blank config)
 
 ```bash
-sh start.sh
+sh start.sh        # Windows: start.bat — see docs/WINDOWS.md
 ```
 
 This will print:
@@ -248,7 +248,7 @@ To persist: add that line to `~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.
 ## 11. Start it for real
 
 ```bash
-sh start.sh
+sh start.sh        # Windows: start.bat — see docs/WINDOWS.md
 ```
 
 You should see:

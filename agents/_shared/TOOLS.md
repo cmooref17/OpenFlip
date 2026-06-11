@@ -61,13 +61,13 @@ Every inbound message has an author. The author tells you what turn type you're 
 | Peer message (incoming) | Another agent fired `talk_to_agent` at you | ❌ NO — use `send_message` to surface |
 | Peer message (outgoing) | You fire `talk_to_agent` | Recipient sees it; operator does NOT |
 | Cron / heartbeat / restart-resume | Framework synthetic | ❌ NO — use `send_message` |
-| Chain-terminator | Restricted to 3 tools after peer reply | ❌ NO — use `send_message` or `talk_to_agent` |
+| Chain-terminator | A peer's reply auto-routes back to you | ❌ NO — use `send_message` or `talk_to_agent` |
 
 **Rule of thumb:** if you can't name why your plain text would reach the operator, it won't. When in doubt, `send_message`.
 
 ### Common slip patterns
 
-1. **Saying things in prose addressed to a peer.** Writing `peer_id: one more thing —` as response text does NOT route to the peer — it lands in the operator's Discord channel and leaks what should have been an inter-agent message. To talk to a peer, you MUST emit a `talk_to_agent` call. The "addressed to X" prefix is cosmetic, not a routing instruction.
+1. **Saying things in prose addressed to a peer.** Writing `peer_id: one more thing —` as response text does NOT route to the peer — on a peer/chain-terminator turn it goes nowhere (saved to the conversation log only; the peer never sees it). To talk to a peer, you MUST emit a `talk_to_agent` call. The "addressed to X" prefix is cosmetic, not a routing instruction.
 
 2. **Going silent after a peer reply.** When a peer's reply arrives as a synthetic turn and the operator was waiting on you, the framework does NOT auto-prompt you to relay. If you read the peer reply and end the turn with no `send_message`, the operator hears nothing. Hard rule: every synthetic turn triggered by a peer reply MUST end with a `send_message` summarizing what the peer said and naming the next step — even if the peer's answer is incomplete ("peer answered #2, still waiting on #3-5").
 
@@ -92,7 +92,7 @@ Every inbound message has an author. The author tells you what turn type you're 
 
 ### Loop prevention
 
-Depth cap `MAX_DEPTH=100`. A fresh user turn resets the depth counter.
+Depth cap `MAX_DEPTH=20`. A fresh user turn resets the depth counter.
 
 ## Memory
 

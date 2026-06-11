@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, Set, Tuple
 
 from .config import OPENFLIP_AGENTS_DIR
+from .._conversation_io import fs_encode as _fs_encode
 from ..utils import print_ts
 
 
@@ -43,7 +44,9 @@ def _conv_path(agent_id: str, channel_id: str) -> Path:
             f"(expected e.g. 'discord:<id>' / 'imessage:<id>'). Caller must "
             f"pass the full conversation_id from the session, not a bare id."
         )
-    return OPENFLIP_AGENTS_DIR / agent_id / "conversations" / f"{channel_id}.jsonl"
+    # fs_encode: on Windows the on-disk stem encodes ":" as "%3A" (NTFS
+    # forbids colons); the conversation_id itself keeps the colon form.
+    return OPENFLIP_AGENTS_DIR / agent_id / "conversations" / f"{_fs_encode(channel_id)}.jsonl"
 
 
 async def subscribe(agent_id: str, channel_id: str) -> "asyncio.Queue[dict]":

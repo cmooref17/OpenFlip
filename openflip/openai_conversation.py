@@ -1019,7 +1019,7 @@ class OpenAIConversation:
         compaction). Kept so /status survives restarts. Cleared by
         clear_history."""
         return os.path.join(
-            self._agent_dir(), "conversations", f"{self.conversation_id}.meta.json"
+            self._agent_dir(), "conversations", f"{_cio.fs_encode(self.conversation_id)}.meta.json"
         )
 
     def _content_extractor(self, m) -> str:

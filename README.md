@@ -37,7 +37,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python -m openflip.main   # first run generates a blank config.json
 # fill in config.json + create your first agent, then:
-./start.sh
+./start.sh                # Linux/macOS — on Windows use start.bat (see docs/WINDOWS.md)
 ```
 
 The full walkthrough — config fields, creating an agent (`agent.json` +
@@ -50,3 +50,5 @@ The full walkthrough — config fields, creating an agent (`agent.json` +
   manual: every config field, tool, ACL form, and subsystem
 - **[agents/_shared/FRAMEWORK.md](agents/_shared/FRAMEWORK.md)** — the
   framework guide injected into every agent's context
+- **[docs/WINDOWS.md](docs/WINDOWS.md)** — running openflip on Windows:
+  setup, credentials, launch via `start.bat`, platform differences
