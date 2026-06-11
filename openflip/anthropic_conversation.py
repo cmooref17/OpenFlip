@@ -27,6 +27,17 @@ from . import _request_validator
 from .config_global import get_compaction_trigger, get_effort, get_model_context_window, _VALID_EFFORT_LEVELS
 
 
+# Compaction trigger (input_tokens) sent on a MANUAL /compact. Anthropic's
+# compact_20260112 edit requires trigger >= 50k (see config_global
+# .get_compaction_trigger, which floors every trigger at this value), so 50k is
+# the lowest value that won't 400 — and it makes Anthropic compact whenever the
+# conversation is at least ~50k tokens, regardless of the per-model auto-trigger
+# (which can be as high as 980k on 1m agents). Anthropic cannot compact a
+# conversation whose input is below this floor; manual /compact on a tiny
+# conversation is therefore a genuine no-op on the server side, not a bug here.
+_MANUAL_COMPACT_TRIGGER = 50_000
+
+
 class MalformedRequestError(Exception):
     """Raised by chat_stream when the assembled request body
     fails pre-flight validation. Carries the list of
@@ -959,6 +970,15 @@ class AnthropicConversation:
         # input is well under the normal trigger. Reset to False after the
         # next chat() call regardless of whether compaction actually fired.
         self.force_compact_next: bool = False
+        # True ONLY when force_compact_next was set by the MANUAL /compact path
+        # (not by the auto-threshold gate or the retry-trim follow-up). When
+        # set, the outgoing request sends a low compaction trigger
+        # (_MANUAL_COMPACT_TRIGGER) so Anthropic compacts regardless of current
+        # input size — without this the body always used the real per-model
+        # trigger (e.g. 980k on 1m agents), so a manual /compact on a small
+        # conversation was a silent no-op. Auto/retry compaction leaves this
+        # False and keeps the real trigger. Consumed alongside force_compact_next.
+        self.force_compact_trigger_override: bool = False
         # Session-level reasoning-effort override for THIS conversation. When
         # set to a valid level (low/medium/high/xhigh/max) it WINS over the
         # per-model config knob (see _effort_level precedence). None = no
@@ -1872,12 +1892,22 @@ class AnthropicConversation:
         if _effort:
             body["output_config"] = {"effort": _effort}
 
-        # Server-side compaction opt-in only when /compact was fired.
+        # Server-side compaction opt-in. Manual /compact (force_compact_trigger_
+        # override) sends the low _MANUAL_COMPACT_TRIGGER so Anthropic compacts
+        # regardless of current input size; auto-compact and retry-trim leave the
+        # override off and keep the real per-model trigger (only compact once
+        # input actually exceeds it). Previously this always used the real
+        # trigger, so a manual /compact on a sub-threshold conversation never
+        # compacted — the documented no-op bug.
         if self.force_compact_next:
+            _compact_trigger = (
+                _MANUAL_COMPACT_TRIGGER if self.force_compact_trigger_override
+                else get_compaction_trigger(self.agent.model, "anthropic")
+            )
             body["context_management"] = {
                 "edits": [{
                     "type": "compact_20260112",
-                    "trigger": {"type": "input_tokens", "value": get_compaction_trigger(self.agent.model, "anthropic")},
+                    "trigger": {"type": "input_tokens", "value": _compact_trigger},
                 }]
             }
 
@@ -2259,12 +2289,14 @@ class AnthropicConversation:
                                 agent=self.agent.id, error=True,
                             )
 
-                    # Consume force_compact_next regardless of stream
-                    # outcome. If we don't clear this, every future turn
-                    # will fire the costly server-side compaction beta
+                    # Consume force_compact_next (and the manual-trigger
+                    # override) regardless of stream outcome. If we don't clear
+                    # these, every future turn will fire the costly server-side
+                    # compaction beta — and keep using the low manual trigger —
                     # even though the user only asked for it once.
                     if self.force_compact_next:
                         self.force_compact_next = False
+                    self.force_compact_trigger_override = False
 
                 # If stream failed, terminate the generator AFTER the
                 # finally cleanup has run.

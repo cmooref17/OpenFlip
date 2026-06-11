@@ -57,6 +57,15 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         import os
         ch_id = interaction.channel.id
         conv_key = _conv_key_for_interaction(runner, interaction)
+        # Invalidate any in-flight turn's pending save BEFORE touching state.
+        # A turn already mid-flight on this channel holds its own reference to
+        # the conversation object and re-saves it at end-of-turn — without this
+        # the delete below would be silently undone (history resurrected) by
+        # that re-save. Bumping the epoch makes the in-flight turn's _save_conv()
+        # a no-op (see AgentRunner.bump_conv_epoch / _run_turn._turn_epoch). This
+        # runs synchronously before any await, so no turn can resume between the
+        # bump and the delete.
+        runner.bump_conv_epoch(conv_key)
         conv = runner.conversations.pop(conv_key, None)
         if conv and hasattr(conv, "clear_history"):
             conv.clear_history()
@@ -128,10 +137,13 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         # (irreversible) and fires a synthetic turn — must not be triggerable
         # by non-owners. Mirrors /uncompact, /dream, /stop gating.
         if not await _owner_check(interaction): return
-        # Anthropic-only: sets a flag on the conversation that overrides the
-        # compaction trigger to 50k for the next chat() call. Anthropic will
-        # then issue a fresh compaction block on the next turn regardless of
-        # input size. Ollama has no equivalent — surface that to the user.
+        # Anthropic-only: sets two flags on the conversation. force_compact_next
+        # opts the next chat() into server-side compaction; force_compact_trigger_
+        # override makes that request send the low _MANUAL_COMPACT_TRIGGER (50k,
+        # Anthropic's floor) instead of the real per-model trigger — so Anthropic
+        # compacts regardless of current input size, as long as the conversation
+        # is at least ~50k tokens (below that floor Anthropic cannot compact at
+        # all). Ollama has no equivalent — surface that to the user.
         conv = runner.conversations.get(_conv_key_for_interaction(runner, interaction))
         if conv is None or not hasattr(conv, "force_compact_next"):
             await interaction.response.send_message(
@@ -140,6 +152,7 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
             )
             return
         conv.force_compact_next = True
+        conv.force_compact_trigger_override = True
         await interaction.response.send_message(
             "⚙️ Compacting now…",
             ephemeral=True,
