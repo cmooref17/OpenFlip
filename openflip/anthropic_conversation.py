@@ -1837,6 +1837,11 @@ class AnthropicConversation:
         for func in tools or []:
             tools_map[func.__name__] = func
 
+        # Re-sync the model from the (possibly hot-reloaded) agent every turn
+        # so `/model` and direct agent.json edits take effect on the NEXT turn
+        # with no restart. self.model is otherwise cached at construction and
+        # would go stale relative to agent.model after a reload_if_changed().
+        self.model = self._normalize_model(self.agent.model)
         body = {
             "model": self.model,
             "max_tokens": 32000,
