@@ -76,10 +76,22 @@ def make_imessage_session(
         conv_suffix = speaker_handle
     else:
         conv_suffix = str(chat_id)
+    conversation_id = f"imessage:{conv_suffix}"
+    # Identity links: a 1:1 chat with a speaker listed in config.json's
+    # `identity_links` ("imessage:<handle>" → canonical) shares its history
+    # with the same person's linked sessions on other transports via
+    # conversation_id "linked:<canonical>". DM-only, and routing/auth fields
+    # (transport_id, handle, is_owner) are untouched — the link affects
+    # conversation identity ONLY, never privilege.
+    if is_dm and speaker_handle:
+        from ..config_global import resolve_linked_conversation_id
+        linked = resolve_linked_conversation_id("imessage", speaker_handle)
+        if linked:
+            conversation_id = linked
     return Session(
         transport="imessage",
         transport_id=str(chat_id),
-        conversation_id=f"imessage:{conv_suffix}",
+        conversation_id=conversation_id,
         # Stable but non-cryptographic int from the handle. Used for
         # bot-self-echo filtering and owner-id matching only.
         speaker_id=abs(hash(speaker_handle)) % (2**31),

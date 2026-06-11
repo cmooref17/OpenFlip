@@ -28,7 +28,7 @@ from .config_global import get_compaction_trigger, get_effort, get_model_context
 
 
 class MalformedRequestError(Exception):
-    """Raised by chat_stream/_chat_legacy when the assembled request body
+    """Raised by chat_stream when the assembled request body
     fails pre-flight validation. Carries the list of
     `RequestValidationProblem` so runtime.py can surface a clear
     user-visible message instead of the cryptic Anthropic 400 string."""
@@ -1227,7 +1227,7 @@ class AnthropicConversation:
         fits in (context_window - 10k). Returns count dropped. Char/2
         estimator — rough but cheap (see `_est` below for why //2, not //4).
         Only fires on retry after a 400 (the `_retry_budget is not None` gate
-        at the call sites in chat_stream/_chat_legacy) — in healthy operation
+        at the call sites in chat_stream) — in healthy operation
         the auto-compact gate in chat() / streaming paths requests Anthropic
         compaction at (window - 20k) BEFORE we get this close to the window, so
         this local-trim path stays as the last-line safety net for cases
@@ -1466,22 +1466,8 @@ class AnthropicConversation:
         StreamEvents; this wrapper accumulates them into the same final
         shape callers got before.
 
-        Escape hatch: OPENFLIP_USE_LEGACY_CHAT=1 in env routes to the old
-        _chat_legacy() implementation. This is a LIVE emergency-rollback path,
-        not dead code — keep it unless deliberately removing the non-streaming
-        fallback (an owner decision, not routine cleanup).
-
         Args / return shape identical to the pre-refactor chat().
         """
-        # Escape hatch for emergency rollback. Remove once streaming has
-        # soaked in production.
-        if os.environ.get("OPENFLIP_USE_LEGACY_CHAT") == "1":
-            return await self._chat_legacy(
-                tools=tools, think=think,
-                _retry_attempt=_retry_attempt,
-                tool_choice=tool_choice,
-            )
-
         # Lazy import to avoid circular issues at module load.
         from ._anthropic_stream import (
             MessageStartEvent, ContentBlockStartEvent,
@@ -1505,6 +1491,8 @@ class AnthropicConversation:
         tool_calls: list[AnthropicToolCall] = []
         ordered_blocks: list[dict] = []  # full content list for raw_response
         framework_error: FrameworkErrorEvent | None = None
+        stop_reason: str | None = None
+        stop_details: dict | None = None
 
         try:
             async for event in self.chat_stream(
@@ -1545,10 +1533,21 @@ class AnthropicConversation:
                     # compaction blocks are handled by chat_stream's
                     # side-effect path — they update self._compaction_block
                     # and self.compacted_this_turn directly.
+                elif isinstance(event, MessageDeltaEvent):
+                    # Carries the terminal stop_reason (+ stop_details on a
+                    # refusal). Previously dropped here, which turned a
+                    # zero-text response (e.g. stop_reason="refusal") into a
+                    # silent empty reply with no explanation. Capture it so
+                    # the assembly step below can surface WHY the turn
+                    # produced no text instead of returning a blank.
+                    if event.stop_reason is not None:
+                        stop_reason = event.stop_reason
+                    if event.stop_details is not None:
+                        stop_details = event.stop_details
                 # Other event types (MessageStart, ContentBlockStart,
-                # ContentBlockDelta, MessageDelta, MessageStop) don't
-                # contribute to the final AnthropicAIChatMessage shape;
-                # chat_stream handles their side effects (last_usage, etc).
+                # ContentBlockDelta, MessageStop) don't contribute to the
+                # final AnthropicAIChatMessage shape; chat_stream handles
+                # their side effects (last_usage, etc).
         except MalformedRequestError:
             # Let pre-flight validation failures propagate so runtime.py
             # can surface a clear user-visible message and route to the
@@ -1628,806 +1627,31 @@ class AnthropicConversation:
         if thinking_parts:
             response.thinking = "".join(thinking_parts)
         response.raw_response = {"content": ordered_blocks}
-        return response
 
-    async def _chat_legacy(
-        self,
-        tools: list[Callable] = None,
-        think: bool = None,
-        _retry_attempt: int = 0,
-        tool_choice: dict | None = None,
-    ) -> AnthropicAIChatMessage:
-        """LEGACY non-streaming implementation. Renamed from chat() in step 4
-        of the streaming refactor (2026-05-21). KEPT as a live emergency
-        rollback path — not scheduled for deletion (removing the non-streaming
-        fallback is an owner decision, not routine cleanup).
-
-        The new chat() wrapper has this as a fallback path
-        callable via OPENFLIP_USE_LEGACY_CHAT=1 if streaming explodes on
-        first contact with production traffic. Don't add new features here.
-
-        tool_choice: optional Anthropic tool_choice object passed through verbatim.
-        """
-        # Reset per-turn flags only on the first attempt — retries shouldn't
-        # clobber a compaction-block we may have just received pre-retry.
-        if _retry_attempt == 0:
-            self.compacted_this_turn = False
-
-        access_token = await _load_oauth_access_token()
-        if not access_token:
-            return AnthropicAIChatMessage(
-                content=f"⚠️ Anthropic OAuth token unavailable — check {_CREDS_PATH}.",
-                is_framework_error=True,
-            )
-
-        # Trim only fires when we're already in a retry-after-overflow.
-        # Normal flow lets Anthropic's server-side auto-compaction handle
-        # context. If Anthropic 400s with 'prompt too long', the retry
-        # path below sets _retry_budget and trims on the retry.
-        # Auto-compact gate: if the last turn's measured total_input was
-        # already past (window - 20k), request Anthropic compaction THIS
-        # turn so the request does not grow further into the over-window
-        # tier (Anthropic charges premium rates above the nominal window
-        # on opus models; capping prevents that overage cost). Uses the
-        # last actually-measured count from self.last_usage rather than
-        # estimating, so we do not over-trigger.
-        if not self.force_compact_next and isinstance(self.last_usage, dict):
-            _last_total = int(self.last_usage.get("total_input") or 0)
-            _cap = get_compaction_trigger(self.agent.model, "anthropic")
-            if _last_total > _cap > 0:
-                self.force_compact_next = True
-                print_ts(
-                    f"{COLOR_YELLOW}auto-compact: last total_input {_last_total:,} > "
-                    f"trigger {_cap:,}; requesting Anthropic compaction this turn"
-                    f"{COLOR_END}",
-                    agent=self.agent.id,
+        # Zero-text, zero-tool turn → would render as a silent blank reply.
+        # Surface the API's stop_reason (and stop_details on a refusal) so
+        # the void becomes an explanation instead of a mystery. Marked as a
+        # framework error so it doesn't pollute history as an assistant turn.
+        if not response.content and not tool_calls:
+            if stop_reason == "refusal":
+                cat = (stop_details or {}).get("category", "unspecified")
+                why = (stop_details or {}).get("explanation", "").strip()
+                msg = f"⚠️ Model declined (stop_reason=refusal, category={cat})."
+                if why:
+                    msg += f" {why}"
+            elif stop_reason:
+                msg = (
+                    f"⚠️ Empty reply (stop_reason={stop_reason}). No text or "
+                    f"tool_use was returned."
                 )
-        # DELIBERATE divergence (trigger timing): the local trim fires ONLY on
-        # a 400-retry (gated on `_retry_budget is not None`), never pre-flight.
-        # Anthropic's server-side compaction bounds context in healthy
-        # operation, so local trim is just the last-resort backstop. The ollama
-        # sibling (conversation.py) has no server compaction and so trims every
-        # turn instead. Intentional — see _trim_to_fit_window docstring.
-        dropped = self._trim_to_fit_window() if self._retry_budget is not None else 0
-        if dropped:
-            print_ts(
-                f"{COLOR_YELLOW}retry trim: dropped {dropped} oldest message(s) to fit smaller budget{COLOR_END}",
-                agent=self.agent.id,
-            )
-            # Trim drops content without summarizing — by operator directive,
-            # always follow trim with compaction so the post-trim state gets
-            # rolled into a fresh server-side summary block this turn. Future
-            # turns then operate on [system + new compaction + small tail]
-            # instead of accumulating tail back to the trim limit.
-            self.force_compact_next = True
-
-        system_prompt, api_messages = _openflip_msgs_to_anthropic(
-            self.messages, self.system_message or ""
-        )
-
-        # Inject any queued image attachments into the last user message.
-        # fetch_discord_message appends to self._pending_image_attachments;
-        # this is where they actually reach the API. We pop the queue
-        # (not just read it) so they don't double-attach next turn even
-        # if this request fails — better to lose one attachment than to
-        # confuse the model with duplicates on retry.
-        _pending_imgs = getattr(self, "_pending_image_attachments", None) or []
-        if _pending_imgs:
-            self._pending_image_attachments = []
-            _injected = _inject_pending_image_attachments(api_messages, _pending_imgs)
-            if _injected:
-                print_ts(
-                    f"  → injected {_injected} image attachment(s) into request",
-                    agent=self.agent.id,
-                )
-        # If we have a stored compaction block from a previous turn, prepend
-        # it as the first assistant message. Anthropic recognizes the
-        # compaction block and auto-drops every message before it on arrival.
-        # Without this, the compaction summary would be lost on the next turn
-        # and the API would re-summarize from scratch (expensive + bad cache).
-        if self._compaction_block is not None:
-            # Shallow-copy so the cache_control marker added below
-            # doesn't mutate self._compaction_block in place. Without this, the
-            # stored block accumulates a cache_control field that travels with
-            # it across persistence — harmless functionally, but the in-memory
-            # block diverges from what Anthropic gave us.
-            api_messages = [
-                {"role": "assistant", "content": [dict(self._compaction_block)]},
-            ] + api_messages
-
-        # REMINDER.md injection. If the agent has a non-empty REMINDER.md in
-        # its directory, inject the contents as an uncached user-role message
-        # tagged `[SYSTEM REMINDER]:` immediately before the new user turn.
-        # Position is end-of-payload (highest model attention) and the message
-        # is NOT cached (see cache_control placement below) so file edits take
-        # effect on the very next turn. The injection is per-request only —
-        # never persisted to self.messages — so REMINDER content doesn't
-        # accumulate in conversation history.
-        #
-        # Cache geometry: prior cache prefix ends at the SECOND-to-last
-        # message after insert (the cached user/assistant tail from last
-        # turn). The REMINDER message and the new user message are both
-        # uncached. cache_control placement below handles this by moving
-        # the breakpoint from [-1] to [-2] when REMINDER was injected.
-        _reminder_injected = False
-        try:
-            import os as _os
-            agent_dir = _os.path.dirname(self.agent.path) if getattr(self.agent, "path", None) else None
-            if agent_dir:
-                reminder_path = _os.path.join(agent_dir, "REMINDER.md")
-                if _os.path.exists(reminder_path):
-                    with open(reminder_path, "r", encoding="utf-8") as _f:
-                        reminder_text = _f.read().strip()
-                    if reminder_text:
-                        # Soft cap warning. Above ~2k chars (~500 tokens) the
-                        # cost of paying this every turn starts to compound.
-                        # Operator decides what to do with the warning — we
-                        # don't truncate, just surface.
-                        if len(reminder_text) > 2000:
-                            print_ts(
-                                f"{COLOR_YELLOW}REMINDER.md is {len(reminder_text)} chars "
-                                f"(~{len(reminder_text) // 4} tokens) — paid every turn. "
-                                f"Consider trimming.{COLOR_END}",
-                                agent=self.agent.id,
-                            )
-                        # Insert BEFORE the new user message. api_messages[-1]
-                        # is the new user turn; we want REMINDER at [-2] post-
-                        # insert so cache breakpoint can land at [-3] (the
-                        # prior tail).
-                        #
-                        # CRITICAL: skip injection when the last user message
-                        # is carrying tool_result blocks. Anthropic requires
-                        # tool_use (assistant) → tool_result (user) to be
-                        # ADJACENT messages. Inserting REMINDER between them
-                        # breaks adjacency and returns 400. Tool-result turns
-                        # don't need REMINDER anyway — they're the model
-                        # processing its own tool output, not a fresh user
-                        # input where end-of-payload attention matters.
-                        _skip_for_tool_result = False
-                        if api_messages:
-                            _last = api_messages[-1]
-                            _last_content = _last.get("content")
-                            if isinstance(_last_content, list):
-                                for _block in _last_content:
-                                    if isinstance(_block, dict) and _block.get("type") == "tool_result":
-                                        _skip_for_tool_result = True
-                                        break
-                        if _skip_for_tool_result:
-                            pass  # don't inject; preserves tool_use/tool_result adjacency
-                        else:
-                            reminder_msg = {
-                                "role": "user",
-                                "content": f"[SYSTEM REMINDER]: {reminder_text}",
-                            }
-                            if api_messages:
-                                api_messages = (
-                                    api_messages[:-1] + [reminder_msg] + [api_messages[-1]]
-                                )
-                            else:
-                                api_messages = [reminder_msg]
-                            _reminder_injected = True
-        except Exception as _rem_err:
-            # Reminder injection is best-effort — never let a bad file or
-            # filesystem hiccup break the request. Log and continue.
-            print_ts(
-                f"{COLOR_YELLOW}REMINDER.md injection failed (continuing without): "
-                f"{_rem_err}{COLOR_END}",
-                agent=self.agent.id,
-            )
-
-        tool_schemas = _build_tool_schemas(tools or [])
-        tools_map: dict[str, Callable] = {}
-        for func in tools or []:
-            tools_map[func.__name__] = func
-
-        body = {
-            "model": self.model,
-            "max_tokens": 32000,
-            "messages": api_messages,
-            # Stream the response. Matches claude code's pattern in
-            # src/services/api/claude.ts:1824 (`stream: true`). The body
-            # comes back as Server-Sent Events; we accumulate via
-            # openflip._anthropic_stream.parse_sse_stream into the same
-            # final dict shape the non-streaming response had. Required
-            # for max_tokens >= 21333 anyway (Anthropic forces stream for
-            # long generations).
-            "stream": True,
-        }
-        # Per-model reasoning-effort knob → Anthropic output_config.effort.
-        # Omitted entirely when unset/invalid so the API default ("high")
-        # applies and the request stays byte-identical to pre-effort behavior.
-        # See config_global.get_effort + agents/_shared/MANUAL.md.
-        _effort = self._effort_level()
-        if _effort:
-            body["output_config"] = {"effort": _effort}
-        # Compaction model: WE decide when to compact (timing), Anthropic
-        # does the summarization work. Concretely:
-        #
-        #   1. Auto-compact gate (primary): the chat() / streaming entry
-        #      paths set force_compact_next=True when the last-measured
-        #      total_input exceeded (window - 20_000). That keeps us under
-        #      the model's nominal window — important on opus-4-7 / opus
-        #      where Anthropic charges a premium tier rate above 200k.
-        #   2. /compact slash command (manual): user-initiated compaction
-        #      via commands.py.
-        #   3. Retry-after-trim (recovery): if a request 400s for "prompt
-        #      too long", _trim_to_fit_window drops oldest LOCALLY (no
-        #      summary) and the next request fires force_compact_next so
-        #      Anthropic resummarizes from the trimmed history.
-        #
-        # All three set force_compact_next=True. When it's True we send
-        # body.context_management (below) with trigger.value from
-        # get_compaction_trigger() — so Anthropic compacts on THIS
-        # turn regardless of its own internal threshold.
-        #
-        # The compact-2026-01-12 beta flag is enabled on every request (in
-        # the headers further below). Without it, Anthropic refuses
-        # body.context_management. Enabling it alone doesn't trigger
-        # compaction — only the body block does — so leaving the flag on
-        # is harmless when we're not requesting compaction.
-        #
-        # Anthropic's actual server-side trigger threshold isn't public
-        # and changes over time — re-measure against your own logs (the
-        # anthropic usage lines) rather than relying on a hardcoded number.
-        if self.force_compact_next:
-            body["context_management"] = {
-                "edits": [
-                    {
-                        "type": "compact_20260112",
-                        # Trigger value comes from get_compaction_trigger() so per-model
-                        # config (models.<bare>.compaction_trigger) takes effect. Anthropic
-                        # floors at 50k, get_compaction_trigger floors at 50k too.
-                        "trigger": {
-                            "type": "input_tokens",
-                            "value": get_compaction_trigger(self.agent.model, "anthropic"),
-                        },
-                    }
-                ]
-            }
-        # Anthropic gates subscription routing for sonnet/opus on a specific
-        # system block. Discovered via mitmproxy capture of an actual claude-cli
-        # request on 2026-05-11: the first system block in claude-cli's body
-        # contains a text payload "x-anthropic-billing-header: cc_version=...;
-        # cc_entrypoint=sdk-cli; cch=...;" — this is what Anthropic looks for
-        # to classify the request as official Claude Code and route via the
-        # Pro/Max subscription. Without this block, sonnet/opus return HTTP 429
-        # ("third-party harness" tier rate limit, enforced April 4 2026).
-        # Values copied verbatim from a real claude-cli 2.1.138 request; will
-        # need to be rotated when claude-cli updates and changes its build hash.
-        _BILLING_BLOCK = {
-            "type": "text",
-            "text": "x-anthropic-billing-header: cc_version=2.1.142; cc_entrypoint=sdk-cli; cch=00000;",
-        }
-        system_blocks = [_BILLING_BLOCK]
-        if system_prompt:
-            # Mark the agent's system prompt cacheable.
-            # Match claude-cli's exact shape (verified via mitmproxy
-            # capture 2026-05-11): cache_control with ttl='1h'. Bare
-            # `{"type": "ephemeral"}` without ttl silently doesn't
-            # cache. The extended-cache-ttl-2025-04-11 beta flag
-            # (set in headers below) is required to unlock the 1h ttl.
-            # cache_control on a block caches that block AND everything
-            # before it, so the billing block piggybacks for free.
-            system_blocks.append({
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral", "ttl": "1h"},
-            })
-        else:
-            system_blocks[0]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-        body["system"] = system_blocks
-        if tool_schemas:
-            body["tools"] = tool_schemas
-            # Forced tool dispatch (narrate-and-stop retry path). Only meaningful
-            # when tools are present; sending tool_choice without tools 400s.
-            if tool_choice is not None:
-                body["tool_choice"] = tool_choice
-
-        # Extend caching past the system prompt to the conversation history.
-        # cache_control caches the marked block AND everything before it, so
-        # marking the last message in api_messages caches the whole prefix
-        # up through that turn. Next turn's request appends new messages
-        # after this point; the prior prefix hits cache. Without this,
-        # 100k+ tokens of unchanged conversation history get paid full
-        # price every turn while only the ~30k system prompt benefits from
-        # caching. Two markers total (system + last message), well under
-        # Anthropic's per-request limit of 4 cache_control breakpoints.
-        #
-        # Place BOTH markers when a compaction block is present:
-        #  1) compaction block — byte-stable across turns, anchors a stable
-        #     cache prefix at [system + compaction]
-        #  2) last message — rolling tail, caches the post-compaction history
-        #     so each turn's growing tail accumulates against prior cache
-        #     instead of paying ~600k input from scratch
-        # Anthropic accepts up to 4 cache_control breakpoints per request;
-        # combined with the system breakpoint we're at 3.
-        #
-        # Without a compaction block, the rolling last-message marker is still
-        # the right placement on its own — caches the append-only history up
-        # through this turn so the next turn hits the prior prefix.
-        if self._compaction_block is not None and api_messages:
-            comp_msg = api_messages[0]
-            comp_content = comp_msg.get("content")
-            if isinstance(comp_content, list) and comp_content:
-                comp_content[0]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-        # Cache breakpoint on the rolling tail. If REMINDER.md was injected,
-        # the last two messages (REMINDER + new user turn) are intentionally
-        # uncached so REMINDER edits take effect immediately. The breakpoint
-        # in that case lands on api_messages[-3] (the previous turn's tail).
-        # When no REMINDER, breakpoint is api_messages[-1] as before.
-        if api_messages:
-            if _reminder_injected and len(api_messages) >= 3:
-                _cache_target_idx = -3
             else:
-                _cache_target_idx = -1
-            _last_msg = api_messages[_cache_target_idx]
-            _last_content = _last_msg.get("content")
-            if isinstance(_last_content, str):
-                _last_msg["content"] = [{
-                    "type": "text",
-                    "text": _last_content,
-                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
-                }]
-            elif isinstance(_last_content, list) and _last_content:
-                _last_block = _last_content[-1]
-                if isinstance(_last_block, dict):
-                    _last_block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-
-        # Anthropic accepts multiple beta flags as a comma-separated list.
-        # `extended-cache-ttl-2025-04-11` unlocks the 1h cache TTL we set on
-        # cache_control blocks. `compact-2026-01-12` enables server-side
-        # compaction (configured in body.context_management above). Add
-        # `context-1m-2025-08-07` only when the model name was suffixed `-1m`
-        # in agent.json (see _normalize_model / _wants_1m_context).
-        _beta_flags = [
-            # Claude Code harness identity flags. Matches OpenClaw's outbound
-            # shape for OAuth requests. Without these, requests look like
-            # generic third-party API calls and the model's tool-dispatch
-            # behavior is the less-reliable generic path; with them, the
-            # model uses the same dispatch path as Claude Code's CLI.
-            # User-Agent + cc_version billing block already identify us as
-            # Claude Code-shaped at the request level — these complete the
-            # set. ToS risk exists at the architectural level (OAuth token
-            # use by non-Claude-Code harness) regardless of these flags;
-            # they don't materially change the exposure.
-            "claude-code-20250219",
-            "oauth-2025-04-20",
-            "extended-cache-ttl-2025-04-11",
-            "compact-2026-01-12",
-        ]
-        if self._wants_1m_context():
-            _beta_flags.append("context-1m-2025-08-07")
-
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "anthropic-version": _DEFAULT_ANTHROPIC_VERSION,
-            "anthropic-beta": ",".join(_beta_flags),
-            "User-Agent": _DEFAULT_USER_AGENT,
-            "Content-Type": "application/json",
-        }
-
-        session = await self._ensure_http_session()
-
-        # Cache-prefix diagnostic: hash each cacheable section so we can
-        # diff turn-to-turn and identify exactly what's busting Anthropic's
-        # prompt cache. Off by default; enable with OPENFLIP_CACHE_DIAG=1
-        # in the environment when investigating cache misses.
-        if os.environ.get("OPENFLIP_CACHE_DIAG") == "1":
-            import hashlib as _hl
-            import json as _json
-            def _h(obj) -> str:
-                blob = _json.dumps(obj, sort_keys=True, ensure_ascii=False).encode()
-                return _hl.sha256(blob).hexdigest()[:12] + f" ({len(blob)}B)"
+                msg = "⚠️ Empty reply: no content blocks and no stop_reason."
             print_ts(
-                f"{COLOR_YELLOW}[cache-diag] tools={_h(body.get('tools', []))} "
-                f"system={_h(body.get('system', []))} "
-                f"tool_choice={_h(body.get('tool_choice'))} "
-                f"ctx_mgmt={_h(body.get('context_management'))} "
-                f"msgs={len(api_messages)}{COLOR_END}",
-                agent=self.agent.id,
-            )
-            for _i, _m in enumerate(api_messages[:5]):
-                print_ts(
-                    f"{COLOR_YELLOW}[cache-diag]   msg[{_i}] role={_m.get('role')} {_h(_m)}{COLOR_END}",
-                    agent=self.agent.id,
-                )
-            if len(api_messages) > 5:
-                print_ts(
-                    f"{COLOR_YELLOW}[cache-diag]   ...{len(api_messages)-5} more msgs (suppressed){COLOR_END}",
-                    agent=self.agent.id,
-                )
-
-        # Request dumping — two modes for compact-vs-non-compact diff investigation.
-        #   OPENFLIP_REQUEST_DUMP=1       → minimal: headers + last user message
-        #                                    + token-relevant fields. System
-        #                                    prompt and tool definitions are
-        #                                    static across compact/non-compact
-        #                                    requests and excluding them
-        #                                    actually improves the diff.
-        #   OPENFLIP_REQUEST_DUMP_FULL=1  → everything: full body (system,
-        #                                    tools, all messages). Use only when
-        #                                    you need full reproduction.
-        # Either mode also dumps the response below for pairing.
-        # Sensitive header scrub: authorization, x-api-key.
-        _dump_full = os.environ.get("OPENFLIP_REQUEST_DUMP_FULL") == "1"
-        _dump_minimal = os.environ.get("OPENFLIP_REQUEST_DUMP") == "1"
-        if _dump_full or _dump_minimal:
-            try:
-                import json as _json, time as _t
-                from .utils import project_root as _pr
-                _dump_dir = os.path.join(_pr(), "data", "request_dumps")
-                os.makedirs(_dump_dir, exist_ok=True)
-                # Dumps carry full conversation bodies (potential PII / other
-                # users' DMs on a multi-user host). Keep the dir owner-only.
-                try:
-                    os.chmod(_dump_dir, 0o700)
-                except OSError:
-                    pass
-                _stamp = f"{self.agent.id}_{int(_t.time() * 1000)}"
-                _dump_path = os.path.join(_dump_dir, f"{_stamp}.req.json")
-                _scrub_keys = {"authorization", "x-api-key"}
-                _safe_headers = {k: v for k, v in headers.items() if k.lower() not in _scrub_keys}
-                if _dump_full:
-                    _payload = {"url": f"{_DEFAULT_API_BASE}/v1/messages",
-                                "mode": "full",
-                                "headers": _safe_headers,
-                                "body": body}
-                else:
-                    # Minimal: just the diff-relevant pieces. Skip system, tools,
-                    # and message history. Keep model, last user message, token
-                    # caps, and any compaction-related fields.
-                    _msgs = body.get("messages") or []
-                    _last_msg = _msgs[-1] if _msgs else None
-                    _body_summary = {
-                        "model": body.get("model"),
-                        "max_tokens": body.get("max_tokens"),
-                        "temperature": body.get("temperature"),
-                        "message_count": len(_msgs),
-                        "last_message": _last_msg,
-                        "betas": body.get("betas"),
-                        "thinking": body.get("thinking"),
-                        "system_chars": sum(len(b.get("text", "")) for b in (body.get("system") or []) if isinstance(b, dict)),
-                        "tools_count": len(body.get("tools") or []),
-                    }
-                    # Include any context-management / compaction-related fields verbatim.
-                    for _k in ("context_management", "context_compaction"):
-                        if _k in body:
-                            _body_summary[_k] = body[_k]
-                    _payload = {"url": f"{_DEFAULT_API_BASE}/v1/messages",
-                                "mode": "minimal",
-                                "headers": _safe_headers,
-                                "body_summary": _body_summary}
-                with open(_dump_path, "w") as _df:
-                    _json.dump(_payload, _df, indent=2)
-                try:
-                    os.chmod(_dump_path, 0o600)
-                except OSError:
-                    pass
-                # Stash the stamp on self so the response-side dumper can pair.
-                self._last_req_dump_stamp = _stamp
-            except Exception as _dump_e:
-                print_ts(f"{COLOR_YELLOW}request_dump failed: {_dump_e}{COLOR_END}", agent=self.agent.id)
-
-        # Pre-flight request validation. Catches structural bugs (orphan
-        # tool_use, oversized images, bad media types, etc.) before the
-        # bytes leave the process. Fail-severity raises; warn-severity
-        # logs and proceeds. See openflip/_request_validator.py.
-        #
-        # Kill switch: OPENFLIP_DISABLE_REQUEST_VALIDATOR=1 bypasses the
-        # entire validator (no warns, no fails). Use if the validator
-        # starts false-positiveing on legitimate traffic and there's
-        # no time to fix it properly. Anthropic's own 400 still surfaces
-        # via the normal error path.
-        if os.environ.get("OPENFLIP_DISABLE_REQUEST_VALIDATOR") != "1":
-            _vresult = _request_validator.validate_anthropic_request(body)
-            for _vp in _vresult.warns():
-                print_ts(
-                    f"{COLOR_YELLOW}request validator WARN: {_vp}{COLOR_END}",
-                    agent=self.agent.id,
-                )
-            if not _vresult.ok:
-                for _vp in _vresult.fails():
-                    print_ts(
-                        f"{COLOR_RED}request validator FAIL: {_vp}{COLOR_END}",
-                        agent=self.agent.id, error=True,
-                    )
-                raise MalformedRequestError(_vresult.fails())
-
-        try:
-            async with session.post(
-                f"{_DEFAULT_API_BASE}/v1/messages",
-                json=body,
-                headers=headers,
-            ) as resp:
-                status = resp.status
-                # For success, we'll consume the SSE stream below via
-                # parse_sse_stream(resp.content). For errors, read the
-                # full body as text so the existing error-recovery paths
-                # work unchanged. Anthropic returns JSON error bodies on
-                # non-200 even when stream=true was requested.
-                if status != 200:
-                    text = await resp.text()
-                else:
-                    # Placeholder; populated after SSE consumption so any
-                    # downstream `text[:N]` references continue to work
-                    # (currently only used in error paths, but kept for
-                    # safety against future drift).
-                    text = ""
-
-                if status == 401:
-                    if _retry_attempt == 0:
-                        print_ts(
-                            f"{COLOR_YELLOW}Anthropic 401 — forcing token refresh and retrying{COLOR_END}",
-                            agent=self.agent.id,
-                        )
-                        refreshed = await _load_oauth_access_token(force_refresh=True)
-                        if refreshed and refreshed != access_token:
-                            return await self._chat_legacy(
-                                tools=tools, think=think, tool_choice=tool_choice,
-                                _retry_attempt=_retry_attempt + 1,
-                            )
-                    print_ts(
-                        f"{COLOR_RED}Anthropic 401 — token refresh failed or still rejected{COLOR_END}",
-                        agent=self.agent.id, error=True,
-                    )
-                    return AnthropicAIChatMessage(
-                        content="⚠️ Anthropic OAuth token rejected (401). Try `claude` to re-login.",
-                        is_framework_error=True,
-                    )
-
-                if status == 429:
-                    return AnthropicAIChatMessage(
-                        content="⚠️ Anthropic rate limit (429). Subscription quota — wait and retry.",
-                        is_framework_error=True,
-                    )
-
-                if status != 200:
-                    print_ts(
-                        f"{COLOR_RED}Anthropic API {status}: {text[:600]}{COLOR_END}",
-                        agent=self.agent.id, error=True,
-                    )
-                    # Recovery 1: stale compaction block. The stored block is
-                    # the wrong format / unrecognized. Clear and retry once.
-                    if (
-                        status == 400
-                        and _retry_attempt == 0
-                        and self._compaction_block is not None
-                        and "compact" in text.lower()
-                    ):
-                        print_ts(
-                            f"{COLOR_YELLOW}clearing stale compaction block "
-                            f"and retrying once{COLOR_END}",
-                            agent=self.agent.id,
-                        )
-                        self._compaction_block = None
-                        try:
-                            os.remove(self._meta_path())
-                        except OSError:
-                            pass
-                        return await self._chat_legacy(
-                            tools=tools, think=think, _retry_attempt=1,
-                            tool_choice=tool_choice,
-                        )
-                    # Recovery 2: prompt too long. Anthropic counted more
-                    # tokens than our chars/2 estimator predicted. Halve the
-                    # budget for the trim and retry. Up to 3 retries total —
-                    # each one halves again. With agent.model=*-1m: first
-                    # retry uses budget=500k, then 250k, then 125k. If even
-                    # 125k can't fit, something's catastrophically wrong and
-                    # we surface the error.
-                    if (
-                        status == 400
-                        and _retry_attempt < 3
-                        and "prompt is too long" in text.lower()
-                    ):
-                        window = get_model_context_window(self.agent.model, "anthropic")
-                        new_budget = max(window // (2 ** (_retry_attempt + 1)), 50_000)
-                        print_ts(
-                            f"{COLOR_YELLOW}prompt too long — retry "
-                            f"{_retry_attempt + 1}/3 with budget {new_budget:,}{COLOR_END}",
-                            agent=self.agent.id,
-                        )
-                        self._retry_budget = new_budget
-                        try:
-                            return await self._chat_legacy(
-                                tools=tools, think=think,
-                                _retry_attempt=_retry_attempt + 1,
-                                tool_choice=tool_choice,
-                            )
-                        finally:
-                            self._retry_budget = None
-                    snippet = text[:200].replace("\n", " ")
-                    return AnthropicAIChatMessage(
-                        content=f"⚠️ Anthropic API {status}: {snippet}",
-                        is_framework_error=True,
-                    )
-
-                # Consume the SSE stream into the same dict shape the
-                # non-streaming response had. parse_sse_stream returns
-                # a dict with `content` (list of blocks), `usage`, and
-                # `stop_reason` — everything the existing block-extraction
-                # loop below needs.
-                from ._anthropic_stream import parse_sse_stream
-                obj = await parse_sse_stream(resp.content.iter_any())
-
-                # OPENFLIP_REQUEST_DUMP[_FULL]=1: pair the response with the
-                # request we stashed before sending.
-                if os.environ.get("OPENFLIP_REQUEST_DUMP") == "1" or os.environ.get("OPENFLIP_REQUEST_DUMP_FULL") == "1":
-                    try:
-                        _stamp = getattr(self, "_last_req_dump_stamp", None)
-                        if _stamp:
-                            from .utils import project_root as _pr2
-                            _dump_dir2 = os.path.join(_pr2(), "data", "request_dumps")
-                            _resp_path = os.path.join(_dump_dir2, f"{_stamp}.resp.json")
-                            with open(_resp_path, "w") as _rf:
-                                json.dump(obj, _rf, indent=2)
-                            try:
-                                os.chmod(_resp_path, 0o600)
-                            except OSError:
-                                pass
-                            # One-shot: clear so we don't double-pair on retry.
-                            self._last_req_dump_stamp = None
-                    except Exception as _re:
-                        print_ts(f"{COLOR_YELLOW}response_dump failed: {_re}{COLOR_END}", agent=self.agent.id)
-        except asyncio.TimeoutError:
-            return AnthropicAIChatMessage(
-                content="⚠️ Anthropic API timed out (5 min).",
-                is_framework_error=True,
-            )
-        except Exception as e:
-            print_ts(
-                f"{COLOR_RED}Anthropic API exception: {e}{COLOR_END}",
+                f"{COLOR_RED}{msg}{COLOR_END}",
                 agent=self.agent.id, error=True,
             )
-            return AnthropicAIChatMessage(
-                content=f"⚠️ Anthropic API error: {e}",
-                is_framework_error=True,
-            )
+            return AnthropicAIChatMessage(content=msg, is_framework_error=True)
 
-        text_parts: list[str] = []
-        thinking_parts: list[str] = []
-        tool_calls: list[AnthropicToolCall] = []
-
-        for block in obj.get("content", []) or []:
-            btype = block.get("type")
-            if btype == "text":
-                text_parts.append(block.get("text", ""))
-            elif btype == "thinking":
-                thinking_parts.append(block.get("thinking", ""))
-            elif btype == "tool_use":
-                name = block.get("name", "")
-                args = block.get("input", {}) or {}
-                tool_use_id = block.get("id", "")
-                if name in tools_map:
-                    tool_calls.append(AnthropicToolCall(
-                        function_name=name, args=args, tool_use_id=tool_use_id,
-                        function=tools_map.get(name),
-                    ))
-            elif btype == "compaction":
-                # Server-side compaction summary. Store it; we re-send it
-                # at the head of every subsequent request as the canonical
-                # summary of everything before it.
-                self._compaction_block = {
-                    "type": "compaction",
-                    "content": block.get("content", ""),
-                }
-                _c = self._compaction_block["content"]
-                summary_chars = len(_c) if isinstance(_c, (str, list)) else 0
-                print_ts(
-                    f"received compaction block ({summary_chars} chars/blocks of summary)",
-                    agent=self.agent.id,
-                )
-                # Persist immediately so a bot restart doesn't lose the block
-                # and force a paid recompaction on next message.
-                self._save_meta()
-                # Flag for runtime to post the "⚙️ Compacting conversation"
-                # notice in the channel.
-                self.compacted_this_turn = True
-                # Critical: also drop the now-summarized messages from
-                # in-memory and from the live jsonl. Without this, every
-                # future turn re-sends 600k+ tokens of "old" messages that
-                # the compaction summary already represents — Anthropic
-                # bills them as cache_create and the conversation never
-                # actually shrinks. Backup the old jsonl with a timestamp
-                # so the raw history is preserved as a sidecar; rewrite
-                # the live file to contain only the post-compaction tail.
-                self._archive_and_trim_after_compaction()
-
-        # Consume the /compact flag — whether or not Anthropic actually
-        # returned a block this turn. Don't carry it into future turns.
-        if self.force_compact_next:
-            self.force_compact_next = False
-
-        # Log usage including cache stats so we can verify caching engages.
-        # Anthropic returns cache_creation_input_tokens (this turn populated
-        # the cache) and cache_read_input_tokens (this turn was served from
-        # cache). On a working pipeline, the first turn shows non-zero
-        # cache_creation and zero cache_read; subsequent turns within the
-        # ttl window show non-zero cache_read.
-        usage = obj.get("usage") or {}
-        in_tok = usage.get("input_tokens", 0)
-        out_tok = usage.get("output_tokens", 0)
-        cache_create = usage.get("cache_creation_input_tokens", 0)
-        cache_read = usage.get("cache_read_input_tokens", 0)
-        # Stash latest usage on the conversation for /status to read without
-        # log-grepping. Total input = in + cache_create + cache_read since
-        # cached tokens still count toward the request's input.
-        self.last_usage = {
-            "input_tokens": in_tok,
-            "output_tokens": out_tok,
-            "cache_creation_input_tokens": cache_create,
-            "cache_read_input_tokens": cache_read,
-            "total_input": in_tok + cache_create + cache_read,
-            "ts": time.time(),
-        }
-        # Persist so /status shows real numbers after bot restart, not 0.
-        # _save_meta also writes compaction_block — combining the two
-        # avoids two separate sidecar writes per turn.
-        self._save_meta()
-        print_ts(
-            f"anthropic usage: in={in_tok} out={out_tok} "
-            f"cache_create={cache_create} cache_read={cache_read}",
-            agent=self.agent.id,
-        )
-
-        # Malformed-tool_use detection + retry.
-        # Anthropic occasionally emits a tool_use block where the `input` dict
-        # is empty `{}` despite the tool's schema requiring fields. When that
-        # reaches our dispatcher it crashes with "missing required positional
-        # argument" — but more often it silently drops because the model also
-        # emits a stop_reason that we treat as turn-complete. Result: visible
-        # "I'll do X" narration, then nothing. Mirroring Claude Code's harness:
-        # detect the case and retry the turn with explicit feedback to the
-        # model. Capped retries to avoid loops on truly broken inputs.
-        if tool_calls and _retry_attempt < 2:
-            malformed = []
-            for tc in tool_calls:
-                schema = (getattr(tc.function, "tool_spec", {}) or {}).get(
-                    "input_schema", {}
-                ) or {}
-                required = schema.get("required") or []
-                if required and not tc.args:
-                    malformed.append((tc.function_name, required))
-            if malformed:
-                names_and_fields = "; ".join(
-                    f"{n} (needs: {', '.join(r)})" for n, r in malformed
-                )
-                print_ts(
-                    f"{COLOR_YELLOW}malformed tool_use detected ({names_and_fields}) — "
-                    f"retry {_retry_attempt + 1}/2{COLOR_END}",
-                    agent=self.agent.id,
-                )
-                # Inject a user-role nudge so the model sees what went wrong.
-                # Avoiding modifying self.messages permanently — append, retry,
-                # pop on the way out.
-                nudge = (
-                    "[FRAMEWORK]: Your last tool_use block had empty input but "
-                    f"required fields are: {names_and_fields}. Retry the call with all "
-                    "required arguments filled in. If you can't fill them, reply in text "
-                    "explaining what you need instead."
-                )
-                self.messages.append(ChatMessage("user", nudge))
-                try:
-                    retry_response = await self._chat_legacy(
-                        tools=tools, think=think,
-                        tool_choice=tool_choice,
-                        _retry_attempt=_retry_attempt + 1,
-                    )
-                    return retry_response
-                finally:
-                    # Always pop the framework nudge we just appended, even
-                    # if the retry raised. Keeps history clean.
-                    if (self.messages and self.messages[-1].role == "user"
-                            and "[FRAMEWORK]:" in (self.messages[-1].get("content", "") or "")):
-                        self.messages.pop()
-
-        response = AnthropicAIChatMessage(
-            content="".join(text_parts),
-            tool_calls=tool_calls,
-        )
-        if thinking_parts:
-            response.thinking = "".join(thinking_parts)
-        response.raw_response = obj
         return response
 
     async def chat_stream(
@@ -2550,8 +1774,7 @@ class AnthropicConversation:
                     {"role": "assistant", "content": [cb]},
                 ] + api_messages
 
-        # REMINDER.md injection. See `_chat_legacy()` for the full rationale
-        # — this is the streaming-path mirror, kept in sync.
+        # REMINDER.md injection.
         # Uncached, position-before-new-user-message, soft-warned at 2k chars,
         # never persisted to self.messages. Cache breakpoint placement below
         # accounts for _reminder_injected when present.
@@ -2573,8 +1796,7 @@ class AnthropicConversation:
                                 agent=self.agent.id,
                             )
                         # CRITICAL: skip when last user message carries
-                        # tool_result blocks — see _chat_legacy mirror for
-                        # the full rationale. Inserting REMINDER between an
+                        # tool_result blocks. Inserting REMINDER between an
                         # assistant tool_use and the user tool_result that
                         # must immediately follow it returns 400.
                         _skip_for_tool_result = False

@@ -378,7 +378,9 @@ async def restart_gateway(reason: str, continuation: str = "", force: bool = Fal
         from ..registry import RUNNERS
         runner = RUNNERS.get(agent.id)
         if runner and channel_id:
-            conv = runner.conversations.get(int(channel_id))
+            # conv_key: identity-linked channels share a "linked:<canonical>"
+            # dict key; unlinked ids pass through unchanged.
+            conv = runner.conversations.get(runner.conv_key(int(channel_id)))
             if conv is not None:
                 conv.save()
                 print_ts(

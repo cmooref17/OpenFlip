@@ -159,7 +159,14 @@ async def talk_to_agent(agent_id: str, message: str, channel_id: int = 0, sessio
         _transport_id = _t_id
         for _k, _c in target.conversations.items():
             if getattr(_c, "conversation_id", None) == _safe_sid:
-                _transport_id = str(_k)
+                # Only an INT dict key is a transport-native channel id worth
+                # reusing for routing. Identity-linked conversations key by
+                # the "linked:<canonical>" STRING — not a routable id; leave
+                # the suffix-derived fallback. The synthetic turn still lands
+                # in the right live object because get_conversation keys
+                # linked conversations by conversation_id, not transport_id.
+                if isinstance(_k, int):
+                    _transport_id = str(_k)
                 break
         _explicit_session = _Session(
             transport=_t_name,

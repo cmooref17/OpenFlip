@@ -91,6 +91,70 @@ def get_admin_ids(integration: str = "discord") -> list[int]:
     return ids
 
 
+# ── Cross-transport identity links ──
+#
+# Top-level `identity_links` in config.json maps a per-transport identity to a
+# canonical id so one person's 1:1 conversations on different transports share
+# ONE conversation history:
+#
+#   "identity_links": {
+#     "discord:139243578504249344": "flip",
+#     "imessage:+15551234567": "flip"
+#   }
+#
+# Keys are "<transport>:<native_id>" (Discord: numeric user id; iMessage: the
+# raw handle). Values are an arbitrary canonical string. A linked speaker's
+# 1:1 sessions get conversation_id "linked:<canonical>" instead of the
+# transport-native id (see make_discord_session / make_imessage_session).
+#
+# SECURITY: links rewrite conversation ROUTING ONLY (which history file +
+# in-memory conversation a session resolves to). They confer NO privilege:
+# owner/admin/tool ACLs are evaluated per-turn from the session's transport +
+# native handle/id (_acl_transport/_acl_speaker/_acl_handle in _run_turn) and
+# never consult identity_links. Being owner on Discord does not make the
+# linked iMessage handle owner, and vice versa.
+
+LINKED_CONV_PREFIX = "linked:"
+
+
+def get_identity_links() -> dict[str, str]:
+    """Return the identity_links map with normalized keys/values.
+
+    Keys are case-folded + stripped ("<transport>:<native_id>") to match the
+    normalization iMessage applies to sender handles; Discord ids are digits
+    and unaffected. Malformed entries (no colon, empty value) are skipped.
+    """
+    cfg = get_config()
+    raw = cfg.get("identity_links")
+    if not isinstance(raw, dict):
+        return {}
+    links: dict[str, str] = {}
+    for k, v in raw.items():
+        key = str(k).strip().lower()
+        val = str(v).strip()
+        if ":" not in key or not key.split(":", 1)[1] or not val:
+            continue
+        links[key] = val
+    return links
+
+
+def resolve_linked_conversation_id(transport: str, native_id) -> str:
+    """Return "linked:<canonical>" if "<transport>:<native_id>" is linked, else "".
+
+    `native_id` is the transport-native speaker identity: the int user id for
+    Discord, the raw handle string for iMessage. Lookup is case-folded to
+    match get_identity_links' key normalization.
+    """
+    if not transport or native_id is None or native_id == "":
+        return ""
+    links = get_identity_links()
+    if not links:
+        return ""
+    key = f"{transport}:{native_id}".strip().lower()
+    canonical = links.get(key, "")
+    return f"{LINKED_CONV_PREFIX}{canonical}" if canonical else ""
+
+
 # ── Handle-based identity accessors (iMessage, future SMS/email) ──
 #
 # Handle-based transports identify senders by an email/phone STRING, not a
@@ -166,19 +230,68 @@ def get_integration_tokens(integration: str = "discord") -> dict[str, str]:
     return {}
 
 
+# ── OpenAI provider accessors ──
+#
+# The "openai" provider (OpenAIConversation) authenticates with a plain API
+# key — no OAuth. The key lives in config.json under `integrations.openai.
+# api_key`, with the standard OPENAI_API_KEY environment variable as a
+# fallback so a deployment can keep the secret out of the config file.
+
+def get_openai_api_key() -> str:
+    """Return the OpenAI API key, or "" if unconfigured.
+
+    Lookup order:
+      1. `integrations.openai.api_key` in config.json (canonical)
+      2. OPENAI_API_KEY environment variable
+      3. "" (provider unusable — surfaces as an auth error at chat time)
+    """
+    cfg = get_config()
+    entry = (cfg.get("integrations") or {}).get("openai") or {}
+    key = entry.get("api_key")
+    if key:
+        return str(key).strip()
+    return os.environ.get("OPENAI_API_KEY", "").strip()
+
+
+def get_openai_base_url() -> str:
+    """API base for the openai provider. `integrations.openai.base_url`
+    overrides (e.g. for a compatible proxy/gateway); default is the
+    official endpoint. Trailing slash is stripped so callers can append
+    `/v1/chat/completions` uniformly."""
+    cfg = get_config()
+    entry = (cfg.get("integrations") or {}).get("openai") or {}
+    base = str(entry.get("base_url") or "").strip()
+    return (base or "https://api.openai.com").rstrip("/")
+
+
+def get_openai_default_model() -> str:
+    """Model used when an openai-provider agent has an empty `model` field.
+
+    `integrations.openai.default_model` overrides; falls back to "gpt-5.1".
+    Agents normally set their model explicitly in agent.json.
+    """
+    cfg = get_config()
+    entry = (cfg.get("integrations") or {}).get("openai") or {}
+    model = str(entry.get("default_model") or "").strip()
+    return model or "gpt-5.1"
+
+
 # ── Model-context lookup ──
 #
-# Single source of truth for each model's context window. Both providers
-# (anthropic + ollama) read from here. Compaction trigger is derived as
-# `context_window - compaction_reserve_tokens` so we never have to
+# Single source of truth for each model's context window. All providers
+# (anthropic + openai + ollama) read from here. Compaction trigger is derived
+# as `context_window - compaction_reserve_tokens` so we never have to
 # maintain two separate numbers.
 
 # Sensible defaults if the model isn't in config.json's `models` block.
 # Anthropic models default to 200k (their published default for sonnet/opus
-# without the 1M beta header). Ollama models default to 32k (a common llama
+# without the 1M beta header). OpenAI models default to a conservative 128k —
+# bigger-window models (gpt-5 family) should declare their real window in
+# config.json's models block. Ollama models default to 32k (a common llama
 # default). Bumping a specific model's window means adding it to config.json.
 _DEFAULT_CONTEXT_WINDOW_BY_PROVIDER = {
     "anthropic": 200_000,
+    "openai": 128_000,
     "ollama": 32_000,
 }
 
@@ -244,28 +357,41 @@ def get_compaction_trigger(model_name: str, provider: str = "") -> int:
 # AnthropicConversation._effort_level, and agents/_shared/MANUAL.md.
 _VALID_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
+# OpenAI `reasoning_effort` levels (Chat Completions, reasoning-capable models
+# only — o-series / gpt-5 family). Distinct vocabulary from Anthropic's set:
+# no xhigh/max, adds minimal. Only set `models.<bare>.effort` on a model that
+# actually supports the parameter — the API 400s otherwise.
+_VALID_OPENAI_EFFORT_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high")
+
 
 def get_effort(model_name: str, provider: str = "") -> str | None:
     """Return the reasoning-effort level for a model → Anthropic
-    `output_config.effort`, or None to omit the field entirely.
+    `output_config.effort` / OpenAI `reasoning_effort`, or None to omit the
+    field entirely.
 
     Per-model override: reads `models.<bare>.effort` from config.json using the
     same bare-name resolution as get_compaction_trigger / get_model_context_window
-    (strip the `provider/` prefix). Validates against the five valid levels
-    (low/medium/high/xhigh/max); anything invalid or absent → None, which the
-    provider treats as "omit output_config" (API default "high").
+    (strip the `provider/` prefix). Validates against the provider's valid
+    levels (anthropic: low/medium/high/xhigh/max; openai: minimal/low/medium/
+    high); anything invalid or absent → None, which the provider treats as
+    "omit the field" (API default).
 
-    Anthropic-only: if a non-empty provider is passed that isn't "anthropic",
-    return None — effort is meaningless for ollama and the field would 400.
+    Provider-gated: a non-empty provider that isn't "anthropic" or "openai"
+    returns None — effort is meaningless for ollama and the field would 400.
+    An empty provider keeps the historical anthropic validation.
     """
-    if provider and provider != "anthropic":
+    if provider == "openai":
+        valid = _VALID_OPENAI_EFFORT_LEVELS
+    elif provider and provider != "anthropic":
         return None
+    else:
+        valid = _VALID_EFFORT_LEVELS
     cfg = get_config()
     # Strip provider prefix for the per-model lookup; matches get_compaction_trigger.
     bare = model_name.split("/", 1)[1] if "/" in model_name else model_name
     models = cfg.get("models") or {}
     entry = models.get(bare) or {}
     level = entry.get("effort")
-    if isinstance(level, str) and level.strip().lower() in _VALID_EFFORT_LEVELS:
+    if isinstance(level, str) and level.strip().lower() in valid:
         return level.strip().lower()
     return None

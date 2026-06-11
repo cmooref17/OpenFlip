@@ -107,11 +107,26 @@ def make_discord_session(
     Centralizes the prefix convention so we don't recompute
     `f"discord:{channel_id}"` everywhere. `guild_id` and `category_id` are
     0 for DMs (and `category_id` is also 0 for uncategorized channels).
+
+    Identity links: if this is a DM and the speaker is in config.json's
+    `identity_links` ("discord:<user_id>" → canonical), conversation_id is
+    rewritten to "linked:<canonical>" so the conversation history is shared
+    with the same person's linked sessions on other transports. DM-only:
+    guild channels are a shared space keyed by channel, not by speaker —
+    rewriting them would split one channel's history across speakers.
+    Routing (transport/transport_id) and auth inputs (speaker_id, is_owner,
+    roles) are untouched — the link affects conversation identity ONLY.
     """
+    conversation_id = f"discord:{channel_id}"
+    if is_dm:
+        from .config_global import resolve_linked_conversation_id
+        linked = resolve_linked_conversation_id("discord", speaker_id)
+        if linked:
+            conversation_id = linked
     return Session(
         transport="discord",
         transport_id=str(channel_id),
-        conversation_id=f"discord:{channel_id}",
+        conversation_id=conversation_id,
         speaker_id=speaker_id,
         speaker_role_ids=speaker_role_ids,
         is_owner=is_owner,
