@@ -57,15 +57,30 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         import os
         ch_id = interaction.channel.id
         conv_key = _conv_key_for_interaction(runner, interaction)
-        # Invalidate any in-flight turn's pending save BEFORE touching state.
-        # A turn already mid-flight on this channel holds its own reference to
-        # the conversation object and re-saves it at end-of-turn — without this
-        # the delete below would be silently undone (history resurrected) by
-        # that re-save. Bumping the epoch makes the in-flight turn's _save_conv()
-        # a no-op (see AgentRunner.bump_conv_epoch / _run_turn._turn_epoch). This
-        # runs synchronously before any await, so no turn can resume between the
-        # bump and the delete.
+        # Stop + wipe must be race-safe: everything from here to the file
+        # delete runs synchronously (no await), so no in-flight or queued turn
+        # can resume in the gap. Ordering is deliberate:
+        #
+        # 1. Bump the epoch FIRST. A turn already mid-flight on this channel
+        #    holds its own reference to the conversation object and re-saves it
+        #    at end-of-turn (including from its CancelledError + finally cleanup
+        #    paths) — without this the delete below would be silently undone
+        #    (history resurrected) by that re-save. Bumping the epoch makes the
+        #    in-flight turn's _save_conv() a no-op (see bump_conv_epoch /
+        #    _run_turn._turn_epoch). It must precede the interrupt so the save
+        #    that may fire during the cancelled turn's teardown already no-ops.
         runner.bump_conv_epoch(conv_key)
+        # 2. Hard-interrupt the actively-generating turn — the SAME machinery
+        #    /stop uses (runner._hard_interrupt), so its reply + save are
+        #    abandoned instead of orphaned. Cancellation is async teardown, but
+        #    .cancel() itself is synchronous and the epoch guard (step 1) already
+        #    suppresses the teardown save.
+        runner._hard_interrupt(conv_key)
+        # 3. Drop any QUEUED-but-not-yet-dispatched turns for this conversation
+        #    (synthetic/cron turns, or a same-channel message that raced the
+        #    soft-inject guard) so none replays against the just-wiped history.
+        #    Scoped to this conversation key only — other channels untouched.
+        runner._drop_queued_turns(conv_key)
         conv = runner.conversations.pop(conv_key, None)
         if conv and hasattr(conv, "clear_history"):
             conv.clear_history()

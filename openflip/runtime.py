@@ -441,6 +441,71 @@ class AgentRunner:
         active_task.cancel()
         return pending_count
 
+    def _drop_queued_turns(self, channel_id: int | str) -> int:
+        """Remove not-yet-dispatched queued turns for `channel_id` from the
+        inbound queue.
+
+        `channel_id` is a conversation key (int or "linked:<canonical>" — see
+        conv_key). Pairs with `_hard_interrupt`: that cancels the ACTIVE turn,
+        this removes turns still sitting in `_inbound_queue` that haven't been
+        dispatched yet — synthetic turns from cron/talk_to_agent (which enqueue
+        without the active-turn soft-inject guard, see run_synthetic_turn), or a
+        same-channel message that raced the guard. Used by `/reset` so a queued
+        turn can't run against history that's about to be wiped.
+
+        Mirrors the human-preempt drain in `_handle_message`/`_handle_inbound`:
+        pull every item, re-queue the ones for OTHER channels untouched, drop
+        the ones matching `channel_id`. task_done() is balanced per get_nowait()
+        exactly as that path does it (re-queued items get a fresh get→task_done
+        cycle later). Fully synchronous (get_nowait/put_nowait) so a caller can
+        run it in the same no-await window as the epoch bump + interrupt — no
+        turn can be dispatched out of the queue in the gap. Other channels are
+        never touched. Returns the number of dropped turns.
+        """
+        if not channel_id:
+            return 0
+        dropped = 0
+        saved: list = []
+        while True:
+            try:
+                item = self._inbound_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                item_key = self._turn_key(
+                    item.get("channel"),
+                    item.get("inbound"),
+                    speaker_id=int(item.get("speaker_id") or 0),
+                )
+            except Exception:
+                # Can't key it — keep it rather than silently drop a turn for
+                # some other channel. Worst case it runs as before.
+                item_key = None
+            if item_key is not None and item_key == channel_id:
+                dropped += 1
+            else:
+                saved.append(item)
+            self._inbound_queue.task_done()
+        for item in saved:
+            try:
+                self._inbound_queue.put_nowait(item)
+            except asyncio.QueueFull:
+                # Unreachable: we only put back items we just took, so depth
+                # can't exceed what it was. Log + drop rather than raise if it
+                # ever somehow does, so /reset can't wedge on a full queue.
+                print_ts(
+                    f"{COLOR_YELLOW}_drop_queued_turns: re-queue unexpectedly full "
+                    f"— dropping a queued turn for another channel{COLOR_END}",
+                    agent=self.agent.id,
+                )
+        if dropped:
+            print_ts(
+                f"{COLOR_YELLOW}/reset on conversation {channel_id} — dropped {dropped} "
+                f"queued turn(s) so they can't replay stale history{COLOR_END}",
+                agent=self.agent.id,
+            )
+        return dropped
+
     def _drain_pending_injects(self, channel_id: int | str, conv) -> int:
         """Soft-inject drain. `channel_id` is a conversation key (int or
         "linked:<canonical>" — see conv_key). Pops everything in _pending_inject[channel_id]
