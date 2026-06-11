@@ -342,7 +342,7 @@ def should_respond(agent: Agent, inbound: InboundMessage, bot_user_id: int) -> b
 MEMORY_TOOL_NAMES = {"save_memory", "update_core_memory", "search_memory", "read_memory", "list_memory_files"}
 
 
-def build_visible_tools(agent: Agent, *, speaker_id, speaker_role_ids, channel_id, owner: bool = False, transport: str = "discord", chain_terminator_mode: bool = False, handle: str = "", tool_grants: list[str] | None = None):
+def build_visible_tools(agent: Agent, *, speaker_id, speaker_role_ids, channel_id, owner: bool = False, transport: str = "discord", chain_terminator_mode: bool = False, chain_root_operator: bool = True, handle: str = "", tool_grants: list[str] | None = None):
     """Return (callable_tool_funcs, system_extension_text, user_preamble_text).
 
     The split is for prompt caching:
@@ -422,23 +422,35 @@ def build_visible_tools(agent: Agent, *, speaker_id, speaker_role_ids, channel_i
         preamble_parts.append(settings_summary)
     preamble = "\n\n".join(preamble_parts)
 
-    # ARCHITECTURE FIX 2026-05-19: chain-terminator turns now use the
-    # normal toolset and normal text-posting behavior. The previous
-    # narrowed-3-tool design was the root cause of the silent-failure
-    # bug class — the model was asked to "produce output that gets
-    # discarded" which is structurally weird and the model sometimes
-    # returned empty under that pressure. By making chain-terminator
-    # turns behave like normal turns (full toolset, plain text posts),
-    # the bug class disappears. See:
-    # chain_terminator_architecture design doc (Option 4).
+    # Chain-terminator turns keep the FULL toolset (the 2026-05-19 fix for
+    # the silent-failure bug class — the old narrowed-3-tool / forced-choice
+    # design pressured the model into empty replies), but since the 2026-06
+    # leak fix they run SILENT: plain text is saved to history only, never
+    # auto-posted. The extension below is what steers delivery — when a
+    # human is awaiting the chain's outcome, the model must explicitly
+    # send_message; inter-agent chatter otherwise never reaches a human
+    # channel. `chain_root_operator` distinguishes the two cases.
     if chain_terminator_mode:
-        extension = (extension + "\n\n" if extension else "") + (
-            "[returning from peer] The previous tool result was an "
-            "auto-routed reply from a peer agent you talked to. Read it, "
-            "then respond as you normally would: answer the human with "
-            "what you learned (plain text — it will post to their DM), "
-            "or call talk_to_agent again to continue the chain, or just "
-            "end the turn if there's nothing more to say."
-        )
+        if chain_root_operator:
+            extension = (extension + "\n\n" if extension else "") + (
+                "[returning from peer] The previous message is an auto-routed "
+                "reply from a peer agent you talked to. This chain was started "
+                "by a human who is likely waiting in this conversation, and "
+                "NOTHING you say here auto-posts: if the reply answers what "
+                "they asked, deliver it NOW with send_message (no channel_id "
+                "needed — it posts to this conversation). Call talk_to_agent "
+                "to continue with the peer first if needed. Plain text is "
+                "saved to the log only and the human will never see it."
+            )
+        else:
+            extension = (extension + "\n\n" if extension else "") + (
+                "[returning from peer] The previous message is an auto-routed "
+                "reply from a peer agent you talked to. This chain is "
+                "agent-initiated (cron/heartbeat/kairos/another agent) — it "
+                "stays off all human channels. Call talk_to_agent to continue "
+                "the exchange, use send_message ONLY if a human genuinely "
+                "needs to see something, or end with plain text to close the "
+                "chain (saved to the log, posted nowhere)."
+            )
 
     return callable_funcs, extension, preamble
