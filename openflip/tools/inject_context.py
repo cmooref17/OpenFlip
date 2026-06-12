@@ -13,6 +13,10 @@ and reuses its exact, already-verified write path:
     conversation (get-or-create) then save() — the in-memory list is the
     source of truth for the next model turn; a bare JSONL append would be
     invisible until reload.
+  * If that conversation has a turn IN FLIGHT, the append is deferred
+    through the runner's _pending_inject buffer (the same path mid-turn
+    operator messages use) so it lands after the turn instead of corrupting
+    the in-flight tool_use/tool_result sequence.
   * If the runner is not active, append straight to the channel's JSONL on
     disk; the agent load()s it fresh on its next inbound for that channel.
 """
@@ -35,10 +39,10 @@ async def inject_context(agent_id: str, channel_id: int = 0, text: str = "", ses
     Use this to plant a fact, reminder, or piece of context into another
     agent ahead of its next reply, without triggering or interrupting it.
 
-    Mid-turn caveat: do NOT inject into an agent that is actively mid-reply
-    (i.e. between a tool_use and its tool_result). Appending a user message
-    into the history at that point can corrupt the in-flight turn's message
-    sequence. Inject when the target is idle between turns.
+    Safe to call regardless of the target's state: if the target is actively
+    mid-reply, the injection is automatically deferred and lands in its
+    history right after the in-flight turn finishes (it is never wedged into
+    the live turn's message sequence).
 
     Args:
         agent_id: The target agent's id.
@@ -95,9 +99,12 @@ async def inject_context(agent_id: str, channel_id: int = 0, text: str = "", ses
     target_runner = registry.RUNNERS.get(agent_id)
 
     # `live_conv` is the in-memory conversation object to append to, or None to
-    # fall back to a direct on-disk JSONL append. `conv_id` is always the
-    # transport-prefixed id that governs the on-disk filename.
+    # fall back to a direct on-disk JSONL append. `live_key` is the runner-dict
+    # key that conversation lives under (the same key _active_turns and
+    # _pending_inject use). `conv_id` is always the transport-prefixed id that
+    # governs the on-disk filename.
     live_conv = None
+    live_key = None
     was_loaded = False
 
     if session_id:
@@ -117,9 +124,10 @@ async def inject_context(agent_id: str, channel_id: int = 0, text: str = "", ses
         # find the LIVE conversation by matching conversation_id and reuse its
         # real dict entry.
         if target_runner is not None:
-            for _c in target_runner.conversations.values():
+            for _k, _c in target_runner.conversations.items():
                 if getattr(_c, "conversation_id", None) == conv_id:
                     live_conv = _c
+                    live_key = _k
                     was_loaded = True
                     break
         # If no live conversation matched (agent idle / channel not loaded),
@@ -169,8 +177,28 @@ async def inject_context(agent_id: str, channel_id: int = 0, text: str = "", ses
                     conv_label = _k
             was_loaded = _key in target_runner.conversations
             live_conv = target_runner.get_conversation(_key, conv_id)
+            live_key = _key
 
     marked_text = f"[INJECTED CONTEXT]: {text}"
+
+    # Mid-turn guard: if the target has a turn in flight for this conversation,
+    # appending a user message into the live list NOW can wedge it between a
+    # tool_use and its tool_result (Anthropic 400s on the broken pair). Defer
+    # through the same _pending_inject buffer mid-turn operator messages use —
+    # _drain_pending_injects lands it at the next safe message boundary and
+    # the normal turn-end save persists it.
+    if live_conv is not None and target_runner is not None and live_key is not None:
+        _active = target_runner._active_turns.get(live_key)
+        if _active is not None and not _active.done():
+            target_runner._pending_inject.setdefault(live_key, []).append(marked_text)
+            print_ts(f"inject_context tool: target {agent_id} mid-turn on {conv_label} — "
+                     f"queued as soft-inject (pending count: {len(target_runner._pending_inject[live_key])})",
+                     agent=agent_id)
+            return ToolResult(
+                model_feedback=f"{target_agent.display_name} is mid-turn in conversation {conv_label} — "
+                "the context was queued and will land in its history right after the in-flight turn "
+                "finishes (same deferred path as mid-turn operator messages). Nothing was posted to Discord."
+            )
 
     # The LIVE in-memory conversation list is the source of truth for the
     # target's next model turn — a bare JSONL append is invisible until the

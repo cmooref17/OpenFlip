@@ -506,6 +506,89 @@ class AgentRunner:
             )
         return dropped
 
+    def reset_conversation(self, conv_key: int | str, fallback_conv_id: str = "") -> bool:
+        """Race-safe conversation reset — the ONE implementation behind both
+        the Discord slash `/reset` (commands.reset_cmd) and the text-prefix
+        `/reset` (text_commands._do_reset). Never duplicate this sequence at a
+        call site: the two paths drifted once (65b1464/ff782f3 fixed only the
+        slash path, leaving the resurrection race live on the text path).
+
+        Everything through the file delete runs synchronously (no await), so
+        no in-flight or queued turn can resume in the gap. Ordering is
+        deliberate:
+
+        1. Bump the epoch FIRST. A turn already mid-flight on this
+           conversation holds its own reference to the conversation object
+           and re-saves it at end-of-turn (including from its CancelledError
+           + finally cleanup paths) — without this the delete below would be
+           silently undone (history resurrected) by that re-save. Bumping the
+           epoch makes the in-flight turn's _save_conv() a no-op (see
+           bump_conv_epoch / _run_turn._turn_epoch). It must precede the
+           interrupt so the save that may fire during the cancelled turn's
+           teardown already no-ops.
+        2. Hard-interrupt the actively-generating turn — the SAME machinery
+           /stop uses, so its reply + save are abandoned instead of orphaned.
+           Cancellation is async teardown, but .cancel() itself is
+           synchronous and the epoch guard (step 1) already suppresses the
+           teardown save.
+        3. Drop any QUEUED-but-not-yet-dispatched turns for this conversation
+           (synthetic/cron turns, or a same-channel message that raced the
+           soft-inject guard) so none replays against the just-wiped history.
+           Scoped to this conversation key only — other channels untouched.
+
+        `fallback_conv_id` is the canonical conversation id used to locate
+        the on-disk files when the conversation isn't loaded in memory (e.g.
+        fresh restart before any message in this channel) — clear_history()
+        would never fire there, so the files are backed up + deleted
+        directly. Returns False only when that cold path is needed and no
+        conversation id was supplied (caller should warn the operator);
+        the race-guard preamble has still run in that case.
+        """
+        self.bump_conv_epoch(conv_key)
+        self._hard_interrupt(conv_key)
+        self._drop_queued_turns(conv_key)
+        ok = True
+        conv = self.conversations.pop(conv_key, None)
+        if conv and hasattr(conv, "clear_history"):
+            try:
+                conv.clear_history()
+            except Exception as e:
+                print_ts(f"{COLOR_YELLOW}/reset: clear_history failed: {e}{COLOR_END}",
+                         agent=self.agent.id)
+        elif not fallback_conv_id:
+            ok = False
+        else:
+            # Conversation isn't loaded in memory yet — delete the canonical
+            # files directly so the operator actually gets a fresh history.
+            # delete_conversation_files is the SAME helper clear_history()
+            # uses: pre_reset backup + 5-backup retention sweep, then removes
+            # the .jsonl, the legacy .json, and the .meta.json sidecar (stale
+            # compaction bookkeeping). fs_encode handles the Windows filename
+            # encoding (":" → "%3A") — never join a raw conv_id into a name.
+            agent_dir = os.path.dirname(self.agent.path)
+            from . import _conversation_io as _cio_reset
+            try:
+                meta_path = os.path.join(
+                    agent_dir, "conversations",
+                    _cio_reset.fs_encode(fallback_conv_id) + ".meta.json",
+                )
+                _cio_reset.delete_conversation_files(
+                    agent_dir, fallback_conv_id,
+                    extra_paths=[meta_path],
+                    backup_tag="pre_reset",
+                )
+            except Exception as _rm_err:
+                print_ts(
+                    f"{COLOR_YELLOW}/reset: failed to delete conversation files for "
+                    f"{fallback_conv_id}: {_rm_err}{COLOR_END}",
+                    agent=self.agent.id,
+                )
+        # Wipe any pending soft-inject buffer for this conversation — the
+        # operator is starting over, queued mid-turn messages from the prior
+        # session would be noise in the fresh history.
+        self._pending_inject.pop(conv_key, None)
+        return ok
+
     def _drain_pending_injects(self, channel_id: int | str, conv) -> int:
         """Soft-inject drain. `channel_id` is a conversation key (int or
         "linked:<canonical>" — see conv_key). Pops everything in _pending_inject[channel_id]
@@ -1811,6 +1894,14 @@ class AgentRunner:
         # on-disk history); _save_conv() below then skips our save so we don't
         # resurrect the cleared history from this turn's stale in-memory copy.
         _turn_epoch = self.conv_epoch(_conv_key)
+        # Thread the same epoch check into the conversation object for persist
+        # paths BELOW the _save_conv chokepoint — the anthropic compaction trim
+        # rewrites the JSONL directly inside chat_stream's finally and would
+        # otherwise resurrect history across a mid-turn /reset (the exact bug
+        # _save_conv's guard closes for normal saves). One active turn per
+        # conversation key, so overwriting the previous turn's closure is safe.
+        if hasattr(conv, "_persist_guard"):
+            conv._persist_guard = lambda: self.conv_epoch(_conv_key) == _turn_epoch
 
         def _save_conv(stage: str):
             """Persist the conversation, unless it was reset out from under us.
@@ -3042,7 +3133,14 @@ class AgentRunner:
                 _fu_session = (
                     getattr(inbound, "session", None) if inbound is not None else None
                 ) or getattr(channel, "_session", None)
-                follow_up_target = _fu_session if _fu_session is not None else follow_up_ch_id
+                # Fallback (no session anywhere — bare legacy channel): the
+                # native channel id. Was an undefined name (`follow_up_ch_id`)
+                # until 2026-06-11 — the NameError was swallowed by the except
+                # below and silently dropped the follow-up turn on this branch.
+                follow_up_target = (
+                    _fu_session if _fu_session is not None
+                    else int(getattr(channel, "id", 0) or 0)
+                )
                 follow_up_speaker = int(speaker_id or 0)
                 print_ts(
                     f"{COLOR_YELLOW}{log_tag}drained {_drained_count} soft-inject(s) "
