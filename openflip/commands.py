@@ -54,96 +54,19 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
 
     @bot.slash_command(name="reset", description="Reset the conversation in this channel.")
     async def reset_cmd(interaction: nextcord.Interaction):
-        import os
         ch_id = interaction.channel.id
         conv_key = _conv_key_for_interaction(runner, interaction)
-        # Stop + wipe must be race-safe: everything from here to the file
-        # delete runs synchronously (no await), so no in-flight or queued turn
-        # can resume in the gap. Ordering is deliberate:
+        # The full race-safe stop+wipe sequence (epoch bump → hard interrupt →
+        # queued-turn drop → clear/delete + pre-reset backup) lives in ONE
+        # place: AgentRunner.reset_conversation, shared with the text-prefix
+        # /reset so the two paths can't drift again. See that method's
+        # docstring for the ordering rationale.
         #
-        # 1. Bump the epoch FIRST. A turn already mid-flight on this channel
-        #    holds its own reference to the conversation object and re-saves it
-        #    at end-of-turn (including from its CancelledError + finally cleanup
-        #    paths) — without this the delete below would be silently undone
-        #    (history resurrected) by that re-save. Bumping the epoch makes the
-        #    in-flight turn's _save_conv() a no-op (see bump_conv_epoch /
-        #    _run_turn._turn_epoch). It must precede the interrupt so the save
-        #    that may fire during the cancelled turn's teardown already no-ops.
-        runner.bump_conv_epoch(conv_key)
-        # 2. Hard-interrupt the actively-generating turn — the SAME machinery
-        #    /stop uses (runner._hard_interrupt), so its reply + save are
-        #    abandoned instead of orphaned. Cancellation is async teardown, but
-        #    .cancel() itself is synchronous and the epoch guard (step 1) already
-        #    suppresses the teardown save.
-        runner._hard_interrupt(conv_key)
-        # 3. Drop any QUEUED-but-not-yet-dispatched turns for this conversation
-        #    (synthetic/cron turns, or a same-channel message that raced the
-        #    soft-inject guard) so none replays against the just-wiped history.
-        #    Scoped to this conversation key only — other channels untouched.
-        runner._drop_queued_turns(conv_key)
-        conv = runner.conversations.pop(conv_key, None)
-        if conv and hasattr(conv, "clear_history"):
-            conv.clear_history()
-        else:
-            # Conversation isn't loaded in memory yet (e.g. fresh restart
-            # before any message in this channel). clear_history() would
-            # never fire, leaving the on-disk JSONL untouched — next message
-            # would reload all the old turns. Delete the canonical files
-            # directly so the operator actually gets a fresh history.
-            agent_dir = os.path.dirname(runner.agent.path)
-            # Linked DMs store history under the canonical linked id, not
-            # discord:<channel> — delete the file the conversation actually uses.
-            conv_id = conv_key if isinstance(conv_key, str) else f"discord:{ch_id}"
-            # conversation_path / fs_encode handle the Windows filename
-            # encoding (":" → "%3A") — never join a raw conv_id into a name.
-            from . import _conversation_io as _cio_reset
-            jsonl_path = _cio_reset.conversation_path(agent_dir, conv_id)
-            # Pre-reset backup so /reset is recoverable. Only the .jsonl
-            # is backed up; the .meta.json sidecar is just compaction
-            # bookkeeping and gets regenerated cleanly.
-            if os.path.exists(jsonl_path):
-                try:
-                    import shutil, time as _time
-                    backup = f"{jsonl_path}.pre_reset_{int(_time.time())}.bak.jsonl"
-                    shutil.copy2(jsonl_path, backup)
-                    print_ts(
-                        f"/reset: backed up conversation to {backup}",
-                        agent=runner.agent.id,
-                    )
-                except Exception as _bk_err:
-                    print_ts(
-                        f"{COLOR_YELLOW}/reset: pre-reset backup failed for {jsonl_path}: {_bk_err}{COLOR_END}",
-                        agent=runner.agent.id,
-                    )
-                # Retention sweep: keep last 5 pre_reset backups per channel.
-                try:
-                    import glob as _glob
-                    _all_bak = sorted(_glob.glob(f"{jsonl_path}.pre_reset_*.bak.jsonl"))
-                    if len(_all_bak) > 5:
-                        for _stale in _all_bak[:-5]:
-                            try:
-                                os.remove(_stale)
-                            except OSError:
-                                pass
-                except Exception as _retain_e:
-                    print_ts(
-                        f"{COLOR_YELLOW}/reset: backup retention sweep failed: {_retain_e}{COLOR_END}",
-                        agent=runner.agent.id,
-                    )
-            for ext in (".jsonl", ".meta.json"):
-                target = os.path.join(agent_dir, "conversations", _cio_reset.fs_encode(conv_id) + ext)
-                try:
-                    if os.path.exists(target):
-                        os.remove(target)
-                except Exception as _rm_err:
-                    print_ts(
-                        f"{COLOR_YELLOW}/reset: failed to delete {target}: {_rm_err}{COLOR_END}",
-                        agent=runner.agent.id,
-                    )
-        # Wipe any pending soft-inject buffer for this channel — the operator
-        # is starting over, queued mid-turn messages from the prior session
-        # would be noise in the fresh history.
-        runner._pending_inject.pop(conv_key, None)
+        # Linked DMs store history under the canonical linked id, not
+        # discord:<channel> — the fallback id names the file the conversation
+        # actually uses when it isn't loaded in memory.
+        conv_id = conv_key if isinstance(conv_key, str) else f"discord:{ch_id}"
+        runner.reset_conversation(conv_key, fallback_conv_id=conv_id)
         await interaction.response.send_message("Conversation reset.", ephemeral=True)
 
     @bot.slash_command(name="compact", description="Force compaction on the next message in this channel.")
@@ -749,12 +672,30 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         # _drain_pending_injects path in runtime.py.
         target_runner = registry.RUNNERS.get(agent_id)
         if target_runner:
+            _inj_key = _link_key if _link_key is not None else ch_id
+            # Mid-turn guard: if the target has a turn in flight for this
+            # conversation, appending a user message into the live list NOW
+            # can wedge it between a tool_use and its tool_result (Anthropic
+            # 400s on the broken pair). Defer through the same _pending_inject
+            # buffer mid-turn operator messages use — _drain_pending_injects
+            # lands it at the next safe message boundary and the normal
+            # turn-end save persists it.
+            _active = target_runner._active_turns.get(_inj_key)
+            if _active is not None and not _active.done():
+                target_runner._pending_inject.setdefault(_inj_key, []).append(marked_text)
+                print_ts(f"/inject_context: target {agent_id} mid-turn on {_inj_key} — "
+                         f"queued as soft-inject (pending count: {len(target_runner._pending_inject[_inj_key])})",
+                         agent=runner.agent.id)
+                await interaction.response.send_message(
+                    f"✅ **{target_agent.display_name}** is mid-turn in `{ch_id}` — "
+                    f"injection queued; it will land right after the in-flight turn finishes.",
+                    ephemeral=True)
+                return
             # get_conversation get-or-creates: if the channel is already loaded
             # we get the live object; if not, it constructs + load()s from disk
             # and registers it in runner.conversations. Either way the list we
             # append to IS the one the next turn reads. (was_loaded only labels
             # the log line.)
-            _inj_key = _link_key if _link_key is not None else ch_id
             was_loaded = _inj_key in target_runner.conversations
             conv = target_runner.get_conversation(_inj_key, conv_id)
             # Same ChatMessage construction _drain_pending_injects uses, branched

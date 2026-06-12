@@ -569,21 +569,29 @@ entry before invocation. The owner ID is always allowed on Discord (see
   readable text. ~100KB cap. Browser headers. Silent to Discord.
   **SSRF-guarded:** private/internal/link-local/loopback/reserved and
   cloud-metadata (169.254.169.254) addresses are refused for
-  non-owner/non-admin callers. The host is DNS-resolved and EVERY
-  resolved address is checked (defeats DNS-rebinding-to-localhost), and
-  the check re-runs on each redirect hop (a public URL can't 302 you to
-  an internal IP). Owner/admins retain full access, so the owner can still
-  fetch localhost services (flipflaskapp, etc.). Public URLs are
+  non-owner/non-admin callers. The host is DNS-resolved ONCE, EVERY
+  resolved address is checked, and the connection is **pinned** to the
+  vetted IP (request URL carries the IP; Host header + TLS SNI carry the
+  original hostname) — the client never re-resolves the name, which
+  closes the resolve-twice DNS-rebinding race, not just the plain
+  rebinding-to-localhost case. The check+pin re-runs on each redirect
+  hop (a public URL can't 302 you to an internal IP). For non-privileged
+  callers a DNS-resolution failure fails CLOSED (no pin → no fetch).
+  Owner/admins retain full access (no guard, no pin), so the owner can
+  still fetch localhost services (flipflaskapp, etc.). Public URLs are
   unchanged for everyone.
-- **`download_url_to_tmp` (internal helper, not a model tool)** — fetches
-  model/user-controlled URLs for edit/upscale/animate/audio_separate. Enforces
-  the SAME internal-host SSRF guard as `fetch_url` (private/internal/loopback/
-  link-local/metadata refused) but UNCONDITIONALLY — no owner bypass, since it
-  has no caller identity. Streams with a 50 MB size cap (no unbounded read) and
-  a 120s timeout. ComfyUI's own calls go through `comfy_host()`, not here, so
-  refusing localhost is safe. The ComfyUI HTTP calls have per-call timeouts:
-  submit/upload/view 120s; the `/history` poll 30s per-request inside the
-  bounded 600s loop.
+- **`download_url_to_tmp` (internal helper in `tools/_comfy.py`, not a model
+  tool)** — fetches model/user-controlled URLs for
+  edit/upscale/animate/audio_separate. Enforces the SAME resolve-once +
+  IP-pinned SSRF guard as `fetch_url` (private/internal/loopback/link-local/
+  metadata refused; connection pinned to the vetted IP so the client never
+  re-resolves the name; the check+pin re-runs on every redirect hop;
+  resolution failure fails CLOSED) but UNCONDITIONALLY — no owner bypass,
+  since it has no caller identity. Streams with a 50 MB size cap (no
+  unbounded read) and a 120s timeout. ComfyUI's own calls go through
+  `comfy_host()`, not here, so refusing localhost is safe. The ComfyUI HTTP
+  calls have per-call timeouts: submit/upload/view 120s; the `/history` poll
+  30s per-request inside the bounded 600s loop.
 
 ## System
 
@@ -659,12 +667,13 @@ entry before invocation. The owner ID is always allowed on Discord (see
   before its next reply. Routes through the live in-memory conversation
   when the target runner is active (so it's visible on the very next turn),
   falls back to a JSONL append when the target isn't running (picked up on
-  its next load). MID-TURN CAVEAT: do NOT inject into an agent that is
-  actively mid-reply (between a tool_use and its tool_result) — it can
-  corrupt the in-flight message sequence. Inject when the target is idle
-  between turns. Owner-only by default (auto-injected blank ACL → owner
-  bypass). A `/inject_context` slash command does the same thing for the
-  operator.
+  its next load). Safe to call regardless of target state: if the target
+  is actively mid-reply, the injection is automatically deferred through
+  the same soft-inject buffer mid-turn operator messages use and lands
+  right after the in-flight turn finishes — it is never wedged into the
+  live turn's tool_use/tool_result sequence. Owner-only by default
+  (auto-injected blank ACL → owner bypass). A `/inject_context` slash
+  command does the same thing for the operator.
 - **Known later-pass item:** the `send_message` / `send_file` /
   `delete_message` trio still takes a bare-int `channel_id` only and has
   NOT yet been migrated to the canonical `session_id` arg. Until that pass
@@ -1139,7 +1148,12 @@ to the conversation object for the whole turn, so a save fired after a
 mid-turn `/reset` would otherwise re-append the stale in-memory messages
 and resurrect the deleted history. The reset-generation epoch guard (see
 `/reset` below) is the single chokepoint that prevents this: `_save_conv()`
-no-ops when the conversation's epoch changed since the turn began.
+no-ops when the conversation's epoch changed since the turn began. The one
+writer below that chokepoint — the anthropic compaction trim, which
+rewrites the live `.jsonl` directly inside `chat_stream`'s `finally` —
+carries the same check: `_run_turn` threads the turn's epoch closure into
+the conversation as `conv._persist_guard`, and the trim skips its rewrite
+when the guard reports a mid-turn reset.
 
 ## /reset
 
@@ -1149,6 +1163,14 @@ Owner-only slash command. Backs up the live `.jsonl` to
 `/reset`. To restore, copy a `.pre_reset_*.bak.jsonl` over the live
 file and `pop` the in-memory conversation by restarting or by
 `/uncompact` (which pops the cache).
+
+Both the Discord slash `/reset` and the text-prefix `/reset` (the only way
+to reset on iMessage, and what fires when a Discord operator types `/reset`
+as plain message text) run the SAME implementation —
+`AgentRunner.reset_conversation` — so everything below holds on every
+transport. (Historically the text-prefix path had its own inline body that
+never got the race guard; the shared method exists so the two paths cannot
+drift again.)
 
 `/reset` is reliable even mid-turn, and a reset fired while the agent is
 mid-response is clean: it first **hard-interrupts the in-flight turn and
@@ -1189,6 +1211,11 @@ queue drain are all per-conversation and never cross conversations.
 `/compact` sets `conv.force_compact_next = True` **and**
 `conv.force_compact_trigger_override = True`, then fires a synthetic
 turn so Anthropic emits a fresh compaction block on the next request.
+The text-prefix `/compact` (iMessage, or `/compact` typed as plain
+message text) sets the same two flags — it previously set only
+`force_compact_next`, which silently no-opped on sub-threshold
+conversations — but does NOT fire the synthetic turn: compaction fires
+on the operator's next message ("Compaction queued").
 On success: `compaction_block` lands in `.meta.json`, the live `.jsonl`
 is archived to `.compaction_<ts>.bak.jsonl`, and the live `.jsonl` is
 rewritten with only the post-compaction tail.
@@ -1838,7 +1865,7 @@ non-content errors and does NOT append them to conversation history
 A pass of small correctness/security hardening, all live:
 - **Web:** `MAX_CONTENT_LENGTH = 8 MB` caps authed POST bodies (413 before buffering). `is_configured()` fails CLOSED on a corrupt `auth.json` (never reopens `/setup`). `/login` is per-IP rate-limited.
 - **ACL:** `run_command` / `claude_code` / `restart_gateway` / `restart_flask_app` each enforce `current_caller_is_owner()` internally — admins do NOT get them even if the ACL admin-bypass would otherwise pass. `inject_context` is owner-gated on the tool itself. A raised admin-check now logs instead of silently denying.
-- **Timeouts:** ComfyUI submit/upload/view = 120s, history poll = 30s/request inside the 600s loop; `download_url_to_tmp` = 120s + 50 MB cap + unconditional SSRF guard; claude_code reap, ollama UI (list/unload 30s, pull 1800s), and the inter-agent auto-route `fetch_user`/`create_dm` (10s) are all bounded.
+- **Timeouts:** ComfyUI submit/upload/view = 120s, history poll = 30s/request inside the 600s loop; `download_url_to_tmp` = 120s + 50 MB cap + unconditional SSRF guard (since hardened to the same resolve-once + IP-pinned, per-redirect-hop, fail-closed guard as `fetch_url`); claude_code reap, ollama UI (list/unload 30s, pull 1800s), and the inter-agent auto-route `fetch_user`/`create_dm` (10s) are all bounded.
 - **Secrets:** OAuth-refresh failures log response KEYS not the payload (no refresh_token leak); request/response debug dumps are `0600` in a `0700` dir.
 - **Crash-safety:** cron persists `lastRunMs` per-fire (no re-fire storm); snapshot writes are atomic (tmp + `os.replace`).
 

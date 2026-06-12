@@ -554,8 +554,36 @@ async def _tick() -> None:
             # must survive, or every due job re-fires on the next boot/tick
             # (a re-fire storm). Tolerate a save failure: a stamp lost here is
             # the pre-existing behavior, never worse.
+            #
+            # LOST-UPDATE GUARD: never write the dict captured at tick start.
+            # `await _fire` below can run for minutes, during which an agent
+            # turn may add_cron_job / cancel_cron_job (their own load→mutate→
+            # save against jobs.json). Re-saving the stale tick-start dict on
+            # the NEXT due job would silently clobber that concurrent write
+            # (dropped new job / resurrected cancelled one). So: re-load the
+            # file fresh, stamp ONLY this job's lastRunMs into it, save that.
+            # asyncio is single-threaded and load→stamp→save has no await, so
+            # nothing can interleave inside the merge itself.
             try:
-                _save_jobs(data)
+                fresh = _load_jobs()
+                target = None
+                for fj in fresh.get("jobs") or []:
+                    if job.get("id") and fj.get("id") == job.get("id"):
+                        target = fj
+                        break
+                    if not job.get("id") and fj.get("name") == job.get("name"):
+                        target = fj
+                        break
+                if target is not None:
+                    target["lastRunMs"] = now_ms
+                    _save_jobs(fresh)
+                else:
+                    # Job vanished from disk mid-tick (cancelled concurrently,
+                    # or id-less + renamed). Nothing to stamp; don't write.
+                    print_ts(
+                        f"{COLOR_YELLOW}cron: job {job.get('id') or job.get('name', '?')} "
+                        f"no longer on disk — skipping lastRunMs persist{COLOR_END}",
+                    )
             except Exception as _persist_err:
                 print_ts(
                     f"{COLOR_YELLOW}cron: failed to persist lastRunMs for "

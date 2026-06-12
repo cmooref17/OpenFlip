@@ -10,11 +10,19 @@ about those without a headless browser.
 
 SSRF guard: fetching PRIVATE / INTERNAL / link-local / loopback / cloud-
 metadata addresses is restricted to the owner/admins. The host is DNS-
-resolved and EVERY resolved address is checked (closes DNS-rebinding to
-localhost), and the check is re-run on each redirect hop (closes a public
-URL 302-ing to http://169.254.169.254/). Public addresses stay open to
-everyone. Owner/admins retain full access so the owner can still hit localhost
-services (flipflaskapp, etc.).
+resolved ONCE, EVERY resolved address is checked, and the connection is
+PINNED to the vetted address (the request URL carries the IP; Host header +
+TLS SNI carry the original hostname) — so the client never re-resolves the
+name, closing the resolve-twice DNS-rebinding race as well as the plain
+rebinding-to-localhost case. The check+pin is re-run on each redirect hop
+(closes a public URL 302-ing to http://169.254.169.254/). Public addresses
+stay open to everyone. Owner/admins retain full access so the owner can
+still hit localhost services (flipflaskapp, etc.) — privileged fetches skip
+the guard AND the pin entirely.
+
+For non-privileged callers resolution failure fails CLOSED (no pin → no
+fetch), so every non-privileged connection goes to a guard-vetted address —
+there is no unpinned fallback path.
 """
 from __future__ import annotations
 
@@ -93,29 +101,43 @@ def _is_internal_ip(ip_str: str) -> bool:
     )
 
 
-async def _host_resolves_internal(host: str) -> bool:
-    """DNS-resolve `host` and return True if ANY resolved address is internal.
+async def _resolve_and_vet_host(host: str) -> tuple[bool, str]:
+    """DNS-resolve `host` ONCE and return (internal, pinned_ip).
 
-    Closes DNS-rebinding-to-localhost: a hostname that resolves to 127.0.0.1
-    (or any private/link-local address) is treated as internal. IP literals
-    resolve to themselves. Fail-open ONLY on resolution failure — if DNS can't
-    resolve the host at all we return False and let the normal request path
-    surface the error; we fail CLOSED whenever resolution succeeds and yields
-    an internal IP. Uses the loop's threadpool resolver so we never block the
-    event loop.
+    `internal` is True if ANY resolved address is private/internal — the
+    caller must block the fetch. `pinned_ip` is the first vetted (public)
+    address; the caller must CONNECT TO THAT ADDRESS, not re-resolve the
+    hostname. Resolving once for the check and letting the HTTP client
+    resolve again for the connect is a DNS-rebinding TOCTOU: an attacker-
+    controlled DNS server answers the guard's lookup with a public IP and
+    the client's lookup with 127.0.0.1 / 169.254.169.254. Pinning closes it.
+
+    IP literals resolve to themselves. Fail-open ONLY on resolution failure —
+    (False, "") lets the normal request path surface the connect error; we
+    fail CLOSED whenever resolution succeeds and yields an internal IP. Uses
+    the loop's threadpool resolver so we never block the event loop.
     """
     if not host:
-        return False
+        return (False, "")
     host = host.strip("[]")  # IPv6 literals arrive bracketed from urlparse
     try:
         infos = await asyncio.get_running_loop().getaddrinfo(host, None)
     except Exception:
-        return False  # resolution failed entirely → don't special-case
+        return (False, "")  # resolution failed entirely → don't special-case
+    # Pinning collapses the address list to ONE — prefer IPv4 so a host with
+    # broken/absent IPv6 routing doesn't lose the v4 fallback aiohttp's own
+    # resolver iteration used to provide.
+    pinned = ""
+    pinned_v4 = ""
     for info in infos:
         ip_str = info[4][0]  # sockaddr is (address, port[, flowinfo, scopeid])
         if _is_internal_ip(ip_str):
-            return True
-    return False
+            return (True, "")
+        if not pinned:
+            pinned = ip_str
+        if not pinned_v4 and ":" not in ip_str:
+            pinned_v4 = ip_str
+    return (False, pinned_v4 or pinned)
 
 
 def _caller_is_owner_or_admin() -> bool:
@@ -179,21 +201,61 @@ async def fetch_url(url: str) -> ToolResult:
         # of each URL (initial + each redirect Location) before fetching it.
         current_url = url
         for _hop in range(_MAX_REDIRECTS + 1):  # 1 initial fetch + up to N redirects
-            host = urlparse(current_url).hostname or ""
+            parsed = urlparse(current_url)
+            host = parsed.hostname or ""
 
-            # SSRF guard: block internal/private targets for non-owner/admin.
-            if not privileged and await _host_resolves_internal(host):
-                return ToolResult.fail(
-                    f"Refusing to fetch internal/private address {host} — "
-                    f"that's restricted to the owner/admins."
-                )
+            # The URL we actually request. For non-privileged callers the
+            # netloc is rewritten to the guard-vetted IP (DNS-rebinding pin,
+            # see _resolve_and_vet_host); `current_url` itself keeps the
+            # hostname so redirect resolution (urljoin) stays host-relative.
+            request_url = current_url
+            request_headers = _BROWSER_HEADERS
+            request_kwargs: dict = {}
+
+            # SSRF guard: block internal/private targets for non-owner/admin,
+            # and pin the connection to the vetted address so aiohttp can't
+            # re-resolve the hostname to something the guard never saw.
+            if not privileged:
+                internal, pinned_ip = await _resolve_and_vet_host(host)
+                if internal:
+                    return ToolResult.fail(
+                        f"Refusing to fetch internal/private address {host} — "
+                        f"that's restricted to the owner/admins."
+                    )
+                if not pinned_ip:
+                    # Resolution failed → fail CLOSED rather than letting
+                    # aiohttp re-resolve unguarded (a selectively-failing
+                    # resolver would otherwise slip an unvetted address past
+                    # the guard). A genuine DNS outage fails here instead of
+                    # at connect time — same outcome for the caller.
+                    return ToolResult.fail(f"Could not resolve host {host}.")
+                ip_for_url = f"[{pinned_ip}]" if ":" in pinned_ip else pinned_ip
+                userinfo = ""
+                if parsed.username is not None:
+                    userinfo = parsed.username
+                    if parsed.password is not None:
+                        userinfo += f":{parsed.password}"
+                    userinfo += "@"
+                port = parsed.port  # None → scheme default
+                netloc = f"{userinfo}{ip_for_url}" + (f":{port}" if port else "")
+                request_url = parsed._replace(netloc=netloc).geturl()
+                # Virtual hosting still needs the real name: Host header
+                # for HTTP routing, server_hostname for TLS SNI (certs
+                # aren't verified here — ssl=False below — but vhost
+                # selection on the server side keys off SNI).
+                request_headers = dict(_BROWSER_HEADERS)
+                host_hdr = f"[{host}]" if ":" in host else host
+                request_headers["Host"] = host_hdr + (f":{port}" if port else "")
+                if parsed.scheme == "https":
+                    request_kwargs["server_hostname"] = host
 
             async with session.get(
-                current_url,
-                headers=_BROWSER_HEADERS,
+                request_url,
+                headers=request_headers,
                 timeout=aiohttp.ClientTimeout(total=_TIMEOUT),
                 allow_redirects=False,  # manual — so we can guard each hop
                 ssl=False,  # don't trip on self-signed certs (e.g. flipflaskapp localhost)
+                **request_kwargs,
             ) as resp:
                 # Redirect → resolve the next hop and loop to re-run the guard.
                 location = resp.headers.get("Location")

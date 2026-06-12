@@ -985,6 +985,16 @@ class AnthropicConversation:
         # override, fall back to the model default. Owner-set via /effort,
         # persisted in meta.json so it survives restarts.
         self.effort_override: str | None = None
+        # Reset-epoch guard, set by runtime._run_turn at turn start (a closure
+        # capturing the runner's conv epoch for this turn — the SAME check
+        # _save_conv enforces). Returns False once /reset bumped the epoch
+        # mid-turn. Checked by persist paths that write the JSONL directly,
+        # below the _save_conv chokepoint (the compaction trim) — without it a
+        # mid-turn compaction rewrites the file from the still-populated
+        # in-memory self.messages and resurrects the history /reset just
+        # wiped. None (e.g. paths outside _run_turn) = no guard, persist as
+        # before.
+        self._persist_guard = None
 
     @staticmethod
     def _normalize_model(model_str: str) -> str:
@@ -1068,6 +1078,26 @@ class AnthropicConversation:
         after compaction fires — we keep paying full token cost on every
         turn for content the summary already covers.
         """
+        # Epoch guard — same semantics as runtime._save_conv. This method
+        # rewrites the JSONL directly from self.messages, BELOW the _save_conv
+        # chokepoint, so it must independently respect a mid-turn /reset:
+        # clear_history() deletes the file but leaves self.messages populated,
+        # and without this check a compaction landing on the dying turn would
+        # rewrite the file from that stale copy — resurrecting the history the
+        # operator just wiped.
+        guard = self._persist_guard
+        if guard is not None:
+            try:
+                allowed = bool(guard())
+            except Exception:
+                allowed = True
+            if not allowed:
+                print_ts(
+                    "compaction trim: skipping — conversation was reset mid-turn "
+                    "(epoch changed); not resurrecting cleared history",
+                    agent=self.agent.id,
+                )
+                return
         import shutil
 
         def _role(m):

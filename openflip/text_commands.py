@@ -21,7 +21,6 @@ import glob
 import json
 import os
 import shutil
-import time
 from typing import Any
 
 from .acl import is_owner
@@ -176,64 +175,17 @@ def _conversation_id_for_channel(channel: Any, ch_id: int) -> str:
 
 
 async def _do_reset(runner, ch_id, channel, transport, session_id) -> None:
-    conv = runner.conversations.pop(ch_id, None)
-    if conv and hasattr(conv, "clear_history"):
-        try:
-            conv.clear_history()
-        except Exception as e:
-            print_ts(f"{COLOR_YELLOW}/reset: clear_history failed: {e}{COLOR_END}",
-                     agent=runner.agent.id)
-    else:
-        agent_dir = os.path.dirname(runner.agent.path)
-        conv_id = _conversation_id_for_channel(channel, ch_id)
-        if not conv_id:
-            await _send(transport, session_id, channel,
-                        "⚠️ /reset: could not resolve conversation id for this channel.")
-            return
-        # conversation_path handles the Windows filename encoding (":" → "%3A").
-        from . import _conversation_io as _cio_reset
-        jsonl_path = _cio_reset.conversation_path(agent_dir, conv_id)
-        if os.path.exists(jsonl_path):
-            try:
-                backup = f"{jsonl_path}.pre_reset_{int(time.time())}.bak.jsonl"
-                shutil.copy2(jsonl_path, backup)
-                print_ts(f"/reset: backed up conversation to {backup}",
-                         agent=runner.agent.id)
-            except Exception as _bk_err:
-                print_ts(
-                    f"{COLOR_YELLOW}/reset: pre-reset backup failed for "
-                    f"{jsonl_path}: {_bk_err}{COLOR_END}",
-                    agent=runner.agent.id,
-                )
-            try:
-                _all_bak = sorted(glob.glob(f"{jsonl_path}.pre_reset_*.bak.jsonl"))
-                if len(_all_bak) > 5:
-                    for _stale in _all_bak[:-5]:
-                        try:
-                            os.remove(_stale)
-                        except OSError:
-                            pass
-            except Exception as _retain_e:
-                print_ts(
-                    f"{COLOR_YELLOW}/reset: backup retention sweep failed: "
-                    f"{_retain_e}{COLOR_END}",
-                    agent=runner.agent.id,
-                )
-        for ext in (".jsonl", ".meta.json"):
-            target = os.path.join(agent_dir, "conversations", _cio_reset.fs_encode(conv_id) + ext)
-            try:
-                if os.path.exists(target):
-                    os.remove(target)
-            except Exception as _rm_err:
-                print_ts(
-                    f"{COLOR_YELLOW}/reset: failed to delete {target}: "
-                    f"{_rm_err}{COLOR_END}",
-                    agent=runner.agent.id,
-                )
-    try:
-        runner._pending_inject.pop(ch_id, None)
-    except Exception:
-        pass
+    # The full race-safe stop+wipe sequence (epoch bump → hard interrupt →
+    # queued-turn drop → clear/delete + pre-reset backup) lives in ONE place:
+    # AgentRunner.reset_conversation, shared with the slash /reset so the two
+    # paths can't drift again. This path historically LACKED the race guard
+    # (only the slash command got the 65b1464/ff782f3 fix) — never reintroduce
+    # an inline reset body here.
+    conv_id = _conversation_id_for_channel(channel, ch_id)
+    if not runner.reset_conversation(ch_id, fallback_conv_id=conv_id):
+        await _send(transport, session_id, channel,
+                    "⚠️ /reset: could not resolve conversation id for this channel.")
+        return
     await _send(transport, session_id, channel, "Conversation reset.")
 
 
@@ -245,7 +197,14 @@ async def _do_compact(runner, ch_id, channel, transport, session_id) -> None:
             "`/compact` is Anthropic-only and there's no active conversation in this channel.",
         )
         return
+    # Both flags, same as the slash compact_cmd: force_compact_next opts the
+    # next chat() into server-side compaction; force_compact_trigger_override
+    # makes that request send the low _MANUAL_COMPACT_TRIGGER (50k, Anthropic's
+    # floor) instead of the real per-model trigger. Without the override a
+    # sub-threshold conversation silently never compacts — the exact no-op
+    # 65b1464 fixed on the slash path.
     conv.force_compact_next = True
+    conv.force_compact_trigger_override = True
     await _send(
         transport, session_id, channel,
         "⚙️ Compaction queued — will fire on your next message.",
