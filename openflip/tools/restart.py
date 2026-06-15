@@ -229,7 +229,7 @@ async def restart_gateway(reason: str, continuation: str = "", force: bool = Fal
         return ToolResult.fail("restart_gateway is owner-only.")
 
     # Pull invocation context from the executor's contextvars.
-    from ..tool_executor import CURRENT_AGENT, CURRENT_CHANNEL_ID, CURRENT_SPEAKER_ID
+    from ..tool_executor import CURRENT_AGENT, CURRENT_CHANNEL_ID, CURRENT_SPEAKER_ID, CURRENT_SESSION
     try:
         agent = CURRENT_AGENT.get()
     except LookupError:
@@ -242,6 +242,16 @@ async def restart_gateway(reason: str, continuation: str = "", force: bool = Fal
         speaker_id = int(CURRENT_SPEAKER_ID.get())
     except LookupError:
         speaker_id = 0
+    # Capture which transport this channel belongs to so the post-restart
+    # announce goes back through THAT transport, not the agent's primary one.
+    # On a multi-transport agent (e.g. Discord + iMessage) the primary is
+    # whichever transport is first in the list; announcing a Discord-channel
+    # restart through a primary iMessage transport sends a Discord id to
+    # `imsg send` and the confirmation silently dies. Empty string when there
+    # is no session (cron/headless) — the announce then falls back to primary,
+    # which is the historical behavior and correct for single-transport agents.
+    _restart_session = CURRENT_SESSION.get(None)
+    channel_transport = getattr(_restart_session, "transport", "") or ""
 
     # Preflight: refuse if any other agent is mid-work, unless force=True.
     if not force:
@@ -334,6 +344,7 @@ async def restart_gateway(reason: str, continuation: str = "", force: bool = Fal
         "ts_ms": int(time.time() * 1000),
         "agent_id": agent.id,
         "channel_id": channel_id,
+        "channel_transport": channel_transport,
         "speaker_id": speaker_id,
         "reason": reason,
         "continuation": continuation.strip() or None,
