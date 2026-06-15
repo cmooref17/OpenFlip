@@ -168,6 +168,8 @@ async def _process_one(path: str) -> None:
     agent_id = sentinel.get("agent_id")
     channel_id = sentinel.get("channel_id")
     channel_transport = sentinel.get("channel_transport") or ""
+    channel_is_dm = bool(sentinel.get("channel_is_dm"))
+    speaker_id = sentinel.get("speaker_id") or 0
     reason = sentinel.get("reason") or "Gateway restarted."
     continuation = sentinel.get("continuation") or None
 
@@ -359,9 +361,32 @@ async def _process_one(path: str) -> None:
             if getattr(_t, "name", "") == channel_transport:
                 announce_transport = _t
                 break
+    # Resolve the actual send target. A DM channel id can't be resolved by
+    # bare id from a cold cache right after restart — Discord's get_channel
+    # misses and fetch_channel can't fetch DMs, so transport.send() logs
+    # "channel <id> unresolved" and silently no-ops (and announce_ok below
+    # would still go True because send() swallows its own errors). For a DM we
+    # instead resolve through the recipient via the transport's existing
+    # resolve_session_for_user (create_dm is cache-independent). Transports
+    # without that method (iMessage/null) or non-DM channels keep using the
+    # channel id directly — iMessage's numeric chat id already routes fine.
+    announce_target = session_id_str
+    if channel_is_dm and speaker_id:
+        _resolve_user = getattr(announce_transport, "resolve_session_for_user", None)
+        if _resolve_user is not None:
+            try:
+                _dm_session = await _resolve_user(int(speaker_id))
+                if _dm_session is not None:
+                    announce_target = str(getattr(_dm_session, "transport_id", session_id_str))
+            except Exception as _dm_err:
+                print_ts(
+                    f"{COLOR_YELLOW}restart-sentinel: DM resolve via user {speaker_id} "
+                    f"failed ({_dm_err}); falling back to channel id{COLOR_END}",
+                    agent=agent_id,
+                )
     try:
         await asyncio.wait_for(
-            announce_transport.send(session_id_str, announce),
+            announce_transport.send(announce_target, announce),
             timeout=30.0,
         )
         # transport.send is documented to log-and-swallow its own delivery
@@ -370,7 +395,7 @@ async def _process_one(path: str) -> None:
         announce_ok = True
         print_ts(
             f"{COLOR_GREEN}restart-sentinel: announced restart via {getattr(announce_transport, 'name', '?')} "
-            f"(agent={agent_id}, session={session_id_str}){COLOR_END}",
+            f"(agent={agent_id}, target={announce_target}){COLOR_END}",
             agent=agent_id,
         )
     except asyncio.TimeoutError:
