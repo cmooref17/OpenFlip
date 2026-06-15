@@ -681,11 +681,14 @@ entry before invocation. The owner ID is always allowed on Discord (see
   live turn's tool_use/tool_result sequence. Owner-only by default
   (auto-injected blank ACL → owner bypass). A `/inject_context` slash
   command does the same thing for the operator.
-- **Known later-pass item:** `send_message` now accepts the canonical
-  transport-prefixed `session_id` (preferred) alongside the deprecated
-  bare-int `channel_id` fallback. `send_file` / `delete_message` still
-  take a bare-int `channel_id` only and have NOT yet been migrated to the
-  canonical `session_id` arg. Until that pass lands, those two remain
+- **`send_message` is migrated** (shipped 2026-06-15, commit 32fd769): it
+  accepts the canonical transport-prefixed `session_id` (preferred) and
+  routes via the matched conversation's transport — so `send_message(...,
+  session_id="imessage:you@example.com")` works, no longer Discord-only.
+  The deprecated bare-int `channel_id` is still supported as a fallback.
+- **Still later-pass:** `send_file` / `delete_message` take a bare-int
+  `channel_id` only and have NOT yet been migrated to the canonical
+  `session_id` arg. Until that pass lands, those two remain
   `channel_id`-keyed.
 
 ## Cron
