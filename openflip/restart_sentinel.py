@@ -167,6 +167,7 @@ async def _process_one(path: str) -> None:
 
     agent_id = sentinel.get("agent_id")
     channel_id = sentinel.get("channel_id")
+    channel_transport = sentinel.get("channel_transport") or ""
     reason = sentinel.get("reason") or "Gateway restarted."
     continuation = sentinel.get("continuation") or None
 
@@ -343,9 +344,24 @@ async def _process_one(path: str) -> None:
 
     announce = f"♻️ Gateway restarted.\n**Reason:** {reason}"
     announce_ok = False
+    # Route the announce through the transport that OWNS this channel, not the
+    # agent's primary transport. `runner.transport` is `_transports[0]`; on a
+    # multi-transport agent that may not be the transport the restart was
+    # requested on, so the announce would go out the wrong pipe (a Discord
+    # channel id handed to `imsg send`, silently dropped). Match by the
+    # transport name the sentinel recorded; fall back to primary when no
+    # transport was recorded (older sentinels) or none matches — that
+    # fallback is exactly the historical behavior and is correct for
+    # single-transport agents, where the one transport is always the primary.
+    announce_transport = runner.transport
+    if channel_transport:
+        for _t in getattr(runner, "_transports", None) or [runner.transport]:
+            if getattr(_t, "name", "") == channel_transport:
+                announce_transport = _t
+                break
     try:
         await asyncio.wait_for(
-            runner.transport.send(session_id_str, announce),
+            announce_transport.send(session_id_str, announce),
             timeout=30.0,
         )
         # transport.send is documented to log-and-swallow its own delivery
@@ -353,7 +369,7 @@ async def _process_one(path: str) -> None:
         # the send call cleanly. Surfaces would still log a failure separately.
         announce_ok = True
         print_ts(
-            f"{COLOR_GREEN}restart-sentinel: announced restart via {getattr(runner.transport, 'name', '?')} "
+            f"{COLOR_GREEN}restart-sentinel: announced restart via {getattr(announce_transport, 'name', '?')} "
             f"(agent={agent_id}, session={session_id_str}){COLOR_END}",
             agent=agent_id,
         )
@@ -507,6 +523,13 @@ async def process_pending() -> None:
         files = sorted(
             os.path.join(d, f) for f in os.listdir(d)
             if f.endswith(".json") and not f.endswith(".bad")
+            # `.tool_result.json` files are continuation MARKERS, not signed
+            # sentinels — they're read via marker_path derivation inside
+            # _process_one, never on their own. Globbing them here made the
+            # processor treat each as a sentinel, fail HMAC ("forged or
+            # stale"), and rename it .forged — scary log noise that could also
+            # clobber the marker before its real sibling sentinel consumed it.
+            and not f.endswith(".tool_result.json")
         )
     except OSError as e:
         print_ts(f"{COLOR_RED}restart-sentinel: failed to list {d}: {e}{COLOR_END}", error=True)
