@@ -21,21 +21,36 @@ Target conversation resolution:
      used directly.
   2. `channel_id` (explicit, deprecated) — bare Discord channel id, used only
      when session_id is empty.
-  3. DEFAULT (both omitted) — a dedicated agent-to-agent conversation in the
-     RECIPIENT's own namespace: "internal:peer-<caller>", one per sender
-     (agents/<recipient>/conversations/internal:peer-<caller>.jsonl). The
-     recipient processes peer traffic in its own isolated context, never
-     inside a human-facing channel conversation. Headless recipients keep
-     their single internal channel instead (every turn runs there by design).
+  3. DEFAULT (both omitted) — splits on whether a HUMAN/OWNER is at the root of
+     this dispatch chain (see `_default_dispatch_is_operator_routed`):
+       * OWNER-TRIGGERED (the operator told an agent to "talk to <peer>"): the
+         message lands in the RECIPIENT's shared human channel with that
+         operator — the recipient's own DM/guild channel with the triggering
+         human — so BOTH agents have shared context of what was said. Resolved
+         the way the pre-2026-06 default did: the caller's current channel when
+         the recipient can reach it (a shared guild channel), else the
+         recipient's DM with the operator. The recipient's reply still
+         auto-routes BACK to the CALLER (via `originator_session`), landing in
+         the caller's own conversation with the operator — it does NOT post to
+         the operator as if from the recipient.
+       * AGENT-TRIGGERED (cron / heartbeat / spontaneous agent-to-agent): a
+         dedicated agent-to-agent conversation in the RECIPIENT's own namespace,
+         "internal:peer-<caller>", one per sender
+         (agents/<recipient>/conversations/internal:peer-<caller>.jsonl). The
+         recipient processes peer traffic in its own isolated context, never
+         inside a human-facing channel conversation. This keeps background
+         inter-agent chatter out of the operator's DMs (the 2026-06 leak).
+     Headless recipients keep their single internal channel either way (every
+     turn runs there by design).
 
-The pre-2026-06 default resolved a REAL channel instead: the caller's current
-channel when the recipient could access it, else the recipient's DM with the
-human who triggered the caller's turn, else the caller's channel. That keyed
-the recipient's side of inter-agent exchanges to operator-facing
-conversations and — combined with chain-terminator return turns then being
-dispatched visible — repeatedly dumped inter-agent chatter into the
-operator's DMs. Removed deliberately; do not reintroduce channel guessing
-here.
+History note: a 2026-06 leak fix removed ALL channel resolution from the
+default and forced every dispatch into internal:peer-<sender>. That was too
+broad — it also buried OWNER-triggered "talk to <peer>" requests in a private
+side conversation the operator and the recipient's main channel never saw. The
+owner-triggered branch above restores the pre-leak-fix REAL-channel resolution,
+but ONLY for human/owner-rooted chains; agent/cron-rooted traffic still stays
+private. Do not widen the owner-triggered branch to background chains — that is
+the leak.
 
 Security caveats:
 * No throttle. A misbehaving agent could spam another with synthetic turns.
@@ -48,6 +63,115 @@ import uuid
 
 from ._base import tool, ToolResult
 from ..utils import print_ts
+
+
+def _default_dispatch_is_operator_routed(*, speaker_is_owner: bool, caller_visibility: str) -> bool:
+    """Whether a DEFAULT talk_to_agent dispatch (no session_id / channel_id) should
+    route into the recipient's shared human channel with the operator (True) or a
+    private internal:peer-<sender> conversation (False).
+
+    Pure predicate — extracted so the routing split can be pinned by a test
+    without standing up a Discord runtime.
+
+    True only when BOTH hold:
+      * `speaker_is_owner` — the originating speaker resolves to the owner (a
+        human owner is attributed to the chain root), AND
+      * `caller_visibility` marks a LIVE HUMAN CHANNEL at the chain root — empty
+        (a real inbound message) or the explicit "operator_channel" tag.
+
+    The visibility conjunct is LOAD-BEARING, and why this is AND, not the OR the
+    task brief sketched. Cron / heartbeat / restart turns also resolve their
+    attributed speaker to owner_id (run_synthetic_turn falls back to owner_id
+    when speaker_id=0; that value rides CURRENT_SPEAKER_ID for the whole turn),
+    so `speaker_is_owner` ALONE is True for them too. Only their visibility tag
+    ("cron" / "heartbeat" / "silent_agent_chain") distinguishes them from a
+    genuine operator-initiated turn. Gating on visibility keeps background
+    chains private and never reopens the 2026-06 operator-DM leak. This mirrors
+    runtime's own `_chain_root_operator` discriminator
+    (originator_visibility in ("", "operator_channel")).
+    """
+    if not speaker_is_owner:
+        return False
+    return (caller_visibility or "").strip() in ("", "operator_channel")
+
+
+async def _resolve_recipient_operator_channel(
+    *, target, caller_session, operator_speaker_id: int, sender_id: str, agent_id: str
+) -> int:
+    """Resolve the RECIPIENT's human-facing Discord channel shared with the
+    operator, for an OWNER-triggered default dispatch. Returns a bare Discord
+    channel id, or 0 when none can be resolved (the caller then falls back to
+    the private peer conversation rather than 403-ing into an unreachable
+    channel — operator-routing is best-effort, never a hard failure).
+
+    Mirrors the pre-2026-06 resolution, gated now to owner-rooted chains:
+      Priority 1: the caller's current channel, IF the recipient bot can
+        actually reach it (a guild channel both bots share, or a channel in the
+        recipient's own private_channels). DMs are per-bot, so the caller's DM
+        never passes this check from the recipient's perspective.
+      Priority 2: the recipient's own DM with the triggering operator — the
+        common case (Flip DMs each agent separately).
+    """
+    # Recipient must be a Discord agent with a live bot. Headless / non-Discord
+    # targets have no shared operator channel to resolve here — `target.bot` is a
+    # property that raises for those, which hasattr() catches.
+    if not hasattr(target, "bot"):
+        return 0
+    bot = target.bot
+
+    # Priority 1: caller's current channel, if the recipient bot shares it.
+    caller_channel = 0
+    try:
+        if caller_session is not None and getattr(caller_session, "transport", "") == "discord":
+            caller_channel = caller_session.channel_id_int
+    except Exception:
+        caller_channel = 0
+    if caller_channel:
+        ch = None
+        try:
+            ch = bot.get_channel(caller_channel)
+        except Exception:
+            ch = None
+        if ch is not None:
+            g = getattr(ch, "guild", None)
+            if g is not None:
+                # Guild channel: reachable only if the recipient is in the guild.
+                try:
+                    g_id = int(getattr(g, "id", 0) or 0)
+                    if g_id and bot.get_guild(g_id) is not None:
+                        return caller_channel
+                except Exception:
+                    pass
+            else:
+                # DM-style channel: only reachable if it's in the recipient's
+                # own private_channels (per-bot — a different bot's DM never is).
+                private = getattr(bot, "private_channels", []) or []
+                try:
+                    if any(int(getattr(p, "id", 0) or 0) == caller_channel for p in private):
+                        return caller_channel
+                except Exception:
+                    pass
+
+    # Priority 2: recipient's DM with the triggering operator.
+    if operator_speaker_id:
+        try:
+            user = await asyncio.wait_for(bot.fetch_user(int(operator_speaker_id)), timeout=15.0)
+            if user is not None:
+                dm = user.dm_channel or await asyncio.wait_for(user.create_dm(), timeout=15.0)
+                if dm is not None:
+                    return int(dm.id)
+        except asyncio.TimeoutError:
+            print_ts(
+                f"talk_to_agent: DM resolve for {agent_id}/operator {operator_speaker_id} timed out after 15s",
+                agent=sender_id,
+            )
+        except Exception as e:
+            print_ts(
+                f"talk_to_agent: failed to resolve {agent_id}'s DM with operator {operator_speaker_id}: {e}",
+                agent=sender_id,
+            )
+
+    return 0
 
 
 @tool
@@ -73,10 +197,12 @@ async def talk_to_agent(agent_id: str, message: str, channel_id: int = 0, sessio
             only when the recipient genuinely needs to process the message in
             a specific (usually human-facing) conversation's context.
         channel_id: DEPRECATED bare-int Discord channel id. Used only when
-            session_id is empty. If both are omitted (the normal case), the
-            recipient processes the message in its private per-peer
-            conversation ("internal:peer-<your_id>") — inter-agent traffic
-            never lands in a human-facing conversation by default.
+            session_id is empty. If both are omitted (the normal case), routing
+            depends on who triggered this chain: when the OWNER told an agent to
+            talk to you, the message lands in the recipient's shared channel with
+            that operator (shared human context); for agent/cron/heartbeat-rooted
+            chains it lands in the recipient's private per-peer conversation
+            ("internal:peer-<your_id>"), never a human-facing conversation.
     """
     from ..registry import RUNNERS
     from ..tool_executor import CURRENT_AGENT, CURRENT_CHANNEL_ID, CURRENT_SPEAKER_ID, CURRENT_TURN_DEPTH, CURRENT_SESSION, CURRENT_TURN_VISIBILITY, CURRENT_CHAIN_ROOT_AGENT
@@ -246,38 +372,75 @@ async def talk_to_agent(agent_id: str, message: str, channel_id: int = 0, sessio
         from ..transports.null import make_internal_session
         target_channel_id = int(make_internal_session(agent_id).transport_id)
     elif not target_channel_id:
-        # DEFAULT (no session_id, no channel_id): a dedicated agent-to-agent
-        # conversation in the RECIPIENT's own namespace, keyed by the sender —
-        # agents/<recipient>/conversations/internal:peer-<sender>.jsonl.
-        # Inter-agent traffic is point-to-point and must not run inside (or
-        # pollute) a human-facing conversation. The previous default resolved
-        # a REAL channel here instead — the caller's current channel when the
-        # recipient could reach it, else the recipient's own DM with the
-        # human who triggered the caller's turn — which keyed the recipient's
-        # side of the exchange to operator-facing conversations and
-        # repeatedly surfaced inter-agent chatter in the operator's DMs
-        # (2026-06 leak). Channel guessing removed deliberately; explicit
-        # session_id/channel_id is the only way to target a real channel.
-        from ..session import Session as _Session
-        _peer_conv_id = f"internal:peer-{sender_id}"
-        _explicit_session = _Session(
-            transport="internal",
-            # Non-numeric transport_id: the TransportChannel shim hashes it
-            # to a per-process-stable int for the in-memory dict keys (same
-            # pattern as make_internal_session). The on-disk file is keyed
-            # by conversation_id, which IS stable across restarts. Being
-            # non-numeric also short-circuits the Discord channel resolution
-            # in _resolve_synthetic_channel straight to the session shim —
-            # no wasted fetch_channel call on a fake id.
-            transport_id=f"peer-{sender_id}",
-            conversation_id=_peer_conv_id,
-            speaker_id=originating_speaker_id,
-            speaker_role_ids=[],
-            is_owner=False,
-            is_dm=True,
-            display_name=f"peer:{sender_id}",
-            handle="",
+        # DEFAULT (no session_id, no channel_id). Two routing modes, split on
+        # whether a HUMAN/OWNER is at the root of this dispatch chain.
+        #
+        # OWNER-TRIGGERED (the operator told an agent to "talk to <peer>"): route
+        # into the RECIPIENT's shared human channel with that operator so BOTH
+        # agents share context of what was said when the operator triggered it.
+        # The recipient's reply still auto-routes BACK to the CALLER (via
+        # originator_session, below) — it does NOT post to the operator as if
+        # from the recipient.
+        #
+        # AGENT-TRIGGERED (cron / heartbeat / spontaneous agent-to-agent): a
+        # dedicated peer conversation in the RECIPIENT's own namespace, keyed by
+        # the sender — agents/<recipient>/conversations/internal:peer-<sender>.jsonl.
+        # Background inter-agent traffic is point-to-point and must NOT run inside
+        # (or pollute) a human-facing conversation — that was the 2026-06 leak.
+        #
+        # Discriminator: see _default_dispatch_is_operator_routed. is_owner alone
+        # is NOT enough — cron/heartbeat resolve their attributed speaker to
+        # owner_id too; the chain-root visibility tag is what tells them apart.
+        from ..acl import is_owner as _is_owner
+        try:
+            _speaker_is_owner = bool(originating_speaker_id) and _is_owner(int(originating_speaker_id))
+        except Exception:
+            _speaker_is_owner = False
+        _operator_routed = _default_dispatch_is_operator_routed(
+            speaker_is_owner=_speaker_is_owner,
+            caller_visibility=_caller_visibility,
         )
+        if _operator_routed:
+            # Best-effort resolve the recipient's shared channel with the
+            # operator (pre-leak-fix resolution, gated to owner-rooted chains).
+            # Leaves target_channel_id as a bare Discord int — _explicit_session
+            # stays None so the dispatch keys the recipient's HUMAN-facing
+            # conversation, not a private peer file. 0 (unresolvable / non-Discord
+            # recipient) falls through to the private peer conversation below.
+            target_channel_id = await _resolve_recipient_operator_channel(
+                target=target,
+                caller_session=_caller_session,
+                operator_speaker_id=originating_speaker_id,
+                sender_id=sender_id,
+                agent_id=agent_id,
+            )
+            if not target_channel_id:
+                print_ts(
+                    f"talk_to_agent: owner-triggered {sender_id} -> {agent_id} could not "
+                    f"resolve a shared operator channel; falling back to private peer conversation",
+                    agent=sender_id,
+                )
+        if not target_channel_id:
+            from ..session import Session as _Session
+            _peer_conv_id = f"internal:peer-{sender_id}"
+            _explicit_session = _Session(
+                transport="internal",
+                # Non-numeric transport_id: the TransportChannel shim hashes it
+                # to a per-process-stable int for the in-memory dict keys (same
+                # pattern as make_internal_session). The on-disk file is keyed
+                # by conversation_id, which IS stable across restarts. Being
+                # non-numeric also short-circuits the Discord channel resolution
+                # in _resolve_synthetic_channel straight to the session shim —
+                # no wasted fetch_channel call on a fake id.
+                transport_id=f"peer-{sender_id}",
+                conversation_id=_peer_conv_id,
+                speaker_id=originating_speaker_id,
+                speaker_role_ids=[],
+                is_owner=False,
+                is_dm=True,
+                display_name=f"peer:{sender_id}",
+                handle="",
+            )
 
     if _explicit_session is None and not target_channel_id:
         return ToolResult.fail(
