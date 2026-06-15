@@ -653,7 +653,12 @@ entry before invocation. The owner ID is always allowed on Discord (see
   recipient's DM with the originating human — which leaked inter-agent
   traffic into operator-facing conversations; removed 2026-06.) The
   recipient's reply auto-routes back to the caller's own conversation as a
-  silent chain-terminator turn. Chain depth cap: 20.
+  silent chain-terminator turn — EXCEPT that if the operator started the
+  chain and you are the agent they spoke to directly, your plain final text
+  on that return turn surfaces to their channel (2026-06-15 safety net; still
+  prefer `send_message` — it is explicit and also covers the nested /
+  background cases the safety net deliberately leaves silent). Chain depth
+  cap: 20.
   Generates a fresh chain_id per dispatch; a reply on a superseded chain_id is delivered with a `[FRAMEWORK]` late-reply prefix (it used to be silently dropped).
 - **`end_chain()`** — explicitly end a chain-terminator turn without
   dispatching anywhere. Use when silence is correct (recipient agent

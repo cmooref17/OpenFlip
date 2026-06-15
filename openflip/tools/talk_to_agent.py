@@ -79,7 +79,7 @@ async def talk_to_agent(agent_id: str, message: str, channel_id: int = 0, sessio
             never lands in a human-facing conversation by default.
     """
     from ..registry import RUNNERS
-    from ..tool_executor import CURRENT_AGENT, CURRENT_CHANNEL_ID, CURRENT_SPEAKER_ID, CURRENT_TURN_DEPTH, CURRENT_SESSION, CURRENT_TURN_VISIBILITY
+    from ..tool_executor import CURRENT_AGENT, CURRENT_CHANNEL_ID, CURRENT_SPEAKER_ID, CURRENT_TURN_DEPTH, CURRENT_SESSION, CURRENT_TURN_VISIBILITY, CURRENT_CHAIN_ROOT_AGENT
 
     sender = CURRENT_AGENT.get(None)
     sender_id = sender.id if sender else "unknown"
@@ -136,6 +136,19 @@ async def talk_to_agent(agent_id: str, message: str, channel_id: int = 0, sessio
         _caller_visibility = CURRENT_TURN_VISIBILITY.get("") or ""
     except Exception:
         originating_speaker_id = 0
+
+    # Chain ROOT-AGENT identity: the agent the human DIRECTLY messaged at the
+    # head of this inter-agent chain. STAMP it with our own id on the FIRST hop
+    # (contextvar empty — this turn is the human-addressed root, or a fresh
+    # cron/heartbeat root); PROPAGATE it verbatim on every deeper hop. The
+    # recipient's chain-terminator surfacing predicate compares root == self to
+    # let ONLY the genuine top-level operator terminator post its return text —
+    # a nested middle agent carries the root's id, not its own, and stays silent
+    # even when dispatched into a real human channel. See CURRENT_CHAIN_ROOT_AGENT.
+    try:
+        _chain_root_agent_id = (CURRENT_CHAIN_ROOT_AGENT.get("") or "").strip() or sender_id
+    except Exception:
+        _chain_root_agent_id = sender_id
 
     # session_id is the canonical target conversation key. When supplied, build
     # a Session from it and dispatch DIRECTLY against it — bypassing every bit
@@ -360,6 +373,11 @@ async def talk_to_agent(agent_id: str, message: str, channel_id: int = 0, sessio
                 # through to the conservative default (operator_channel
                 # behavior). Read from contextvar set in _run_turn.
                 originator_visibility=_caller_visibility,
+                # Chain root-agent identity — stamped on the first hop, propagated
+                # on deeper hops. Rides the whole chain (and back up the return
+                # path via runtime's auto-route block) so the originating agent's
+                # chain-terminator turn can confirm it is the human-addressed root.
+                chain_root_agent_id=_chain_root_agent_id,
                 originator_channel_id=originator_channel_id,
                 # Thread the caller's full Session so the recipient's reply
                 # auto-route can return into THIS conversation even when it
