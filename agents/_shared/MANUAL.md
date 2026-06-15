@@ -646,12 +646,28 @@ entry before invocation. The owner ID is always allowed on Discord (see
   conversation; do this only when the recipient genuinely needs a specific
   (usually human-facing) conversation's context. `channel_id` is the
   deprecated-but-supported bare-int fallback, used only when `session_id`
-  is empty. **When BOTH are omitted (the normal case), the recipient
-  processes the message in a dedicated per-peer conversation in its own
-  namespace — `internal:peer-<caller>` — never in a human-facing channel.**
-  (The old default resolved a real channel — caller's channel, else the
-  recipient's DM with the originating human — which leaked inter-agent
-  traffic into operator-facing conversations; removed 2026-06.) The
+  is empty. **When BOTH are omitted (the normal case), the default routing
+  splits on who triggered the chain you're in:**
+    - **Operator-triggered** (the owner messaged you, or told you to "talk to
+      <peer>"): the message lands in the **recipient's shared channel with that
+      operator** — the recipient's own DM with them, else a guild channel you
+      both share — so both agents share context of what was said. The
+      recipient's reply still auto-routes BACK to you; it does NOT post to the
+      operator as if from the recipient.
+    - **Agent-triggered** (cron / heartbeat / a spontaneous agent-to-agent
+      ping): the recipient processes the message in a **private per-peer
+      conversation in its own namespace — `internal:peer-<caller>`** — never in
+      a human-facing channel. Keeps background chatter out of operator DMs.
+
+  The discriminator is the chain-root: the originating speaker is the owner AND
+  the chain-root visibility is a live human channel (`""` / `"operator_channel"`,
+  not `cron`/`heartbeat`/`silent_agent_chain`). `is_owner` alone is NOT enough —
+  cron/heartbeat resolve their attributed speaker to `owner_id` too, so the
+  visibility tag is what keeps them private. (History: the 2026-06 leak fix
+  forced EVERY default dispatch into `internal:peer-<caller>`; that also buried
+  owner-triggered "talk to <peer>" requests in a side conversation the operator
+  never saw. The owner-triggered branch restores the pre-leak-fix real-channel
+  resolution, gated to human/owner-rooted chains only. 2026-06-15.) The
   recipient's reply auto-routes back to the caller's own conversation as a
   silent chain-terminator turn — EXCEPT that if the operator started the
   chain and you are the agent they spoke to directly, your plain final text
@@ -1653,9 +1669,19 @@ intermediate tool output still flows through `tool_response_mode`.
 `talk_to_agent(agent_id, message, channel_id=0, session_id="")` —
 fire-and-forget. The recipient sees `"<your_id>: <message>"` as a
 synthetic user turn. With no explicit `session_id`/`channel_id` (the
-normal case) the recipient processes it in a dedicated per-peer
-conversation in its own namespace (`internal:peer-<caller>`), never in a
-human-facing channel conversation.
+normal case) the default routing splits on the chain root:
+- **Operator-triggered** → the recipient's **shared channel with the
+  operator** (its DM with them, else a shared guild channel), so both agents
+  share the context. The reply still routes back to the caller, not to the
+  operator.
+- **Agent-triggered** (cron / heartbeat / spontaneous) → the recipient's
+  **private `internal:peer-<caller>`** conversation, never a human channel.
+
+Discriminator: owner is the originating speaker AND chain-root visibility is a
+live human channel (`""`/`"operator_channel"`). Cron/heartbeat resolve their
+speaker to `owner_id` too, so the visibility tag — not `is_owner` alone — is
+what keeps them private. (Restores pre-leak-fix real-channel routing for
+owner-rooted chains; 2026-06-15.)
 
 ## Visibility
 
