@@ -17,7 +17,7 @@ from .pipeline import build_user_prompt, should_respond, build_visible_tools, ex
 from .session import InboundMessage, Session
 from .tool_executor import execute_tool_calls, build_model_feedback
 from .tools import TOOL_REGISTRY
-from .utils import print_ts, COLOR_YELLOW, COLOR_RED, COLOR_END, sanitize_outbound_text, log_task_exception
+from .utils import print_ts, COLOR_YELLOW, COLOR_RED, COLOR_GREEN, COLOR_END, sanitize_outbound_text, log_task_exception
 from .acl import is_owner
 from .registry import RUNNERS
 from .turn_retries import (
@@ -86,6 +86,93 @@ class _SessionChannel:
 
     def __repr__(self):
         return f"_SessionChannel(channel={self._real!r}, conversation_id={self._session.conversation_id!r})"
+
+
+def _terminator_text_surfaces(
+    *,
+    is_chain_terminator: bool,
+    chain_root_operator: bool,
+    final_text: str,
+    channel_session_transport: str,
+    channel_conversation_id: str,
+    reply_equivalent_tool_fired: bool,
+    already_posted: bool,
+    media_only: bool,
+    any_attachments: bool,
+    human_softinject_drained: bool,
+    this_agent_id: str = "",
+    chain_root_agent_id: str = "",
+) -> bool:
+    """Decide whether a SILENT chain-terminator turn's plain final text should
+    POST to the originating channel (vs. be saved-to-history-only).
+
+    Background: since the 2026-06-11 inter-agent leak fix, EVERY chain-
+    terminator turn (a peer's reply auto-routing back to the agent that
+    initiated the chain) runs silent — so an agent that consulted a peer via
+    talk_to_agent and then answered the human in plain text on the return turn
+    had that answer SWALLOWED (the operator saw silence; hit on two
+    deployments). This restores the answer for the GENUINE TOP-LEVEL operator
+    terminator ONLY, without reopening the leak.
+
+    Posts only when ALL hold:
+      - this is a chain-terminator turn AND a human is at the chain root
+        (`chain_root_operator`: originator_visibility in ("", "operator_channel")
+        — NOT cron/kairos/dream/heartbeat/silent_agent_chain; those background
+        chains stay silent, preserving the 2026-06 leak fix verbatim);
+      - THIS agent is the chain ROOT — the agent the human DIRECTLY messaged
+        (`chain_root_agent_id == this_agent_id`, both non-empty). This is the
+        load-bearing discriminator (2026-06-15 hardening). The chain root id is
+        stamped by talk_to_agent on the first hop and propagated verbatim down
+        every deeper hop and back up the return path, so a NESTED middle agent
+        (operator → A → B → C → B, any depth where the human never addressed
+        THIS agent) carries root="A" while running as "B" and is rejected here —
+        EVEN IF it was explicitly dispatched into a real/numeric human channel
+        via `talk_to_agent(channel_id=<real op channel>)`. That explicit-channel
+        nested case is the residual leak path the earlier "is it a real channel"
+        check could not close; gating on root-agent identity closes it with zero
+        tolerance. Empty `chain_root_agent_id` fails CLOSED (no surface) — a
+        genuine inter-agent terminator always carries one (talk_to_agent always
+        stamps it), so empty means "not a real operator-rooted chain";
+      - the terminator runs in a REAL human channel, not an `internal:` peer
+        inter-agent conversation (belt-and-suspenders behind the root-agent
+        gate: default-routed nested terminators also land in `internal:peer-*`
+        non-routable sessions);
+      - the agent has not ALREADY delivered to the human this turn via
+        send_message/end_chain (`reply_equivalent_tool_fired`) or a direct post
+        (`already_posted`) — no double-post;
+      - not a media-only turn that already produced its attachment (and no
+        human soft-injected to pull text back into play).
+
+    Why root-agent identity, not "does the resolved channel match the operator's
+    original inbound channel" (the other option considered): the genuine
+    top-level terminator's auto-route ALWAYS returns into the root agent's own
+    originating session (the human channel) — so for the root agent the channel
+    identity match is tautologically true and adds nothing, while for a nested
+    agent explicitly placed in the operator's channel the channel WOULD match yet
+    must still be rejected. Channel-identity is also fragile: a plain nextcord
+    top-level operator DM carries NO session conversation_id, so a strict
+    conv-id match would wrongly reject the very repro this fix restores.
+    Root-agent identity is strictly stronger and directly encodes "the agent the
+    human addressed" — the precise intent.
+    """
+    if not (is_chain_terminator and chain_root_operator):
+        return False
+    if not (final_text or "").strip():
+        return False
+    # Root-agent gate: only the agent the human DIRECTLY messaged (the outermost
+    # hop) may surface. Fail closed on empty / mismatch — a nested middle agent's
+    # terminator never posts, even into an explicitly-targeted real channel.
+    if not (chain_root_agent_id and this_agent_id
+            and chain_root_agent_id == this_agent_id):
+        return False
+    if reply_equivalent_tool_fired or already_posted:
+        return False
+    if (channel_session_transport == "internal"
+            or str(channel_conversation_id or "").startswith("internal:")):
+        return False
+    if media_only and any_attachments and not human_softinject_drained:
+        return False
+    return True
 
 
 async def _notify_compaction_done(channel, *, was_manual: bool, elapsed_s: float | None = None) -> None:
@@ -943,6 +1030,12 @@ class AgentRunner:
                                 auto_route_from_peer=self.agent.id,
                                 speaker_id=_speaker_id,
                                 originator_visibility=_orig_vis,
+                                # Propagate chain root-agent identity onto the
+                                # originator's terminator turn, same as the
+                                # success auto-route — keeps the surfacing
+                                # predicate's root==self check valid for the
+                                # CHAIN_ERROR return path too.
+                                chain_root_agent_id=kwargs.get("chain_root_agent_id") or "",
                             ), name="autoroute_chain_error")
                             _ce_task.add_done_callback(log_task_exception)
                             print_ts(
@@ -1313,6 +1406,7 @@ class AgentRunner:
         originator_visibility: str = "",
         originator_channel_id: int = 0,
         originator_session: Optional[Session] = None,
+        chain_root_agent_id: str = "",
         force_tool_choice: dict | None = None,
     ) -> None:
         """Fire a turn for this agent without an inbound Discord message.
@@ -1428,6 +1522,11 @@ class AgentRunner:
             # into the caller's own conversation when it has no routable bare
             # channel id (internal peer / linked / handle-keyed sessions).
             "originator_session": originator_session,
+            # Chain ROOT-AGENT identity — the agent the human directly messaged
+            # at the head of this inter-agent chain. Threaded so the recipient's
+            # (and every deeper hop's) chain-terminator surfacing predicate can
+            # tell the genuine top-level operator terminator from a nested one.
+            "chain_root_agent_id": chain_root_agent_id or "",
             "force_tool_choice": force_tool_choice,
         })
 
@@ -1651,6 +1750,7 @@ class AgentRunner:
         originator_visibility: str = "",
         originator_channel_id: int = 0,
         originator_session: Optional[Session] = None,
+        chain_root_agent_id: str = "",
         force_tool_choice: dict | None = None,
     ) -> None:
         """Shared agent loop — calls the model, runs tools, feeds results back,
@@ -1796,6 +1896,18 @@ class AgentRunner:
         try:
             from .tool_executor import CURRENT_TURN_VISIBILITY
             CURRENT_TURN_VISIBILITY.set(originator_visibility or "")
+        except Exception:
+            pass
+        # Chain-ROOT-AGENT identity for this turn (the agent the human directly
+        # addressed at the head of the chain). talk_to_agent reads
+        # CURRENT_CHAIN_ROOT_AGENT to decide stamp-vs-propagate; the
+        # chain-terminator surfacing predicate compares it to self.agent.id so
+        # only the genuine top-level operator terminator posts its return text.
+        # Empty on plain human turns — talk_to_agent stamps the sender's id on
+        # the first hop in that case.
+        try:
+            from .tool_executor import CURRENT_CHAIN_ROOT_AGENT
+            CURRENT_CHAIN_ROOT_AGENT.set(chain_root_agent_id or "")
         except Exception:
             pass
         # Pre-turn self-edit hot-reload. Hash-based fingerprint over agent.json
@@ -3409,6 +3521,17 @@ class AgentRunner:
                                     # chain-terminator empty path will
                                     # surface failure to them.
                                     originator_visibility=originator_visibility,
+                                    # Propagate the chain ROOT-AGENT identity
+                                    # verbatim back up the return path. Stamped
+                                    # once by talk_to_agent on the first hop, it
+                                    # must ride unchanged to the originator's
+                                    # chain-terminator turn so the surfacing
+                                    # predicate can confirm the originator IS the
+                                    # agent the human addressed (root == self).
+                                    # Without this the genuine top-level
+                                    # terminator carries an empty root and
+                                    # fails the (now mandatory) root-agent gate.
+                                    chain_root_agent_id=chain_root_agent_id,
                                 ),
                                 name="autoroute_dispatch",
                             )
@@ -3447,18 +3570,63 @@ class AgentRunner:
                                     print_ts(f"{COLOR_RED}{log_tag}Failed to post message: {e}{COLOR_END}", error=True, agent=agent.id)
                 elif silent:
                     if is_chain_terminator:
-                        # Expected end-state since the 2026-06 leak fix:
-                        # chain-terminator turns run silent, so a plain-text
-                        # ending simply closes the chain — the text is saved
-                        # to history (dashboard-visible) but posts nowhere.
-                        # Explicit send_message is the only human surface.
-                        print_ts(
-                            f"{COLOR_YELLOW}chain ended silently (root="
-                            f"{originator_visibility or 'operator_channel'}): final text saved to "
-                            f"history, not posted. Preview: "
-                            f"{(final_text or '')[:120].replace(chr(10), ' ')!r}{COLOR_END}",
-                            agent=agent.id,
+                        # Chain-terminator turns run silent since the 2026-06
+                        # leak fix. But an OPERATOR-ROOTED terminator that ends
+                        # in plain text is the human's actual answer (agent
+                        # consulted a peer, then replied to the operator) — the
+                        # leak fix swallowed it (operator saw silence; hit on
+                        # two deployments, 2026-06-15). Surface it for
+                        # operator-rooted chains landing in a REAL human channel;
+                        # agent-rooted background chains and nested internal:peer
+                        # terminators stay silent (leak fix preserved). See
+                        # _terminator_text_surfaces for the full discriminator.
+                        _ts_sess = getattr(channel, "_session", None)
+                        _surface = _terminator_text_surfaces(
+                            is_chain_terminator=is_chain_terminator,
+                            chain_root_operator=_chain_root_operator,
+                            final_text=final_text,
+                            channel_session_transport=(
+                                getattr(_ts_sess, "transport", "") if _ts_sess is not None else ""),
+                            channel_conversation_id=(
+                                getattr(_ts_sess, "conversation_id", "") if _ts_sess is not None else ""),
+                            reply_equivalent_tool_fired=reply_equivalent_tool_fired,
+                            already_posted=_posted_assistant_text,
+                            media_only=media_only,
+                            any_attachments=any_attachments_this_turn,
+                            human_softinject_drained=_human_softinject_drained_this_turn,
+                            this_agent_id=agent.id,
+                            chain_root_agent_id=chain_root_agent_id,
                         )
+                        if _surface:
+                            try:
+                                for chunk in _split_for_discord(final_text):
+                                    await _safe_channel_send(channel, chunk)
+                                _posted_assistant_text = True
+                                print_ts(
+                                    f"{COLOR_GREEN}operator-rooted chain terminator: posted "
+                                    f"final text to the originating channel (root="
+                                    f"{originator_visibility or 'operator_channel'}). Preview: "
+                                    f"{(final_text or '')[:120].replace(chr(10), ' ')!r}{COLOR_END}",
+                                    agent=agent.id,
+                                )
+                            except Exception as e:
+                                print_ts(
+                                    f"{COLOR_RED}{log_tag}Failed to post operator-rooted "
+                                    f"chain-terminator reply: {e}{COLOR_END}",
+                                    error=True, agent=agent.id,
+                                )
+                        else:
+                            # Stayed silent: agent-rooted background chain,
+                            # internal:peer nested terminator, or already
+                            # delivered via send_message. Saved to history
+                            # (dashboard-visible), posts nowhere — unchanged.
+                            print_ts(
+                                f"{COLOR_YELLOW}chain ended silently (root="
+                                f"{originator_visibility or 'operator_channel'}): final text saved to "
+                                f"history, not posted. Preview: "
+                                f"{(final_text or '')[:120].replace(chr(10), ' ')!r}{COLOR_END}",
+                                agent=agent.id,
+                            )
                     else:
                         # Non-chain silent turn (cron/heartbeat/kairos) ended in
                         # plain text — deliberate drop, but log loudly: the model

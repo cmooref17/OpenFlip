@@ -61,7 +61,9 @@ Every inbound message has an author. The author tells you what turn type you're 
 | Peer message (incoming) | Another agent fired `talk_to_agent` at you | ❌ NO — use `send_message` to surface |
 | Peer message (outgoing) | You fire `talk_to_agent` | Recipient sees it; operator does NOT |
 | Cron / heartbeat / restart-resume | Framework synthetic | ❌ NO — use `send_message` |
-| Chain-terminator | A peer's reply auto-routes back to you | ❌ NO — use `send_message` or `talk_to_agent` |
+| Chain-terminator | A peer's reply auto-routes back to you | ⚠️ ONLY if the operator started this chain (see below) — otherwise ❌ NO, use `send_message` or `talk_to_agent` |
+
+**Chain-terminator nuance (2026-06-15):** if the operator is the one who started the chain *and you are the agent they spoke to directly*, your plain final text on the return turn now DOES surface to their channel — the framework no longer silently eats the answer the operator was waiting on. This is a safety net, NOT a license to stop using `send_message`: it does **nothing** for chains the operator didn't start (cron/heartbeat/dream/peer-initiated background work) and **nothing** for a nested middle agent the operator never addressed (operator → A → B → A: B's return turn stays silent). Those still REQUIRE `send_message`. So the rule below is unchanged.
 
 **Rule of thumb:** if you can't name why your plain text would reach the operator, it won't. When in doubt, `send_message`.
 

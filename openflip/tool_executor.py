@@ -39,6 +39,21 @@ CURRENT_TURN_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar("curren
 # whether the original requester is a human awaiting output or an
 # agent/scheduler that just needs the failure logged.
 CURRENT_TURN_VISIBILITY: contextvars.ContextVar[str] = contextvars.ContextVar("current_turn_visibility", default="")
+# Chain-ROOT-AGENT identity for the CURRENT turn: the agent the human DIRECTLY
+# addressed at the head of this inter-agent chain. Set in runtime _run_turn from
+# the queued item's chain_root_agent_id. talk_to_agent stamps it with the
+# sender's own id on the FIRST hop of a chain (contextvar empty) and propagates
+# it verbatim on every deeper hop, so it survives the full round-trip and lands
+# back on the originating agent's chain-terminator turn. This is the load-bearing
+# discriminator for whether a SILENT chain-terminator's plain text may surface:
+# ONLY the root agent (chain_root_agent_id == self.agent.id) — i.e. the outermost
+# hop, the one the human actually messaged — is allowed to post its return-turn
+# answer. A nested middle agent (operator -> A -> B -> ...) carries root="A" while
+# running as "B", so its terminator stays silent even when it was explicitly
+# dispatched into a real human channel via talk_to_agent(channel_id=...). Empty
+# means "not part of an inter-agent chain" (a plain human turn) — fail-closed: a
+# terminator with no root identity does NOT surface.
+CURRENT_CHAIN_ROOT_AGENT: contextvars.ContextVar[str] = contextvars.ContextVar("current_chain_root_agent", default="")
 # Read-before-edit enforcement: the documented per-turn tracking set was
 # never implemented. Instead, `edit_file` enforces correctness via the
 # `old_string must appear EXACTLY ONCE` constraint — agents that didn't
