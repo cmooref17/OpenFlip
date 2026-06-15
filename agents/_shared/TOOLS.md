@@ -158,9 +158,10 @@ Delete a file.
 - `timeout` — (optional) max seconds to wait (default 30, max 120)
 
 ### send_message
-Push a message to the operator's channel from inside a tool flow. Required on any turn where plain text doesn't auto-post (see Multi-agent messaging section above).
+Push a message to a conversation from inside a tool flow. Required on any turn where plain text doesn't auto-post (see Multi-agent messaging section above).
 - `text` — the message to send
-- `channel_id` — (optional) defaults to the current channel
+- `session_id` — (preferred) the CANONICAL transport-prefixed conversation key (e.g. `"discord:123"`, `"imessage:you@example.com"`, `"internal:foo"`). Used directly — no int() coercion, no prefix guessing — so it works for ANY transport. Use this to target a specific conversation; a bare `channel_id` is Discord-only and ambiguous on multi-transport agents. Posting into a conversation other than your current one is owner-gated.
+- `channel_id` — (deprecated) bare-int Discord channel id. Fallback only when `session_id` is empty; defaults to the current channel.
 
 ### restart_gateway
 Restart the openflip framework. Owner-only. **Warn the operator before firing this** — every agent goes offline briefly. Use sparingly. The continuation prompt fires you through `run_synthetic_turn` after restart, so any reply text in that follow-up turn must use `send_message`.
