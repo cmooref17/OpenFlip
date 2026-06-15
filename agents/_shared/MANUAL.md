@@ -615,9 +615,16 @@ entry before invocation. The owner ID is always allowed on Discord (see
 
 ## Discord
 
-- **`send_message(text: str, channel_id: int = 0)`** — post to the
-  current channel (default) or a different channel if `channel_id` is
-  set. Auto-splits >1900 chars. Routes through Transport.send.
+- **`send_message(text: str, channel_id: int = 0, session_id: str = "")`**
+  — post to a conversation. `session_id` (PREFERRED) is the canonical
+  transport-prefixed conversation key (e.g. `"discord:123"`,
+  `"imessage:you@example.com"`, `"internal:foo"`); it's used directly —
+  no int() coercion, no prefix guessing — so it targets ANY transport.
+  `channel_id` (DEPRECATED) is the bare-int Discord fallback used only
+  when `session_id` is empty; defaults to the current channel. Posting
+  into a conversation other than your current one is owner-gated.
+  Auto-splits >1900 chars. Routes through Transport.send; the transport
+  is resolved generically from the prefix / the matched live conversation.
 - **`delete_message(message_id: int = 0, channel_id: int = 0,
   with_attachments: bool = False)`** — delete a Discord message by ID,
   or find-and-delete the bot's most recent message if both IDs are 0.
@@ -674,10 +681,12 @@ entry before invocation. The owner ID is always allowed on Discord (see
   live turn's tool_use/tool_result sequence. Owner-only by default
   (auto-injected blank ACL → owner bypass). A `/inject_context` slash
   command does the same thing for the operator.
-- **Known later-pass item:** the `send_message` / `send_file` /
-  `delete_message` trio still takes a bare-int `channel_id` only and has
-  NOT yet been migrated to the canonical `session_id` arg. Until that pass
-  lands, those three remain `channel_id`-keyed.
+- **Known later-pass item:** `send_message` now accepts the canonical
+  transport-prefixed `session_id` (preferred) alongside the deprecated
+  bare-int `channel_id` fallback. `send_file` / `delete_message` still
+  take a bare-int `channel_id` only and have NOT yet been migrated to the
+  canonical `session_id` arg. Until that pass lands, those two remain
+  `channel_id`-keyed.
 
 ## Cron
 
