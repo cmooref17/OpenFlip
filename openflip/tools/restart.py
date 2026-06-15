@@ -252,6 +252,12 @@ async def restart_gateway(reason: str, continuation: str = "", force: bool = Fal
     # which is the historical behavior and correct for single-transport agents.
     _restart_session = CURRENT_SESSION.get(None)
     channel_transport = getattr(_restart_session, "transport", "") or ""
+    # Whether this channel is a 1:1 DM. The post-restart announcer needs this:
+    # a Discord DM channel can't be resolved by bare id from a cold cache right
+    # after restart (get_channel misses; fetch_channel can't fetch DMs), so the
+    # announcer resolves it via the recipient (create_dm) instead. Guild
+    # channels resolve fine by id and don't need that path.
+    channel_is_dm = bool(getattr(_restart_session, "is_dm", False))
 
     # Preflight: refuse if any other agent is mid-work, unless force=True.
     if not force:
@@ -345,6 +351,7 @@ async def restart_gateway(reason: str, continuation: str = "", force: bool = Fal
         "agent_id": agent.id,
         "channel_id": channel_id,
         "channel_transport": channel_transport,
+        "channel_is_dm": channel_is_dm,
         "speaker_id": speaker_id,
         "reason": reason,
         "continuation": continuation.strip() or None,
