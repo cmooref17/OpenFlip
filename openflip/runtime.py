@@ -2309,7 +2309,16 @@ class AgentRunner:
 
                     _pre_notice_fired = False
                     _compact_started_at = None
-                    if getattr(conv, "force_compact_next", False) and not silent:
+                    # Will this turn compact? For MANUAL /compact the flag is
+                    # already set here. For AUTO-compaction the flag is set
+                    # INSIDE chat() (anthropic_conversation) AFTER this point,
+                    # so we ask the conversation whether its threshold is
+                    # already exceeded — same logic chat() uses — to fire the
+                    # start notice for both paths. The ollama sibling has no
+                    # such method (no server compaction): fall back to the flag.
+                    _wc = getattr(conv, "will_compact_this_turn", None)
+                    _will_compact = _wc() if callable(_wc) else getattr(conv, "force_compact_next", False)
+                    if _will_compact and not silent:
                         # safe_channel_send returns the Message on success,
                         # None on timeout/transport error (it logs its own
                         # failure). Gate _pre_notice_fired on actual
