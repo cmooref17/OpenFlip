@@ -93,8 +93,13 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
             return
         conv.force_compact_next = True
         conv.force_compact_trigger_override = True
+        # Discord requires an interaction ack, but we DON'T want a second
+        # "Compacting…" line — the public start-notice fired by the synthetic
+        # turn below ("⚙️ Compacting conversation...") is the one real notice,
+        # consistent with the auto-compaction path. So this ack is a quiet,
+        # non-duplicate confirmation, not another "Compacting" message.
         await interaction.response.send_message(
-            "⚙️ Compacting now…",
+            "⚙️ On it — the compaction notice will post in-channel.",
             ephemeral=True,
         )
         # Compaction is a server-side Anthropic operation that only runs
