@@ -93,15 +93,22 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
             return
         conv.force_compact_next = True
         conv.force_compact_trigger_override = True
-        # Discord requires an interaction ack, but we DON'T want a second
-        # "Compacting…" line — the public start-notice fired by the synthetic
-        # turn below ("⚙️ Compacting conversation...") is the one real notice,
-        # consistent with the auto-compaction path. So this ack is a quiet,
-        # non-duplicate confirmation, not another "Compacting" message.
-        await interaction.response.send_message(
-            "⚙️ On it — the compaction notice will post in-channel.",
-            ephemeral=True,
-        )
+        # Discord requires an interaction ack within 3s, but we DON'T want ANY
+        # second message — the public start-notice fired by the synthetic turn
+        # below ("⚙️ Compacting conversation...") is the ONE notice, consistent
+        # with the auto-compaction path. So we defer (ephemeral) to satisfy the
+        # ack requirement, then immediately delete the deferred placeholder so
+        # nothing visible lingers — leaving only the single public notice.
+        try:
+            await interaction.response.defer(ephemeral=True)
+            await interaction.delete_original_message()
+        except Exception:
+            # If defer/delete races (already acked, etc.), fall back to a quiet
+            # ephemeral ack rather than crashing the command.
+            try:
+                await interaction.followup.send("⚙️ Compacting…", ephemeral=True)
+            except Exception:
+                pass
         # Compaction is a server-side Anthropic operation that only runs
         # during a chat request — there's no "compact this conversation now"
         # endpoint. So fire a tiny synthetic turn immediately to drive the
