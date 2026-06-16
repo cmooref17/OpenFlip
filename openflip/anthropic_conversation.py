@@ -1721,6 +1721,28 @@ class AnthropicConversation:
 
         return response
 
+    def _auto_compact_due(self) -> bool:
+        """True if the last measured `total_input` already exceeds this
+        model's compaction trigger. Single source of truth for the
+        auto-compaction decision — used both by chat_stream() to SET
+        `force_compact_next` mid-turn and by will_compact_this_turn() so
+        the runtime start-notice agrees with what chat() will actually do.
+        """
+        if not isinstance(self.last_usage, dict):
+            return False
+        _last_total = int(self.last_usage.get("total_input") or 0)
+        _cap = get_compaction_trigger(self.agent.model, "anthropic")
+        return _last_total > _cap > 0
+
+    def will_compact_this_turn(self) -> bool:
+        """True if this turn will request Anthropic compaction — either the
+        flag is already set (manual /compact, or a prior retry-trim) or the
+        auto-compaction threshold is already exceeded. runtime.py reads this
+        BEFORE chat() so the "⚙️ Compacting conversation..." start notice
+        fires for auto-compaction too, not just manual /compact.
+        """
+        return bool(self.force_compact_next) or self._auto_compact_due()
+
     async def chat_stream(
         self,
         tools: list[Callable] = None,
@@ -1786,17 +1808,16 @@ class AnthropicConversation:
         # on opus models; capping prevents that overage cost). Uses the
         # last actually-measured count from self.last_usage rather than
         # estimating, so we do not over-trigger.
-        if not self.force_compact_next and isinstance(self.last_usage, dict):
+        if not self.force_compact_next and self._auto_compact_due():
             _last_total = int(self.last_usage.get("total_input") or 0)
             _cap = get_compaction_trigger(self.agent.model, "anthropic")
-            if _last_total > _cap > 0:
-                self.force_compact_next = True
-                print_ts(
-                    f"{COLOR_YELLOW}auto-compact: last total_input {_last_total:,} > "
-                    f"trigger {_cap:,}; requesting Anthropic compaction this turn"
-                    f"{COLOR_END}",
-                    agent=self.agent.id,
-                )
+            self.force_compact_next = True
+            print_ts(
+                f"{COLOR_YELLOW}auto-compact: last total_input {_last_total:,} > "
+                f"trigger {_cap:,}; requesting Anthropic compaction this turn"
+                f"{COLOR_END}",
+                agent=self.agent.id,
+            )
         # DELIBERATE divergence (trigger timing): the local trim fires ONLY on
         # a 400-retry (gated on `_retry_budget is not None`), never pre-flight.
         # Anthropic's server-side compaction bounds context in healthy
