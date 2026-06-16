@@ -2331,6 +2331,17 @@ class AgentRunner:
                         _compact_started_at = _time.monotonic()
                         _pre_sent = await _safe_channel_send(channel, "⚙️ *Compacting conversation...*")
                         _pre_notice_fired = _pre_sent is not None
+                        # Re-trigger typing right after the notice so the
+                        # "typing…" indicator is fresh for the (slow) compaction
+                        # round-trip. The outer _safe_typing pulse fired at loop
+                        # entry can lapse (~10s) before compaction returns,
+                        # leaving dead air after the notice. Best-effort.
+                        try:
+                            _tt = getattr(channel, "trigger_typing", None)
+                            if callable(_tt):
+                                await _tt()
+                        except Exception:
+                            pass
 
                     # force_tool_choice forwarded only on the FIRST iteration
                     # of the turn (not on subsequent tool-result continuations,
