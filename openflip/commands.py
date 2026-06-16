@@ -69,14 +69,16 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         runner.reset_conversation(conv_key, fallback_conv_id=conv_id)
         await interaction.response.send_message("Conversation reset.", ephemeral=True)
 
-    @bot.slash_command(name="compact", description="Force compaction on the next message in this channel.")
+    @bot.slash_command(name="compact", description="Compact this channel's conversation now (needs ~50k+ tokens).")
     async def compact_cmd(interaction: nextcord.Interaction):
         # Owner-only: /compact forces a server-side Anthropic compaction
         # (irreversible) and fires a synthetic turn — must not be triggerable
         # by non-owners. Mirrors /uncompact, /dream, /stop gating.
         if not await _owner_check(interaction): return
-        # Anthropic-only: sets two flags on the conversation. force_compact_next
-        # opts the next chat() into server-side compaction; force_compact_trigger_
+        # Anthropic-only: sets two flags, then SELF-FIRES a synthetic turn
+        # below to drive compaction immediately (NOT waiting for the user's
+        # next message). force_compact_next opts that turn's chat() into
+        # server-side compaction; force_compact_trigger_
         # override makes that request send the low _MANUAL_COMPACT_TRIGGER (50k,
         # Anthropic's floor) instead of the real per-model trigger — so Anthropic
         # compacts regardless of current input size, as long as the conversation
