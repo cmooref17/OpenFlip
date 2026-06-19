@@ -135,3 +135,42 @@ def make_discord_session(
         guild_id=guild_id,
         category_id=category_id,
     )
+
+
+def make_external_session(name: str, *, speaker_label: str = "") -> Session:
+    """Build a Session for an `external` transport turn.
+
+    Mirrors `make_internal_session` (null.py): the conversation is keyed by a
+    fixed NAME chosen by the operator (the token's `session` field), NOT by
+    anything the external caller can influence. All turns bound to one token
+    land in `external:<name>` so a game keeps one continuous conversation.
+
+    `name` becomes the `transport_id` verbatim (so the transport's `send()` —
+    which receives `session.transport_id` — can route the captured reply back
+    to the in-flight HTTP request keyed by it) and the `conversation_id` is
+    `external:<name>` (so history lives in
+    `agents/<id>/conversations/external:<name>.jsonl`, isolated from every
+    Discord/iMessage/internal conversation). The in-memory dict key the runtime
+    derives (`TransportChannel.id`) is a per-process-stable hash of `name`
+    (channel_shim.py) — only ever an in-memory key; the on-disk filename is
+    governed by `conversation_id`, which IS stable across restarts.
+
+    SECURITY: `is_owner` is hard-False and `speaker_id` is a non-owner hash —
+    an external caller can NEVER be the owner (acl.is_owner stays False), so
+    owner-only tools/disclosure never unlock on this transport. The numeric
+    `speaker_id` is only an internal keying value; `external` ACL auth is keyed
+    by transport name, so a tool needs an explicit `auth.external` block to be
+    callable here (fail-closed: Discord-only tool entries are invisible).
+    """
+    speaker_id = abs(hash(f"external:{name}")) % (2**31)
+    return Session(
+        transport="external",
+        transport_id=name,
+        conversation_id=f"external:{name}",
+        speaker_id=speaker_id,
+        speaker_role_ids=[],
+        is_owner=False,
+        is_dm=True,
+        display_name=speaker_label or f"external:{name}",
+        handle="",
+    )

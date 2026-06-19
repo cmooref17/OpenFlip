@@ -38,6 +38,11 @@ agents/*/live.json
 *.token
 *.secret
 secrets.json
+game_ingress_token.txt
+
+# external transport — bearer tokens + self-signed TLS material (never commit)
+external_tokens.json
+external_cert/
 
 # Maintainer-private; not for public consumption.
 CLAUDE.md

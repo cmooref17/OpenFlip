@@ -405,10 +405,61 @@ def _build_null_transport(agent: Agent) -> "NullTransport":
     return NullTransport()
 
 
+def _build_external_transport(agent: Agent) -> "ExternalTransport | None":
+    """Build an ExternalTransport (authenticated HTTPS ingress) for an agent.
+
+    Config resolution, most-specific first:
+      1. agent.json `external` block (carried on the Agent dataclass so it
+         survives save() round-trips).
+      2. config.json `integrations.external.agents.<id>`.
+      3. Built-in defaults (port 1780, cert dir / token file under the repo
+         root, 120s request timeout).
+    Returns None on init failure.
+    """
+    from .config_global import get_config
+    cfg = get_config()
+    global_cfg = (
+        (cfg.get("integrations") or {})
+        .get("external", {})
+        .get("agents", {})
+        .get(agent.id, {})
+    )
+    # agent.json block wins over the global config fallback, key by key.
+    ext = dict(global_cfg)
+    ext.update(agent.external or {})
+
+    port = int(ext.get("port", 1780) or 1780)
+    bind_host = str(ext.get("bind_host", "0.0.0.0") or "0.0.0.0")
+    cert_dir = str(ext.get("cert_dir", "") or "")
+    cert_path = str(ext.get("cert_path", "") or "")
+    key_path = str(ext.get("key_path", "") or "")
+    token_path = str(ext.get("token_path", "") or "")
+    request_timeout = float(ext.get("request_timeout", 120.0) or 120.0)
+
+    from .transports.external import ExternalTransport
+    try:
+        return ExternalTransport(
+            port=port,
+            bind_host=bind_host,
+            cert_dir=cert_dir,
+            cert_path=cert_path,
+            key_path=key_path,
+            token_path=token_path,
+            request_timeout=request_timeout,
+        )
+    except Exception as e:
+        print_ts(
+            f"{COLOR_RED}ExternalTransport init failed for '{agent.id}': {e}{COLOR_END}",
+            error=True,
+        )
+        return None
+
+
 _TRANSPORT_BUILDERS = {
     "discord": _build_discord_transport,
     "imessage": _build_imessage_transport,
     "internal": _build_null_transport,
+    "external": _build_external_transport,
 }
 
 

@@ -1055,12 +1055,91 @@ lives in `_shared/FRAMEWORK.md` ("Group channels — know when to speak").
 ## Transports
 
 - **Discord** (default). `nextcord.Bot` per agent. Token from
-  `api_config.json` (gitignored) keyed by agent id.
-- **iMessage** (macOS-only, experimental). Transport class at `openflip/transports/imessage.py`. `_handle_inbound` is wired in `runtime.py:411` — real implementation, not a stub. Per-transport config in `config.json` under `integrations.imessage.agents.<id>` — keys: `handle`, `imsg_path` (default `~/.local/bin/imsg`), `allowlist_chats` (list of chat rowids), `respond_in` (inherits from agent.json). Requires Full Disk Access on chat.db and Automation permissions for Messages.app. Not currently in active use. Note: the imessage.py module docstring still has a stale "INTEGRATION GAP" note from before the wiring landed — ignore it.
+  `integrations.discord.tokens.<id>` in `config.json`.
+- **iMessage** (macOS-only, experimental). Transport class at `openflip/transports/imessage.py`. Per-transport config in `config.json` under `integrations.imessage.agents.<id>` — keys: `handle`, `imsg_path` (default `~/.local/bin/imsg`), `allowlist_chats` (list of chat rowids), `allowlist_senders` (list of allowed phone/email handles), `respond_in` (inherits from agent.json). Requires Full Disk Access on chat.db and Automation permissions for Messages.app.
+- **external** (authenticated HTTPS ingress, internet-reachable). Transport class at `openflip/transports/external.py`. Built to be reached from off-box: it binds **0.0.0.0** over **TLS** and uses a per-token config file instead of one shared secret. See the dedicated section below.
+- **internal** (headless/null transport). No-op transport for background agents with no messaging surface. Used by agents invoked only through `talk_to_agent`.
 
-Multi-transport per agent is not currently supported — `transport:`
-selects one. iMessage agents need Full Disk Access (chat.db) and
-Automation permissions for Messages.app on macOS.
+**Multi-transport agents:** Add `"transports": ["discord", "external"]` to `agent.json` to enable multiple transports for one agent. Each transport runs concurrently. Omitting the `transports` field defaults to Discord only (legacy single-transport mode).
+
+### external transport (HTTPS)
+
+Authenticated HTTPS endpoint that lets an external program POST one message to
+an agent and get the agent's reply back synchronously. Transport class:
+`openflip/transports/external.py`.
+
+**Endpoint.** `POST https://<host>:<port>/<agent_id>` — the path `agent_id`
+must equal the agent the transport belongs to, else **404**. No other route
+exists (any other path/method → 404). Binds `0.0.0.0` (off-network reachable);
+port default **1780**.
+
+**TLS.** On first start, if the cert+key files don't exist, the transport
+auto-generates a self-signed cert (10-year life) — via the `cryptography` lib
+if present, else by shelling out to `openssl`. The private key is written
+`0600`. The cert's SHA-256 fingerprint is logged at startup so a client can
+pin it. Default location: `external_cert/` under the project root
+(`external_cert.pem` + `external_key.pem`). Cert unreadable / un-generatable →
+the transport refuses to bind (fails closed, logs loudly).
+
+**Auth — per-token file.** Tokens live in a gitignored file (default
+`external_tokens.json` in the project root, mode `0600`). Reloaded
+automatically whenever the file's mtime changes (per-request stat-check — edit
+at runtime, no restart/SIGHUP needed). Shape:
+
+```json
+{
+  "tokens": {
+    "<bearer-token-string-32+chars>": {
+      "agent": "agent_b",
+      "session": "agent_b-game",
+      "default_model": "anthropic/claude-opus-4-8",
+      "allow_model_choice": false,
+      "allowed_models": [],
+      "rate_limit": 20
+    }
+  }
+}
+```
+
+(A flat `{ "<token>": { ... } }` map without the `tokens` wrapper is also
+accepted.) Per-entry keys: `agent` (must equal the endpoint's agent — entries
+for other agents are invisible), `session` (operator-assigned **fixed** session
+name — every turn on this token lands in conversation `external:<session>`,
+never anything from the request body), `default_model` (**required**),
+`allow_model_choice` (bool, default false), `allowed_models` (list, only
+meaningful when `allow_model_choice` is true), `rate_limit` (req/min, default
+20). Missing/empty/unparseable token file → **every** request 401 (fail
+closed). Tokens are compared in constant time; a token <32 chars is ignored.
+
+**Request.** Header `Authorization: Bearer <token>`. Body JSON
+`{"message": <str, required>, "sender_label": <str, optional>, "model": <str, optional>}`.
+`sender_label` is cosmetic — prepended as `[<label>]: <message>`. Model
+resolution: if `allow_model_choice` is true **and** `model` is sent, it must be
+in `allowed_models` (else **400** with `{"error": "...", "allowed": [...]}`);
+otherwise the token's `default_model` is used. The chosen model applies to
+**that turn only** (per-turn override on the conversation — `set_model_override`
+in `anthropic_conversation.py`), never mutating the agent's persistent config.
+Any `session`/`agent` field in the body is ignored.
+
+**Response.** `200 {"reply": "<full agent text>"}`. The whole reply is captured
+(multi-chunk included). Error codes: **400** malformed/empty body or
+disallowed model, **401** missing/invalid token, **403** never (auth is
+all-or-nothing per token), **404** wrong agent path / unknown route, **413**
+body over 16 KiB, **429** over the token's rate limit, **503** agent disabled,
+**504** turn didn't finish within the request timeout (default 120s), **500**
+internal error (details redacted). Concurrent requests for the same `session`
+are serialized so one conversation only runs one turn at a time.
+
+**Security.** The session is non-owner (`is_owner` hard-False), so owner-only
+tools and disclosure never unlock. ACL is keyed by transport name, so a tool is
+callable here only with an explicit `auth.external` block — Discord-only tool
+entries are invisible (fail closed).
+
+**Config** lives on `agent.json` under an `external` block (carried as a real
+field so it survives `agent.save()`), with a `config.json`
+`integrations.external.agents.<id>` fallback. Keys: `port`, `bind_host`,
+`cert_dir`, `cert_path`, `key_path`, `token_path`, `request_timeout`. Enabled
+on agent_b; not on other agents.
 
 ---
 

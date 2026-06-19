@@ -996,6 +996,33 @@ class AnthropicConversation:
         # before.
         self._persist_guard = None
 
+        # Per-turn model override (raw, pre-normalize form — e.g.
+        # "anthropic/claude-..."). Set by a transport that wants THIS turn to
+        # run on a caller-chosen model without mutating the agent's persistent
+        # config. None = use self.agent.model as usual. The every-turn resync
+        # (and reapply_agent) honor this via _effective_raw_model(); the
+        # external transport clears it in a finally after the turn so it never
+        # leaks into a subsequent turn. Only the model id is overridden —
+        # reasoning-effort, 1M-context and compaction stay keyed to agent.model.
+        self._model_override: str | None = None
+
+    def set_model_override(self, raw_model: str | None) -> None:
+        """Override the model used for the NEXT turn only (per-turn).
+
+        `raw_model` is the raw, un-normalized model string as it would appear
+        in agent.json (provider prefix / `-1m` suffix allowed — _normalize_model
+        strips them). Pass None to clear. The override is consumed by the
+        every-turn resync in chat_stream and by reapply_agent; the caller is
+        responsible for clearing it (typically in a `finally`) so it does not
+        bleed into later turns on the same conversation.
+        """
+        self._model_override = raw_model or None
+
+    def _effective_raw_model(self) -> str:
+        """Raw model string for THIS turn: the per-turn override if set,
+        otherwise the agent's configured model."""
+        return self._model_override or self.agent.model
+
     @staticmethod
     def _normalize_model(model_str: str) -> str:
         """Strip provider prefix (`anthropic/...`) and `-1m` context-window
@@ -1490,7 +1517,7 @@ class AnthropicConversation:
         self.last_usage = None
 
     def reapply_agent(self):
-        self.model = self._normalize_model(self.agent.model)
+        self.model = self._normalize_model(self._effective_raw_model())
         self.system_message = self.agent.system_message
 
     async def _ensure_http_session(self) -> aiohttp.ClientSession:
@@ -1929,10 +1956,13 @@ class AnthropicConversation:
         # so `/model` and direct agent.json edits take effect on the NEXT turn
         # with no restart. self.model is otherwise cached at construction and
         # would go stale relative to agent.model after a reload_if_changed().
-        self.model = self._normalize_model(self.agent.model)
+        # A per-turn override (set via set_model_override) wins for this turn
+        # only — _effective_raw_model() returns it when present, else
+        # agent.model.
+        self.model = self._normalize_model(self._effective_raw_model())
         body = {
             "model": self.model,
-            "max_tokens": 32000,
+            "max_tokens": 64000,
             "messages": api_messages,
             "stream": True,
         }
