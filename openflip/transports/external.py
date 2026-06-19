@@ -627,8 +627,12 @@ class ExternalTransport:
             return
 
         self._app = web.Application(client_max_size=_MAX_BODY_BYTES)
-        # Only ONE route: POST /<agent_id>. Anything else → aiohttp 404.
-        self._app.router.add_post(f"/{agent_id}", self._handle_request)
+        # ONE route: POST /{agent_id} (dynamic). The handler verifies the path
+        # segment equals THIS agent's id via request.match_info["agent_id"] and
+        # 404s otherwise. Registering it dynamic (not the literal f"/{agent_id}")
+        # is REQUIRED: a static path populates no match_info, so the handler's
+        # agent-id check would read "" and 404 every request.
+        self._app.router.add_post("/{agent_id}", self._handle_request)
 
         self._app_runner = web.AppRunner(self._app)
         await self._app_runner.setup()
