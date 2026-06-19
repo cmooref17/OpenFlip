@@ -570,6 +570,13 @@ class Agent:
     # same AgentRunner. Empty list (default) = fall back to the single
     # `transport` field above (backward compat).
     transports: list[str] = field(default_factory=list)
+    # Per-agent config block for the "external" HTTPS transport (port, cert/key
+    # paths, token-file path, request timeout). Read by main.py's
+    # _build_external_transport. Kept as an opaque dict so the transport owns
+    # its own schema; carried as a real field (not a stray agent.json key) so it
+    # survives save() re-serialization round-trips (save() rebuilds data from
+    # known fields only and would otherwise drop an unknown top-level key).
+    external: dict = field(default_factory=dict)
     _fingerprint: str = ""
 
     @classmethod
@@ -664,6 +671,7 @@ class Agent:
             agent_specific_commands=list(data.get("agent_specific_commands", []) or []),
             transport=str(data.get("transport", "discord")),
             transports=list(data.get("transports", []) or []),
+            external=dict(data.get("external", {}) or {}),
             _fingerprint=fingerprint,
         )
 
@@ -770,6 +778,10 @@ class Agent:
         # files stay byte-identical.
         if self.transports:
             data["transports"] = list(self.transports)
+        # external transport config — only serialize when populated so agents
+        # without the transport keep byte-identical agent.json files.
+        if self.external:
+            data["external"] = dict(self.external)
         return save_json(self.path, data)
 
     @staticmethod
