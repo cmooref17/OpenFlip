@@ -1,0 +1,45 @@
+"""Example third-party transport plugin — copy me.
+
+HOW TO USE
+  1. Copy this file to `my_transport.py` (any name; `.py`, not starting with `_`)
+     in this same directory (transports_local/).
+  2. Fill in TRANSPORT_NAME and build() below, and implement your Transport.
+  3. Add `"transports": ["<your TRANSPORT_NAME>"]` to an agent's agent.json.
+
+WHY HERE (and NOT openflip/main.py)
+  This directory is gitignored, so a `git pull` never clobbers your plugin.
+  Do NOT add transports by editing the `_TRANSPORT_BUILDERS` dict in
+  openflip/main.py — that file is git-tracked and your edit will be lost on the
+  next pull. openflip discovers and merges everything in this directory at
+  startup; this is the only supported extension point.
+
+THE CONTRACT (both symbols are required)
+  TRANSPORT_NAME: str                  — the name agents reference in config.
+  build(agent) -> Transport | None     — build the Transport for an agent.
+
+REFERENCE IMPLEMENTATIONS (read these — they satisfy the same protocol)
+  openflip/transports/null.py     — minimal no-op transport (smallest example).
+  openflip/transports/discord.py  — a full real-world transport.
+
+Note: the `.template` suffix means this file is NOT auto-loaded. Only plain
+`.py` files in this directory are imported as plugins.
+"""
+from __future__ import annotations
+
+# The name agents put in agent.json: "transports": ["example"].
+# Must not collide with a built-in (discord/imessage/internal/external) — if it
+# does, the built-in wins and this plugin is ignored with a warning.
+TRANSPORT_NAME = "example"
+
+
+def build(agent):
+    """Build and return a Transport for `agent`, or None to skip it.
+
+    Called once per agent that lists TRANSPORT_NAME in its `transports`. Return
+    None when this agent has no config for your transport (the runner just
+    skips it). The returned object must satisfy the Transport protocol — see
+    openflip/transports/null.py for the smallest complete implementation.
+    """
+    # from openflip.transports.null import NullTransport
+    # return NullTransport()
+    raise NotImplementedError("Implement your Transport and return it here.")

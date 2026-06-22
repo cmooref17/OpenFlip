@@ -105,6 +105,13 @@ openflip/tools/*
 !openflip/tools/inject_context.py
 
 
+# Third-party transport plugins — local extension point, never tracked so a
+# `git pull` can't clobber them. Discovered by openflip/main.py at startup.
+# The README + .template are intentionally kept (they document the contract).
+transports_local/*
+!transports_local/README.md
+!transports_local/*.template
+
 api_config.json.bak
 
 # webapp credentials — never commit

@@ -436,6 +436,36 @@ stays list-only in both editors.
   agents need `handle`, optional `imsg_path`, optional `allowlist_chats`
   there. macOS-only.
 
+### Adding a custom transport (plugin discovery)
+
+The four built-in transports (`discord`, `imessage`, `internal`, `external`)
+are registered in the `_TRANSPORT_BUILDERS` dict in `openflip/main.py`. To add
+your **own** transport, do **NOT** edit that dict or any other repo-tracked
+file — `openflip/main.py` is tracked and a `git pull` will overwrite your
+edit. Tracked-file edits are not the way; they get clobbered.
+
+Instead, drop a plugin in the gitignored local directory:
+
+- **Where:** `transports_local/` at the repo root (or set
+  `$OPENFLIP_TRANSPORTS_DIR` to point elsewhere). The directory is gitignored,
+  so plugins there survive every `git pull`.
+- **Contract:** each `.py` file (files starting with `_` are skipped) must
+  expose a module-level `TRANSPORT_NAME = "yourname"` (str) and a
+  `def build(agent) -> Transport | None`. At startup openflip imports each
+  plugin and **merges** `{TRANSPORT_NAME: build}` into the transport registry
+  alongside the built-ins.
+- **Use it:** put `"transports": ["yourname"]` in an agent's `agent.json`.
+- **Built-ins can't be shadowed:** a plugin reusing a built-in name
+  (`discord`/`imessage`/`internal`/`external`) is ignored with a warning; the
+  built-in wins.
+- **Crash-safe:** a broken/throwing plugin is logged and skipped — it never
+  takes down startup.
+
+See `transports_local/README.md` for the full contract and
+`transports_local/example_transport.py.template` for a copy-me skeleton.
+Reference implementations: `openflip/transports/null.py` (minimal) and
+`openflip/transports/discord.py` (full).
+
 ## Ollama-only
 
 - `ollama_options` (alias: `options`) — passed to Ollama's chat API.
