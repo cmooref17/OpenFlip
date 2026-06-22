@@ -24,7 +24,7 @@ from .agent import Agent
 from .utils import print_ts, COLOR_YELLOW, COLOR_RED, COLOR_END, load_json, save_json
 from . import _conversation_io as _cio
 from . import _request_validator
-from .config_global import get_compaction_trigger, get_effort, get_model_context_window, _VALID_EFFORT_LEVELS
+from .config_global import get_compaction_trigger, get_effort, get_max_tokens, get_model_context_window, _VALID_EFFORT_LEVELS
 
 
 # Compaction trigger (input_tokens) sent on a MANUAL /compact. Anthropic's
@@ -1962,7 +1962,11 @@ class AnthropicConversation:
         self.model = self._normalize_model(self._effective_raw_model())
         body = {
             "model": self.model,
-            "max_tokens": 64000,
+            # Per-model output token cap → config.json models.<bare>.max_tokens.
+            # Pass agent.model raw (with any `-1m` suffix); get_max_tokens does
+            # the bare-name normalization, exactly like get_effort /
+            # get_compaction_trigger. Falls back to 64000 when unset/invalid.
+            "max_tokens": get_max_tokens(self.agent.model, "anthropic"),
             "messages": api_messages,
             "stream": True,
         }
