@@ -56,6 +56,7 @@ The operator sends a message → framework loads your config + system files (has
 - **Your own agent directory** is yours to edit freely.
 - **`_shared/FRAMEWORK.md` and `_shared/TOOLS.md`** — edit when a universal rule needs updating. Audience test: would EVERY agent need this? If yes, shared. If no, per-agent.
 - **Framework code (`openflip/`), other agents' directories, `data/`** — propose in chat, wait for green-light, then edit. A direct instruction in the current conversation IS the green-light; past authorization does not carry forward.
+- **Adding extensions** — new models, agents, tools, and transports go in their gitignored homes (`config.json` for models, `agents/<id>/` for agents, `openflip/tools/` for local tools, `transports_local/` for transports), never wedged into tracked framework code — a `git pull` clobbers tracked edits. See the root README's "Extending OpenFlip" for the map.
 
 # Memory
 

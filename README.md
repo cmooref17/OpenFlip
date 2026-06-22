@@ -22,6 +22,34 @@ schedule.
 - **Operational safety** — restart sentinel, atomic conversation persistence,
   secret scrubbing of tool output, per-session tool grants.
 
+## Extending OpenFlip (without losing your work on `git pull`)
+
+**NEVER edit git-tracked framework files to add your own models, agents, tools,
+or transports.** OpenFlip is a live repo — a `git pull` overwrites tracked files,
+silently clobbering any customization you wedged into them. (This warning is for
+you *and* for any AI coding assistant you point at the repo — they reach for
+`openflip/main.py` by default; redirect them here.)
+
+Every kind of extension has a **gitignored** home that survives every update.
+Put your customization there instead:
+
+| You want to add a… | Put it in… | Why it's safe |
+|---|---|---|
+| **Model** | a `models.<bare-id>` block in `config.json` | `config.json` is gitignored → survives pull |
+| **Agent** | a new `agents/<id>/` dir + its token in `config.json` | personal agent dirs are gitignored by default → survives pull |
+| **Local tool** | a `@tool` `.py` file dropped in `openflip/tools/` | non-core tool files are gitignored + auto-loaded → survives pull |
+| **Transport** | a `.py` file in `transports_local/` (`TRANSPORT_NAME` + `build(agent)`) | dir is gitignored + auto-discovered → survives pull (see [transports_local/README.md](transports_local/README.md)) |
+
+None of these require touching a single tracked file. Step-by-step recipes for
+each are in **[agents/_shared/MANUAL.md](agents/_shared/MANUAL.md)** §14.
+
+**The one exception — contributing to the framework itself:** making a tool
+*first-class* (shipped to everyone in the public repo) does require editing
+tracked files — a `!`-allowlist line in `.gitignore` plus a static import in
+`openflip/tools/__init__.py`. Those are version-controlled and *can* conflict on
+pull, which is expected for a real contribution. For anything personal, use the
+gitignored paths above.
+
 ## Requirements
 
 - Python 3.11+
