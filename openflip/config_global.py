@@ -413,3 +413,40 @@ def get_effort(model_name: str, provider: str = "") -> str | None:
     if isinstance(level, str) and level.strip().lower() in valid:
         return level.strip().lower()
     return None
+
+
+# Default Anthropic output token cap when a model has no explicit
+# `models.<bare>.max_tokens` entry. Matches the historical hardcoded literal
+# so nothing regresses for models without a config override.
+_DEFAULT_MAX_TOKENS = 64_000
+# Sanity ceiling for a configured max_tokens. Anthropic's output cap tops out
+# at 128k (sonnet with the output-128k beta); anything beyond that is a config
+# typo, not a real cap, so we reject it and fall back to the default rather
+# than let the API 400 on an absurd value.
+_MAX_TOKENS_CEILING = 128_000
+
+
+def get_max_tokens(model_name: str, provider: str = "") -> int:
+    """Return the Anthropic output token cap (request `max_tokens`) for a model.
+
+    Per-model override: reads `models.<bare>.max_tokens` from config.json using
+    the same bare-name resolution as get_effort / get_compaction_trigger /
+    get_model_context_window (strip the `provider/` prefix). Anthropic-only —
+    the ollama provider has its own `num_predict` knob in agent.json.
+
+    Validates that the configured value is a positive int within Anthropic's
+    allowed output range (1.._MAX_TOKENS_CEILING). Anything invalid — non-int,
+    <= 0, or absurdly large — falls back to _DEFAULT_MAX_TOKENS (64000) so the
+    request body stays valid and behavior is unchanged for any model without an
+    explicit, sane entry.
+    """
+    cfg = get_config()
+    # Strip provider prefix for the per-model lookup; matches get_effort.
+    bare = model_name.split("/", 1)[1] if "/" in model_name else model_name
+    models = cfg.get("models") or {}
+    entry = models.get(bare) or {}
+    override = entry.get("max_tokens")
+    if isinstance(override, int) and not isinstance(override, bool):
+        if 0 < override <= _MAX_TOKENS_CEILING:
+            return override
+    return _DEFAULT_MAX_TOKENS

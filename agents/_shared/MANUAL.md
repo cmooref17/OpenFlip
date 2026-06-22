@@ -2290,6 +2290,14 @@ bare model id — the `-1m` suffix is part of the key, so a 1m-context model key
 - `context_window` — token window; feeds `get_model_context_window`.
 - `compaction_trigger` — overrides the `window - reserve` default; floored at
   Anthropic's 50k minimum. See `get_compaction_trigger`.
+- `max_tokens` — **Anthropic-only** output token cap (the request `max_tokens`
+  field), read via `config_global.get_max_tokens`. It's a **model capability,
+  not an agent trait**, so it lives here next to `compaction_trigger`/`effort`.
+  Must be a positive int within Anthropic's output range (1..128000); a junk
+  value (wrong type, `<= 0`, or absurdly large) falls back to the default
+  **64000** rather than 400-ing the request. Unset → 64000, so behavior is
+  unchanged for any model without an explicit entry. The ollama provider
+  ignores this knob (it has its own `num_predict` in agent.json).
 - `effort` — reasoning depth. It's a **model capability, not an agent
   trait**, so it lives here next to `compaction_trigger`, read via
   `config_global.get_effort`. For Anthropic models it's sent as
