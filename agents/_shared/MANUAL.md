@@ -2014,13 +2014,7 @@ non-content errors and does NOT append them to conversation history
 
 # 14. Self-modification recipes
 
-For the full pull-safe extension-points overview — the one-table map of which
-gitignored spot each kind of extension lives in, and the single tracked-file
-exception (making a tool first-class) — see the root **README.md** ("Extending
-OpenFlip"). The per-thing recipes below are the detailed steps; each already
-notes its gitignored / pull-safe status under a **Pull-safe:** line. The rule
-throughout: extensions go in the gitignored homes, never in tracked framework
-code, which `git pull` overwrites.
+> ⚠️ Add models/agents/tools/transports in their gitignored homes, never in tracked framework code — `git pull` overwrites tracked files. (Recipes below.)
 
 ## Give yourself / another agent a new tool
 
