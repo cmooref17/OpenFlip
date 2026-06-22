@@ -714,12 +714,18 @@ entry before invocation. The owner ID is always allowed on Discord (see
 
 ## Cron
 
-- **`add_cron_job(name, prompt, cron="", every_seconds=0,
+- **`add_cron_job(name, prompt, cron="", every_seconds=0, run_at="",
   mode="reminder", timezone="", channel_id=0, session_id="",
   tool_grants=None)`** —
-  schedule a recurring
-  job for yourself. Either `cron` (expression like `"0 9 * * 5"`) OR
-  `every_seconds` — never both. Modes: `"reminder"` (final text auto-
+  schedule a job for yourself. Set EXACTLY ONE of `cron` (expression
+  like `"0 9 * * 5"` — recurring), `every_seconds` (interval — recurring),
+  or `run_at` (TRUE one-shot — fires once then auto-deletes). Never more
+  than one. **One-shot reminders:** use `run_at` for "remind me ONCE at
+  3pm tomorrow" — pass an ISO 8601 time (`"2026-06-22T15:00:00"`, optional
+  tz offset) or unix epoch seconds as a string. It must be in the future;
+  a naive ISO time (no offset) is read in `timezone` if set, else UTC. The
+  job fires exactly once and removes itself from `jobs.json` — no
+  self-cancel hack needed. Modes: `"reminder"` (final text auto-
   posts to the anchor conversation), `"data_collection"` (silent — you
   can still call `send_message`), `"mixed"` (silent, reserved).
   **Anchor:** `session_id` (transport-prefixed, e.g. `"imessage:you@example.com"` or
@@ -1531,10 +1537,19 @@ tool grants" under the auth Rules above.
 - `"interval"` — fires every `seconds` seconds. Needs `seconds > 0`.
 - `"cron"` — standard cron expression. Needs `expression`. Optional
   `timezone` (IANA name, defaults to UTC). Backed by `croniter`.
+- `"once"` — one-shot. Needs `runAtMs` (absolute epoch milliseconds). Fires
+  exactly once when that time has passed, then the scheduler DELETES the
+  job from `jobs.json` (it never reschedules). Created via
+  `add_cron_job(..., run_at="<ISO 8601 | epoch seconds>")`, which parses
+  `run_at` to `runAtMs`, requires it to be in the future, and applies
+  `timezone` to a naive ISO time. A `lastRunMs` guard prevents a re-fire in
+  the window between firing and deletion. If the gateway was down when the
+  time passed, the job fires on the next tick after startup, then deletes.
 
 Validation runs at job-add and at scheduler-start. Bad expressions
 surface immediately; the scheduler still starts but bad jobs won't
-fire.
+fire. (A past `runAtMs` is NOT a validation error — a one-shot that came
+due while offline must still fire once on the next tick.)
 
 ## Modes
 

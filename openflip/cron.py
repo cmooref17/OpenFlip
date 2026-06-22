@@ -41,6 +41,9 @@ Schedule kinds:
 - "cron"      — standard cron expression. Required field: `expression`
                 (e.g. "0 9 * * 5" = Fridays 9 AM). Optional `timezone`
                 (IANA name, defaults to UTC). Backed by croniter.
+- "once"      — one-shot. Required field: `runAtMs` (absolute epoch ms).
+                Fires exactly once when that time has passed, then the job
+                is DELETED from jobs.json (never reschedules).
 
 The scheduler is intentionally conservative:
 - One pass every 5 seconds, no overlap (job runs serialized per agent).
@@ -131,6 +134,14 @@ def validate_job(job: dict, ident: str = "(job)") -> list[str]:
         seconds = schedule.get("seconds")
         if not isinstance(seconds, (int, float)) or seconds <= 0:
             errors.append(f"interval schedule needs `seconds` > 0 (got {seconds!r})")
+    elif kind == "once":
+        # One-shot absolute fire time in epoch ms. We deliberately do NOT
+        # reject a past `runAtMs` here: a one-shot whose time elapsed while
+        # the gateway was down must still validate so it fires on next tick
+        # (then auto-deletes). Only structural validity is checked.
+        run_at_ms = schedule.get("runAtMs")
+        if not isinstance(run_at_ms, (int, float)) or run_at_ms <= 0:
+            errors.append(f"once schedule needs `runAtMs` > 0 (got {run_at_ms!r})")
     elif kind == "cron":
         expression = (schedule.get("expression") or "").strip()
         if not expression:
@@ -226,11 +237,14 @@ def _in_quiet_hours(job: dict, now_ms: int) -> bool:
 def _due(job: dict, now_ms: int) -> bool:
     """Return True if this job is due to run right now.
 
-    Two schedule kinds:
+    Schedule kinds:
         "interval" — fires every N seconds. Field: `seconds`.
         "cron"     — standard cron expression. Field: `expression`
                      (e.g. "0 9 * * *"). Optional `timezone` (IANA name);
                      defaults to UTC. Uses croniter under the hood.
+        "once"     — one-shot. Field: `runAtMs` (absolute epoch ms). Due once
+                     its time has passed; never again (the job is deleted
+                     after firing — see `_tick`).
     """
     if not job.get("enabled", True):
         return False
@@ -252,6 +266,16 @@ def _due(job: dict, now_ms: int) -> bool:
             return False
         last = int(job.get("lastRunMs", 0) or 0)
         return (now_ms - last) >= seconds * 1000
+    if kind == "once":
+        run_at_ms = int(schedule.get("runAtMs", 0) or 0)
+        if run_at_ms <= 0:
+            return False
+        # One-shot: due once its absolute time has passed, never again. The
+        # lastRunMs guard prevents a re-fire in the window between firing and
+        # deletion (and as a safety net if deletion ever fails to persist).
+        if int(job.get("lastRunMs", 0) or 0) > 0:
+            return False
+        return now_ms >= run_at_ms
     if kind == "cron":
         expression = (schedule.get("expression") or "").strip()
         if not expression:
@@ -591,6 +615,33 @@ async def _tick() -> None:
                     error=True,
                 )
             await _fire(job)
+
+            # One-shot ("once") jobs auto-delete after firing — they never
+            # reschedule. Re-load fresh and drop this job by id, then save
+            # atomically (same lost-update guard as the lastRunMs persist
+            # above: load→mutate→save with no await in between). The lastRunMs
+            # stamp set before _fire means that even if this delete fails to
+            # persist, `_due` won't let the job re-fire.
+            if (job.get("schedule") or {}).get("kind") == "once":
+                try:
+                    fresh = _load_jobs()
+                    jid = job.get("id")
+                    before = fresh.get("jobs") or []
+                    fresh["jobs"] = [
+                        fj for fj in before if not (jid and fj.get("id") == jid)
+                    ]
+                    if len(fresh["jobs"]) != len(before):
+                        _save_jobs(fresh)
+                        print_ts(
+                            f"{COLOR_GREEN}cron: one-shot job "
+                            f"{jid or job.get('name', '?')} fired and deleted{COLOR_END}",
+                        )
+                except Exception as _del_err:
+                    print_ts(
+                        f"{COLOR_YELLOW}cron: failed to delete one-shot job "
+                        f"{job.get('id', '?')}: {_del_err}{COLOR_END}",
+                        error=True,
+                    )
 
 
 async def run_scheduler() -> None:
