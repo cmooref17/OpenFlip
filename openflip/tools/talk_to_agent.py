@@ -110,7 +110,7 @@ async def _resolve_recipient_operator_channel(
         recipient's own private_channels). DMs are per-bot, so the caller's DM
         never passes this check from the recipient's perspective.
       Priority 2: the recipient's own DM with the triggering operator — the
-        common case (Flip DMs each agent separately).
+        common case (the owner DMs each agent separately).
     """
     # Recipient must be a Discord agent with a live bot. Headless / non-Discord
     # targets have no shared operator channel to resolve here — `target.bot` is a
