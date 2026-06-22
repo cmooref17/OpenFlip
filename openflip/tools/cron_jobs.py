@@ -16,13 +16,16 @@ Job modes:
                       future use case where multiple data-collection runs
                       accumulate and a final summary fires as a reminder.
 
-Schedules accept either a cron expression ("0 9 * * 5" = Fridays 9 AM) OR
-an interval in seconds. Use cron expressions for "at a specific time" and
-intervals for "every N seconds/minutes/hours".
+Schedules accept exactly ONE of: a cron expression ("0 9 * * 5" = Fridays
+9 AM), an interval in seconds, or an absolute one-shot time (`run_at`). Use
+cron expressions for "at a specific recurring time", intervals for "every N
+seconds/minutes/hours", and `run_at` for a true run-once reminder that fires
+at a single absolute moment and then auto-deletes.
 """
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from typing import Optional
 
@@ -106,39 +109,84 @@ def _validate_cron_expression(expr: str) -> Optional[str]:
     return None
 
 
+def _parse_run_at(run_at: str, tz_name: str) -> tuple[Optional[int], Optional[str]]:
+    """Parse a one-shot `run_at` value into epoch milliseconds.
+
+    Accepts either an ISO 8601 datetime ("2026-06-22T14:30:00", with optional
+    timezone offset) OR a unix epoch SECONDS integer-as-string ("1782484200").
+    A naive ISO datetime (no tz info) is interpreted in `tz_name` (IANA) when
+    provided, else UTC — mirroring how cron expressions treat `timezone`.
+
+    Returns (epoch_ms, None) on success or (None, error_string) on failure.
+    """
+    import datetime as _dt
+    s = (run_at or "").strip()
+    if not s:
+        return None, "`run_at` is empty."
+    # Unix epoch seconds integer-as-string (optional leading sign).
+    if s.lstrip("+-").isdigit():
+        return int(s) * 1000, None
+    # ISO 8601.
+    try:
+        dt = _dt.datetime.fromisoformat(s)
+    except ValueError as e:
+        return None, f"`run_at` is not a valid ISO 8601 datetime or epoch seconds: {s!r} ({e})"
+    if dt.tzinfo is None:
+        tz = _dt.timezone.utc
+        if tz_name:
+            try:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo(tz_name)
+            except Exception as e:
+                return None, f"invalid timezone {tz_name!r}: {e}"
+        dt = dt.replace(tzinfo=tz)
+    return int(dt.timestamp() * 1000), None
+
+
 @tool
 async def add_cron_job(
     name: str,
     prompt: str,
     cron: str = "",
     every_seconds: int = 0,
+    run_at: str = "",
     mode: str = "reminder",
     timezone: str = "",
     channel_id: int = 0,
     session_id: str = "",
     tool_grants: list[str] = None,
 ) -> ToolResult:
-    """Schedule a recurring job for yourself (the current agent).
+    """Schedule a job for yourself (the current agent).
 
     Use this to create reminders ("remind me on Friday at 9am"), recurring
     research tasks, periodic checks — anything you want to fire on a
     schedule. The job runs as a synthetic turn for YOU, with `prompt` as the
     user message.
 
-    Exactly ONE of `cron` or `every_seconds` must be set:
+    Exactly ONE of `cron`, `every_seconds`, or `run_at` must be set:
       * `cron`: standard cron expression, e.g. "0 9 * * 5" (Fridays 9 AM),
-        "*/15 * * * *" (every 15 minutes), "0 6 * * *" (daily 6 AM).
-      * `every_seconds`: fixed interval in seconds. 3600 = hourly.
+        "*/15 * * * *" (every 15 minutes), "0 6 * * *" (daily 6 AM). Recurring.
+      * `every_seconds`: fixed interval in seconds. 3600 = hourly. Recurring.
+      * `run_at`: a single absolute time for a TRUE one-shot (run-once)
+        reminder. Fires exactly once at that moment, then auto-deletes — no
+        self-cancel hack needed. Accepts ISO 8601 ("2026-06-22T14:30:00",
+        optional tz offset) or unix epoch seconds as a string ("1782484200").
 
     Args:
         name: Short human label for the job.
         prompt: What you (the agent) will see as the user message when the
             job fires.
-        cron: A cron expression. Mutually exclusive with `every_seconds`.
-        every_seconds: Interval in seconds. Mutually exclusive with `cron`.
+        cron: A cron expression. Mutually exclusive with `every_seconds`/`run_at`.
+        every_seconds: Interval in seconds. Mutually exclusive with `cron`/`run_at`.
+        run_at: Absolute one-shot time (ISO 8601 or unix epoch seconds string).
+            Mutually exclusive with `cron`/`every_seconds`. Must be in the
+            future. The job fires once and then auto-deletes from jobs.json.
+            A naive ISO datetime (no tz) is interpreted in `timezone` if set,
+            else UTC.
         mode: "reminder" (default), "data_collection" (silent), or "mixed".
-        timezone: IANA timezone for cron expressions (e.g. "US/Eastern").
-            Defaults to UTC. Ignored for interval schedules.
+        timezone: IANA timezone for cron expressions (e.g. "US/Eastern") and
+            for naive `run_at` datetimes. Defaults to UTC. Ignored for
+            interval schedules.
         channel_id: Discord channel for reminder posts. Defaults to the
             current channel. Required for "reminder" and "mixed"; ignored
             for "data_collection". Legacy bare-int anchor — see `session_id`.
@@ -173,10 +221,17 @@ async def add_cron_job(
         return ToolResult.fail(f"`mode` must be one of {_VALID_MODES}; got {mode!r}.")
 
     cron_expr = (cron or "").strip()
-    if cron_expr and every_seconds:
-        return ToolResult.fail("Set EITHER `cron` OR `every_seconds`, not both.")
-    if not cron_expr and not every_seconds:
-        return ToolResult.fail("Set EITHER `cron` (expression) OR `every_seconds` (interval).")
+    run_at_str = (run_at or "").strip()
+    set_count = sum(bool(x) for x in (cron_expr, every_seconds, run_at_str))
+    if set_count == 0:
+        return ToolResult.fail(
+            "Set EXACTLY ONE of `cron` (expression), `every_seconds` (interval), "
+            "or `run_at` (one-shot absolute time)."
+        )
+    if set_count > 1:
+        return ToolResult.fail(
+            "Set EXACTLY ONE of `cron`, `every_seconds`, or `run_at` — not multiple."
+        )
 
     schedule: dict
     if cron_expr:
@@ -187,6 +242,13 @@ async def add_cron_job(
         tz = (timezone or "").strip()
         if tz:
             schedule["timezone"] = tz
+    elif run_at_str:
+        run_at_ms, err = _parse_run_at(run_at_str, (timezone or "").strip())
+        if err:
+            return ToolResult.fail(err)
+        if run_at_ms <= int(time.time() * 1000):
+            return ToolResult.fail("`run_at` must be in the future.")
+        schedule = {"kind": "once", "runAtMs": run_at_ms}
     else:
         if every_seconds <= 0:
             return ToolResult.fail("`every_seconds` must be a positive integer.")
@@ -252,11 +314,12 @@ async def add_cron_job(
     data.setdefault("jobs", []).append(job)
     _save_jobs(data)
 
-    sched_desc = (
-        f"cron {cron_expr!r}" + (f" ({timezone})" if timezone else "")
-        if cron_expr
-        else f"every {every_seconds}s"
-    )
+    if cron_expr:
+        sched_desc = f"cron {cron_expr!r}" + (f" ({timezone})" if timezone else "")
+    elif run_at_str:
+        sched_desc = f"once at {run_at_str}" + (f" ({timezone})" if timezone else "")
+    else:
+        sched_desc = f"every {every_seconds}s"
     return ToolResult(
         text=f"Scheduled '{name}' ({sched_desc}, mode={mode}). job_id={job_id}",
         model_feedback=f"Created cron job {job_id} — '{name}' ({sched_desc}, mode={mode}).",
@@ -305,6 +368,8 @@ async def list_cron_jobs(agent_id: str = "", include_all_agents: bool = False) -
                 sched_desc += f" ({tz})"
         elif sched.get("kind") == "interval":
             sched_desc = f"every {sched.get('seconds')}s"
+        elif sched.get("kind") == "once":
+            sched_desc = f"once @ {sched.get('runAtMs')}ms (one-shot)"
         else:
             sched_desc = "(unknown schedule)"
 
