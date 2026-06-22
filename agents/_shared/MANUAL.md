@@ -2014,7 +2014,7 @@ non-content errors and does NOT append them to conversation history
 
 # 14. Self-modification recipes
 
-> ⚠️ Add models/agents/tools/transports in their gitignored homes, never in tracked framework code — `git pull` overwrites tracked files. (Recipes below.)
+> ⚠️ Don't edit repo-tracked files — `git pull` overwrites them, so your changes won't survive updates.
 
 ## Give yourself / another agent a new tool
 
