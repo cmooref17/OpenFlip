@@ -461,6 +461,117 @@ _TRANSPORT_BUILDERS = {
     "internal": _build_null_transport,
     "external": _build_external_transport,
 }
+# ^^^ DO NOT add third-party transports here. This dict is git-tracked and
+# may be overwritten on `git pull` — any edit you make would be clobbered.
+# The supported extension point is the gitignored local plugin directory
+# discovered by _discover_local_transports() below (default: transports_local/
+# at the repo root, or $OPENFLIP_TRANSPORTS_DIR). See transports_local/README.md
+# and agents/_shared/MANUAL.md for the contract.
+
+
+def _local_transports_dir() -> str:
+    """Resolve the directory third-party transport plugins are loaded from.
+
+    Honors $OPENFLIP_TRANSPORTS_DIR (absolute or repo-root-relative) if set,
+    otherwise defaults to `transports_local/` at the repo root. This path lives
+    OUTSIDE the git-tracked tree (it's gitignored) so a `git pull` never
+    clobbers a third party's plugins.
+    """
+    override = os.environ.get("OPENFLIP_TRANSPORTS_DIR", "").strip()
+    if override:
+        return override if os.path.isabs(override) else os.path.join(project_root(), override)
+    return os.path.join(project_root(), "transports_local")
+
+
+def _discover_local_transports() -> dict:
+    """Import third-party transport plugins from the local plugin directory.
+
+    Each `.py` module there (files starting with `_` are skipped) must expose
+    the plugin contract:
+      - `TRANSPORT_NAME: str`   — the transport name agents reference in config.
+      - `build(agent) -> Transport | None` — builds the Transport for an agent.
+
+    Returns `{TRANSPORT_NAME: build}` for every valid plugin. Discovery is
+    crash-safe: a broken/throwing module is logged and skipped, never taking
+    down startup. Name collisions with built-ins are NOT applied here — the
+    caller (_get_transport_registry) lets built-ins win.
+    """
+    import importlib.util
+
+    found: dict = {}
+    plugin_dir = _local_transports_dir()
+    if not os.path.isdir(plugin_dir):
+        return found
+
+    for fname in sorted(os.listdir(plugin_dir)):
+        if not fname.endswith(".py") or fname.startswith("_"):
+            continue
+        fpath = os.path.join(plugin_dir, fname)
+        mod_name = f"openflip_local_transport_{fname[:-3]}"
+        try:
+            spec = importlib.util.spec_from_file_location(mod_name, fpath)
+            if spec is None or spec.loader is None:
+                print_ts(
+                    f"{COLOR_YELLOW}Transport plugin '{fname}': could not create "
+                    f"import spec; skipping.{COLOR_END}"
+                )
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            name = getattr(module, "TRANSPORT_NAME", None)
+            build = getattr(module, "build", None)
+            if not isinstance(name, str) or not name.strip():
+                print_ts(
+                    f"{COLOR_YELLOW}Transport plugin '{fname}': missing/invalid "
+                    f"module-level TRANSPORT_NAME (str); skipping.{COLOR_END}"
+                )
+                continue
+            if not callable(build):
+                print_ts(
+                    f"{COLOR_YELLOW}Transport plugin '{fname}': missing/invalid "
+                    f"module-level build(agent) callable; skipping.{COLOR_END}"
+                )
+                continue
+            found[name.strip()] = build
+            print_ts(
+                f"{COLOR_GREEN}Loaded transport plugin '{name.strip()}' from "
+                f"{fname}.{COLOR_END}"
+            )
+        except Exception as e:
+            print_ts(
+                f"{COLOR_YELLOW}Transport plugin '{fname}' failed to load: {e}; "
+                f"skipping.{COLOR_END}"
+            )
+            continue
+    return found
+
+
+_MERGED_TRANSPORT_REGISTRY: dict | None = None
+
+
+def _get_transport_registry() -> dict:
+    """Built-ins merged with discovered local plugins (cached after first call).
+
+    Built-ins always win on name collision: a third-party plugin may not
+    silently shadow 'discord'/'imessage'/'internal'/'external'. A collision is
+    logged and the built-in is kept.
+    """
+    global _MERGED_TRANSPORT_REGISTRY
+    if _MERGED_TRANSPORT_REGISTRY is not None:
+        return _MERGED_TRANSPORT_REGISTRY
+
+    merged = dict(_TRANSPORT_BUILDERS)
+    for name, build in _discover_local_transports().items():
+        if name in _TRANSPORT_BUILDERS:
+            print_ts(
+                f"{COLOR_YELLOW}Transport plugin tried to reuse built-in name "
+                f"'{name}'; ignoring the plugin and keeping the built-in.{COLOR_END}"
+            )
+            continue
+        merged[name] = build
+    _MERGED_TRANSPORT_REGISTRY = merged
+    return merged
 
 
 async def start_runner(agent: Agent) -> bool:
@@ -485,9 +596,12 @@ async def start_runner(agent: Agent) -> bool:
         getattr(agent, "transport", "discord") or "discord"
     ]
 
+    # Built-ins plus any third-party plugins discovered in the gitignored
+    # local plugin directory (see _get_transport_registry / transports_local/).
+    registry = _get_transport_registry()
     transport_objects = []
     for t_name in transport_names:
-        builder = _TRANSPORT_BUILDERS.get(t_name)
+        builder = registry.get(t_name)
         if builder is None:
             print_ts(
                 f"{COLOR_YELLOW}Unknown transport '{t_name}' for agent "
