@@ -2027,6 +2027,108 @@ non-content errors and does NOT append them to conversation history
    Or `/grant <tool> @user` for the owner-only-then-broaden path.
 4. Save the file. Hot reload picks it up on the next turn.
 
+## Add a new model
+
+1. Point the agent at it — in `agents/<id>/agent.json` set `"model"`
+   to the provider-prefixed id, e.g. `"anthropic/claude-opus-4-8"`
+   (append `-1m` for the 1M-context beta:
+   `"anthropic/claude-opus-4-8-1m"`), or `"openai/gpt-5.1"`. See
+   "Provider + model" above for the id conventions.
+2. Declare it in `config.json` under `models.<bare-id>` so the
+   framework knows its real context window. The key is the BARE id —
+   provider prefix stripped, but the `-1m` suffix **kept** (it's part
+   of the key):
+   ```json
+   "models": {
+     "claude-opus-4-8-1m": {
+       "context_window": 1000000,
+       "max_tokens": 64000,
+       "effort": "high",
+       "compaction_trigger": 950000
+     }
+   }
+   ```
+   - `context_window` (**required**) — the model's real token window;
+     drives compaction + defensive trimming. Absent/wrong and the
+     framework mis-sizes the window.
+   - `max_tokens` (optional, Anthropic only) — output-token cap per
+     request. Default 64000; valid range 1..128000 (anything outside
+     that, or non-int, silently falls back to 64000).
+   - `effort` (optional) — reasoning effort for this model (vocabulary
+     differs by provider/auth path — see "Provider + model").
+   - `compaction_trigger` (optional) — token count at which
+     server-side compaction fires; defaults to `context_window` minus
+     a reserve.
+3. Effect: the agent.json `model` change hot-reloads (next turn —
+   agent.json's mtime is checked per message and its bytes are in the
+   reload fingerprint). The config.json `models` block does **NOT**
+   hot-reload — config.json is read once at startup
+   (`config_global._config` is a singleton; `reload_config()` is never
+   called at runtime), so a new/edited `models.<id>` entry needs a
+   **gateway restart**.
+
+**Pull-safe:** `config.json` is gitignored, so your `models` entries
+survive `git pull`.
+
+## Add a new agent
+
+1. Create the directory `agents/<id>/` — `<id>` is the stable agent id
+   and must match the dir name.
+2. Add its files:
+   - `agent.json` — see "Example minimal agent.json" above for the
+     skeleton. (Create the dir without one and the framework
+     auto-generates a default `agent.json` + `SOUL.md` + `REMINDER.md`
+     stub on next startup — but authoring your own is the point.)
+   - `SOUL.md` — the character/personality prompt.
+3. Add the bot token to `config.json` under
+   `integrations.discord.tokens.<id>`:
+   ```json
+   "integrations": { "discord": { "tokens": {
+     "<id>": "<discord-bot-token>"
+   } } }
+   ```
+   Without a token the agent is discovered but its Discord transport
+   is skipped (it never connects).
+4. Restart the gateway. On startup the agent is discovered and
+   auto-added to `agent_state.json` with `enabled: true`, then spawned
+   — no manual flag flip needed. (To keep a discovered agent from
+   spawning, set its `agent_state.json` entry to `{"enabled": false}`
+   or use the owner disable slash command.)
+
+**Pull-safe:** personal agent dirs (`agents/*/`, except `_shared/` and
+`example_agent/`), `config.json`, and `agent_state.json` are all
+gitignored — a new agent survives `git pull`.
+
+## Add a new local tool
+
+1. Write a `.py` in `openflip/tools/` with a function decorated
+   `@tool` (imported from `openflip/tools/_base.py`), following the
+   shape of an existing tool — return a `ToolResult`; honor the tool
+   design rules + the path-redaction note above.
+2. It auto-loads. `openflip/tools/__init__.py` explicitly imports the
+   framework-core tools, then dynamically scans the tools dir and
+   imports every other `.py` (or package dir with `__init__.py`),
+   silently skipping any whose import fails. You do NOT edit any
+   import list for a local tool — the explicit list is only for
+   framework-core tools.
+3. Grant it: add the tool's registered name to an agent's
+   `allowed_tools` in `agent.json` (same as "Give yourself / another
+   agent a new tool" above).
+4. Restart the gateway to pick up the new file (the dynamic scan runs
+   once, at import time).
+
+**Pull-safe:** `.gitignore` ignores everything under
+`openflip/tools/` EXCEPT the `!`-listed framework-core files, so any
+non-core tool you drop there is gitignored and survives `git pull`.
+
+**Contrast — making a tool first-class (shipped to everyone):** that
+requires editing TWO tracked files — add a `!openflip/tools/<name>.py`
+un-ignore line to `.gitignore` AND add an explicit
+`from . import <name>` to the core block in
+`openflip/tools/__init__.py`. Both are version-controlled and CAN
+conflict on `git pull`, so for personal additions the local-tool path
+above is the recommended one.
+
 ## Hardening notes (audit 2026-06-07)
 
 A pass of small correctness/security hardening, all live:
