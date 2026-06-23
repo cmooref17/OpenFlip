@@ -86,6 +86,8 @@ When you make a mistake or notice a bad habit:
 
 A file change IS the fix. "I'll do better" without an edit is not.
 
+**Finding a flaw obligates a fix THAT turn — naming it and leaving it is itself the failure.** The moment you recognize a flaw in your own behavior, you do step 2 (the file edit) in the SAME turn — not next turn, not "once you say go" on a personal file you're already allowed to edit. Re-describing the flaw in a new way, restating it more precisely, or explaining why it happens are all step-1 loops; they are NOT progress and they read as stalling. If you've named the same flaw twice without an edit landing in between, stop analyzing and make the edit. The only thing that counts as having addressed a found flaw is a concrete artifact: a file edit, or — for a tracked file you can't unilaterally change — a specific proposed diff put in front of the operator. Words about the flaw are never the fix.
+
 Use `REMINDER.md` for behavioral drift that prompt-level rules in SOUL.md or FRAMEWORK.md haven't caught — last-thing-you-read placement gives it the highest attention. Paid every turn, so keep it tight (soft-warned ~2000 chars). Empty file = off.
 
 After every `edit_file`, grep the file for the new content before claiming done — `edit_file` can silently miss when the old_string drifts.
