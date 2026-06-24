@@ -311,11 +311,17 @@ async def _do_effort(runner, ch_id, arg, channel, transport, session_id) -> None
     # Bare `/effort` — report the current override + usage, change nothing.
     if not arg:
         current = getattr(conv, "effort_override", None)
-        shown = f"`{current}`" if current else "model default (no override)"
+        current_level = current if current else "default"
+        shown = "\n".join(
+            f"  • `{lvl}`" + ("  ← current" if lvl == current_level else "")
+            for lvl in _EFFORT_LEVELS
+        )
+        note = "" if current else " (model default — no override)"
         await _send(
             transport, session_id, channel,
-            f"Current effort for THIS conversation: {shown}.\n"
-            f"Usage: `/effort <{'|'.join(_EFFORT_LEVELS)}>`",
+            f"Current effort for THIS conversation: `{current_level}`{note}.\n"
+            f"Available levels:\n{shown}\n"
+            f"Usage: `/effort <level>` to set.",
         )
         return
     level = arg.split(None, 1)[0].lower()
@@ -355,18 +361,21 @@ async def _do_model(runner, arg, channel, transport, session_id) -> None:
     # model name still works as an explicit arg.
     if not arg:
         from .config_global import get_config
+        # agent.model carries the provider prefix ("anthropic/..."); config.json
+        # keys are bare. Compare/display bare so the "← current" marker matches.
+        bare_current = agent.model.split("/", 1)[-1] if "/" in agent.model else agent.model
         models = list((get_config().get("models") or {}).keys())
         if models:
             shown = "\n".join(
-                f"  • `{m}`" + ("  ← current" if m == agent.model else "")
+                f"  • `{m}`" + ("  ← current" if m == bare_current else "")
                 for m in models
             )
-            model_list = f"Available models (from config.json):\n{shown}"
+            model_list = f"Available models:\n{shown}"
         else:
-            model_list = "No models configured in config.json (any valid model name still works)."
+            model_list = "No models configured (any valid model name still works)."
         await _send(
             transport, session_id, channel,
-            f"Current model: `{agent.model}` (provider `{agent.provider}`).\n"
+            f"Current model: `{bare_current}` (provider `{agent.provider}`).\n"
             f"{model_list}\n"
             f"Usage: `/model <model-name>` to switch.",
         )
