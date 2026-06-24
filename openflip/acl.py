@@ -38,6 +38,7 @@ def evaluate_tools_for_speaker(
     channel_id: Optional[int] = None,
     handle: str = "",
     tool_grants: list[str] | None = None,
+    tool_allowlist: list[str] | None = None,
 ) -> list[ToolVisibility]:
     """Return the per-tool visibility for this speaker in this channel.
 
@@ -61,9 +62,33 @@ def evaluate_tools_for_speaker(
     only iterate names already grouped from `agent.allowed_tools`, a grant for
     a tool the agent was never configured with is silently ignored (it can't
     conjure a tool). It confers tool-call authorization ONLY — never owner/admin.
+
+    `tool_allowlist` is the RESTRICTIVE mirror of `tool_grants` (external
+    transport's per-token `allowed_tools`). It is applied LAST, as a hard
+    intersection on top of everything above (human ACL path AND any grants):
+        None      → no narrowing. Callability is exactly the ceiling above.
+        []        → narrows to nothing. No tool is callable (chat only).
+        [names…]  → a tool stays callable only if its name is also in this set;
+                    everything else is forced non-callable.
+    It can ONLY restrict — a name here that the ceiling already denied stays
+    denied (we never set callable from this path). A tool narrowed out is also
+    forced un-known, so the model is not even told it exists. This is the
+    least-privilege ceiling for the untrusted internet-facing transport: a
+    malformed allowlist arrives here pre-normalized to [] (deny-all), so this
+    function fails closed regardless of caller. See Session.tool_allowlist.
     """
     role_set = set(speaker_role_ids)
     grants = set(tool_grants or ())
+    # None = no narrowing; any list (incl. empty) = active intersection. Built
+    # defensively so non-iterable junk fails closed to deny-all rather than
+    # raising or silently disabling the narrowing.
+    if tool_allowlist is None:
+        allowlist: set[str] | None = None
+    else:
+        try:
+            allowlist = {str(t) for t in tool_allowlist}
+        except TypeError:
+            allowlist = set()  # junk → deny-all (fail closed)
     grouped: dict[str, list[ToolACL]] = {}
     for acl in agent.allowed_tools:
         grouped.setdefault(acl.name, []).append(acl)
@@ -89,6 +114,11 @@ def evaluate_tools_for_speaker(
         # hence known.
         known_when_denied = any(a.visibility_when_denied == "known" for a in acls)
         known = callable_ok or known_when_denied
+        # RESTRICTIVE intersection — applied last so it overrides grants too. A
+        # tool narrowed out is both non-callable AND hidden from the model.
+        if allowlist is not None and name not in allowlist:
+            callable_ok = False
+            known = False
         out.append(ToolVisibility(name=name, callable=callable_ok, known=known))
     return out
 

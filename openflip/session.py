@@ -45,6 +45,26 @@ class Session:
     # that tool callable for this session even if no auth block matches. Additive
     # only — it never overrides an exclude deny, and can't authorize a tool that
     # isn't present in the agent's allowed_tools at all.
+    tool_allowlist: Optional[list[str]] = None
+    # RESTRICTIVE intersection ceiling — the exact opposite of tool_grants.
+    # tool_grants WIDENS (adds callability); tool_allowlist NARROWS (removes it).
+    # Semantics (fail-closed, internet-facing — see ExternalTransport):
+    #   None          → no narrowing. The session gets its full per-transport ACL
+    #                   ceiling unchanged. This is the value for EVERY Discord /
+    #                   iMessage / cron / internal session — nothing changes for
+    #                   them.
+    #   [] (empty)    → narrows to NOTHING. No tools are callable (chat only).
+    #                   Meaningfully distinct from None: "present but empty" is a
+    #                   deliberate deny-all, not "unset".
+    #   ["a", "b"]    → the callable set becomes the INTERSECTION of the ACL
+    #                   ceiling and this list. A name here that the ceiling
+    #                   doesn't already allow is still blocked — the list can only
+    #                   restrict, never widen. It cannot conjure a tool the
+    #                   transport's auth block denies.
+    # Used by the `external` transport so an operator can issue a token that is
+    # narrower than the agent's `auth.external` ceiling (per-token least
+    # privilege). Threaded Session → build_visible_tools → evaluate_tools_for_
+    # speaker, parallel to tool_grants but applied as a ceiling, not a grant.
 
     @property
     def channel_id_int(self) -> int:
@@ -137,7 +157,12 @@ def make_discord_session(
     )
 
 
-def make_external_session(name: str, *, speaker_label: str = "") -> Session:
+def make_external_session(
+    name: str,
+    *,
+    speaker_label: str = "",
+    tool_allowlist: Optional[list[str]] = None,
+) -> Session:
     """Build a Session for an `external` transport turn.
 
     Mirrors `make_internal_session` (null.py): the conversation is keyed by a
@@ -161,6 +186,12 @@ def make_external_session(name: str, *, speaker_label: str = "") -> Session:
     `speaker_id` is only an internal keying value; `external` ACL auth is keyed
     by transport name, so a tool needs an explicit `auth.external` block to be
     callable here (fail-closed: Discord-only tool entries are invisible).
+
+    `tool_allowlist` (the token's optional `allowed_tools`) NARROWS the
+    `auth.external` ceiling for this turn — None = no narrowing (full ceiling),
+    [] = no tools, [names…] = intersection with the ceiling. See
+    Session.tool_allowlist for the full semantics. It can only restrict, never
+    grant, so it is always safe to thread from an untrusted token.
     """
     speaker_id = abs(hash(f"external:{name}")) % (2**31)
     return Session(
@@ -173,4 +204,5 @@ def make_external_session(name: str, *, speaker_label: str = "") -> Session:
         is_dm=True,
         display_name=speaker_label or f"external:{name}",
         handle="",
+        tool_allowlist=tool_allowlist,
     )

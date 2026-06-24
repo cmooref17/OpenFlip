@@ -1948,11 +1948,18 @@ class AgentRunner:
         # extracted regardless of transport so a granted synthetic turn works on
         # any transport. Additive allow-path only — see Session.tool_grants.
         _acl_tool_grants: list[str] = []
+        # Per-session RESTRICTIVE tool ceiling (external transport's per-token
+        # allowed_tools). None = no narrowing (every non-external session);
+        # [] or [names] = intersect the ACL ceiling down. Opposite direction to
+        # tool_grants — see Session.tool_allowlist. Default None so nothing but
+        # an explicitly-narrowed session is affected.
+        _acl_tool_allowlist: list[str] | None = None
         try:
             from .tool_executor import CURRENT_SESSION as _CS
             _ss = _CS.get(None)
             if _ss is not None:
                 _acl_tool_grants = list(getattr(_ss, "tool_grants", None) or [])
+                _acl_tool_allowlist = getattr(_ss, "tool_allowlist", None)
                 if _ss.transport == "imessage":
                     _acl_transport = "imessage"
                     _acl_speaker = _ss.display_name or ""
@@ -1972,6 +1979,7 @@ class AgentRunner:
             chain_root_operator=_chain_root_operator,
             handle=_acl_handle,
             tool_grants=_acl_tool_grants,
+            tool_allowlist=_acl_tool_allowlist,
         )
 
         # Pull conversation_id from the session if we have one — that's the
