@@ -36,6 +36,7 @@ _TEXT_COMMANDS = {
     "/effort",
     "/model",
     "/models",
+    "/dream",
     "/status",
     "/reload",
     "/restart",
@@ -159,6 +160,18 @@ async def handle_text_command(
             await _send(transport, session_id, channel, "Owner only.")
             return True
         await _do_model(runner, arg, channel, transport, session_id)
+        return True
+
+    if head == "/dream":
+        # Owner-only: text mirror of the Discord /dream slash command. Fires a
+        # memory-consolidation turn regardless of the agent's dream.enabled flag
+        # (that flag gates only auto-fire). Pass the Session (not a bare int) so
+        # it routes to THIS conversation on iMessage; a bare int would re-expand
+        # to imessage:<rowid> and miss the handle-keyed conversation.
+        if not is_owner(speaker_id, transport=tname, handle=handle):
+            await _send(transport, session_id, channel, "Owner only.")
+            return True
+        await _do_dream(runner, session if session is not None else ch_id, speaker_id, channel, transport, session_id)
         return True
 
     if head == "/status":
@@ -408,6 +421,38 @@ async def _do_model(runner, arg, channel, transport, session_id) -> None:
         f"✅ Model: `{old_model}` → `{new_model}`{prov_note} "
         f"(updated {n} live conversation(s)).",
     )
+
+
+async def _do_dream(runner, target, speaker_id, channel, transport, session_id) -> None:
+    # Text mirror of the Discord /dream slash command (commands.py dream_cmd).
+    # Manual dream fires REGARDLESS of the agent's dream.enabled flag (that flag
+    # gates only auto-fire). Fires a synthetic turn attributed to the owner so
+    # owner-bypass in acl makes the dream() tool callable even if it isn't in
+    # the agent's allowed_tools. `target` is the Session (preferred, routes
+    # correctly on iMessage) or a bare int channel id fallback.
+    prompt = (
+        "It's time to dream — consolidate your long-term memory now. "
+        "Call the dream() tool, then follow its 4-phase instructions: "
+        "distill durable facts, convert relative dates to absolute, prune "
+        "facts that were later contradicted, and write the cleaned-up "
+        "result back with update_core_memory()."
+    )
+    try:
+        await runner.run_synthetic_turn(
+            target,
+            prompt,
+            auto_post_final_text=True,  # post the consolidation summary back here
+            speaker_id=int(speaker_id) if speaker_id else 0,
+            originator_visibility="operator_channel",
+        )
+    except Exception as e:
+        print_ts(
+            f"{COLOR_YELLOW}/dream (text): failed to enqueue consolidation turn: {e}{COLOR_END}",
+            agent=runner.agent.id,
+        )
+        await _send(transport, session_id, channel, f"❌ Failed to start dream: {e}")
+        return
+    await _send(transport, session_id, channel, "💤 Dreaming — consolidating memory…")
 
 
 async def _do_status(runner, ch_id, channel, transport, session_id) -> None:
