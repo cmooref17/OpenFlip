@@ -1131,7 +1131,8 @@ at runtime, no restart/SIGHUP needed). Shape:
       "default_model": "anthropic/claude-opus-4-8",
       "allow_model_choice": false,
       "allowed_models": [],
-      "rate_limit": 20
+      "rate_limit": 20,
+      "allowed_tools": ["web_search", "generate_image"]
     }
   }
 }
@@ -1144,8 +1145,34 @@ name — every turn on this token lands in conversation `external:<session>`,
 never anything from the request body), `default_model` (**required**),
 `allow_model_choice` (bool, default false), `allowed_models` (list, only
 meaningful when `allow_model_choice` is true), `rate_limit` (req/min, default
-20). Missing/empty/unparseable token file → **every** request 401 (fail
-closed). Tokens are compared in constant time; a token <32 chars is ignored.
+20), `allowed_tools` (optional per-token tool ceiling — see below). Missing/
+empty/unparseable token file → **every** request 401 (fail closed). Tokens are
+compared in constant time; a token <32 chars is ignored.
+
+**Per-token `allowed_tools` (restrictive intersection).** Optional. When
+present it NARROWS the agent's `auth.external` ACL ceiling for this token — it
+is an **intersection**, never a grant. A token can only ever lose access this
+way; it can never gain a tool the agent's `auth.external` doesn't already allow.
+The three states are deliberately distinct:
+
+- **Key absent / `null`** → no narrowing. The token gets the full `auth.external`
+  ceiling, exactly as it did before this field existed. (This is why the
+  existing agent_b game token — which has no `allowed_tools` key — is
+  unaffected.)
+- **`"allowed_tools": []`** (present but empty) → **no tools** (chat only). An
+  empty list is a deliberate deny-all and is meaningfully different from the key
+  being absent.
+- **`"allowed_tools": ["web_search", "generate_image"]`** → the callable set
+  becomes the **intersection** of the `auth.external` ceiling and this list. A
+  name here that `auth.external` doesn't allow stays blocked (it cannot widen);
+  a ceiling tool not named here is dropped.
+
+Fail-closed: a malformed value (anything that isn't a list — a bare string,
+number, object) is treated as **deny-all** (`[]`), not as "no narrowing", so a
+typo can never silently fall open to the full ceiling. The narrowing gates both
+what the model is told exists AND what is actually callable (and it caps the
+auto-injected memory tools too), so a narrowed-out tool is fully invisible to
+that token's turns.
 
 **Request.** Header `Authorization: Bearer <token>`. Body JSON
 `{"message": <str, required>, "sender_label": <str, optional>, "model": <str, optional>}`.
@@ -2436,6 +2463,18 @@ override persists per-conversation in the `.meta.json` sidecar (key
 conversations that never touched `/effort`), so it survives restarts. It takes
 effect on the next real turn (no synthetic turn fired). Same model-gating
 caveat applies: don't set `xhigh`/`max` on a model that doesn't support it.
+
+Available as both the Discord slash command and a cross-transport text-prefix
+mirror (iMessage + any non-Discord transport), alongside `/reset`, `/compact`,
+`/uncompact`, `/model`, `/status`, `/reload`, `/restart`, `/help`. The text arg is
+optional: bare `/effort` shows the current override + usage; `/effort <level>`
+sets it. Owner-only and Anthropic-only on every transport.
+
+`/model` is also a cross-transport text-prefix mirror (the Discord slash `/model`
+opens an interactive panel that can't render off-Discord): bare `/model` shows the
+current model + provider + usage, `/model <model-name>` switches the agent's model
+(auto-inferring + flipping the provider, mirroring the slash panel's set+save).
+Owner-only on every transport.
 
 `/status` slash command shows runtime state.
 
