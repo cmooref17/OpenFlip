@@ -35,6 +35,7 @@ _TEXT_COMMANDS = {
     "/uncompact",
     "/effort",
     "/model",
+    "/models",
     "/status",
     "/reload",
     "/restart",
@@ -149,10 +150,11 @@ async def handle_text_command(
         await _do_effort(runner, conv_key, arg, channel, transport, session_id)
         return True
 
-    if head == "/model":
+    if head in ("/model", "/models"):
         # Owner-only: /model changes the agent's model (and provider) and
         # rewrites agent.json — the text mirror of the slash /model panel,
         # which is itself owner-gated. Same gating as /effort and /uncompact.
+        # `/models` is an alias — bare /model already lists the choices.
         if not is_owner(speaker_id, transport=tname, handle=handle):
             await _send(transport, session_id, channel, "Owner only.")
             return True
@@ -346,13 +348,26 @@ async def _do_model(runner, arg, channel, transport, session_id) -> None:
     # transport the same set+persist behavior in plain text. The set path mirrors
     # agent_ui._ModelPicker.callback step-for-step.
     agent = runner.agent
-    # Bare `/model` — report the current model + provider + usage, change
-    # nothing. Deliberately instant: NO live model-list fetch (the slash panel
-    # hits Ollama/Anthropic for choices; the text mirror must never block here).
+    # Bare `/model` — report the current model + the configured choices, change
+    # nothing. Deliberately instant: the choices come from config.json's
+    # `models` block (local, no blocking Ollama/Anthropic fetch like the slash
+    # panel does). config.json is the operator-curated set; any other valid
+    # model name still works as an explicit arg.
     if not arg:
+        from .config_global import get_config
+        models = list((get_config().get("models") or {}).keys())
+        if models:
+            shown = "\n".join(
+                f"  • `{m}`" + ("  ← current" if m == agent.model else "")
+                for m in models
+            )
+            model_list = f"Available models (from config.json):\n{shown}"
+        else:
+            model_list = "No models configured in config.json (any valid model name still works)."
         await _send(
             transport, session_id, channel,
             f"Current model: `{agent.model}` (provider `{agent.provider}`).\n"
+            f"{model_list}\n"
             f"Usage: `/model <model-name>` to switch.",
         )
         return
