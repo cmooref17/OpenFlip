@@ -33,6 +33,8 @@ _TEXT_COMMANDS = {
     "/reset",
     "/compact",
     "/uncompact",
+    "/effort",
+    "/model",
     "/status",
     "/reload",
     "/restart",
@@ -116,6 +118,26 @@ async def handle_text_command(
             await _send(transport, session_id, channel, "Owner only.")
             return True
         await _do_uncompact(runner, conv_key, channel, transport, session_id)
+        return True
+
+    if head == "/effort":
+        # Owner-only: /effort changes the Anthropic request body
+        # (output_config.effort), which affects reasoning depth + billing.
+        # Same gating as the slash effort_cmd and /uncompact above.
+        if not is_owner(speaker_id, transport=tname, handle=handle):
+            await _send(transport, session_id, channel, "Owner only.")
+            return True
+        await _do_effort(runner, conv_key, arg, channel, transport, session_id)
+        return True
+
+    if head == "/model":
+        # Owner-only: /model changes the agent's model (and provider) and
+        # rewrites agent.json — the text mirror of the slash /model panel,
+        # which is itself owner-gated. Same gating as /effort and /uncompact.
+        if not is_owner(speaker_id, transport=tname, handle=handle):
+            await _send(transport, session_id, channel, "Owner only.")
+            return True
+        await _do_model(runner, arg, channel, transport, session_id)
         return True
 
     if head == "/status":
@@ -249,6 +271,100 @@ async def _do_uncompact(runner, ch_id, channel, transport, session_id) -> None:
     runner.conversations.pop(ch_id, None)
     await _send(transport, session_id, channel,
                 f"↩️ Restored conversation from {os.path.basename(latest)}.")
+
+
+# Valid effort levels — mirror the slash effort_cmd SlashOption choices.
+_EFFORT_LEVELS = ["default", "low", "medium", "high", "xhigh", "max"]
+
+
+async def _do_effort(runner, ch_id, arg, channel, transport, session_id) -> None:
+    conv = runner.conversations.get(ch_id)
+    # Anthropic-only: only AnthropicConversation carries `effort_override`.
+    # Same shape as _do_compact's hasattr(force_compact_next) guard.
+    if conv is None or not hasattr(conv, "effort_override"):
+        await _send(
+            transport, session_id, channel,
+            "`/effort` is Anthropic-only and there's no active conversation in this channel.",
+        )
+        return
+    # Bare `/effort` — report the current override + usage, change nothing.
+    if not arg:
+        current = getattr(conv, "effort_override", None)
+        shown = f"`{current}`" if current else "model default (no override)"
+        await _send(
+            transport, session_id, channel,
+            f"Current effort for THIS conversation: {shown}.\n"
+            f"Usage: `/effort <{'|'.join(_EFFORT_LEVELS)}>`",
+        )
+        return
+    level = arg.split(None, 1)[0].lower()
+    if level not in _EFFORT_LEVELS:
+        await _send(
+            transport, session_id, channel,
+            f"⚠️ Invalid effort level `{level}`. Valid options: {', '.join(_EFFORT_LEVELS)}.",
+        )
+        return
+    if level == "default":
+        conv.effort_override = None
+        conv._save_meta()
+        await _send(
+            transport, session_id, channel,
+            "⚙️ Effort override cleared for THIS conversation — falling back to the model default.",
+        )
+        return
+    conv.effort_override = level
+    conv._save_meta()
+    await _send(
+        transport, session_id, channel,
+        f"⚙️ Effort for THIS conversation set to `{level}` (overrides the model default). "
+        f"Use `/effort default` to clear.",
+    )
+
+
+async def _do_model(runner, arg, channel, transport, session_id) -> None:
+    # Text mirror of the slash /model panel (agent_ui.open_model_panel). That
+    # panel renders dropdowns/buttons that only exist on Discord; this gives any
+    # transport the same set+persist behavior in plain text. The set path mirrors
+    # agent_ui._ModelPicker.callback step-for-step.
+    agent = runner.agent
+    # Bare `/model` — report the current model + provider + usage, change
+    # nothing. Deliberately instant: NO live model-list fetch (the slash panel
+    # hits Ollama/Anthropic for choices; the text mirror must never block here).
+    if not arg:
+        await _send(
+            transport, session_id, channel,
+            f"Current model: `{agent.model}` (provider `{agent.provider}`).\n"
+            f"Usage: `/model <model-name>` to switch.",
+        )
+        return
+    # First whitespace-delimited token only — same arg discipline as _do_effort.
+    new_model = arg.split(None, 1)[0].strip()
+    from .agent_ui import _provider_for_model, _propagate_model_to_live_conversations
+    if new_model == agent.model:
+        await _send(transport, session_id, channel, f"Model already set to `{new_model}`.")
+        return
+    # Auto-infer the provider from the name and flip it too — exactly as the
+    # panel does. When the provider changes, clear this agent's live
+    # conversations: Ollama / Anthropic / OpenAI histories aren't compatible.
+    old_model = agent.model
+    new_provider = _provider_for_model(new_model)
+    old_provider = agent.provider
+    agent.model = new_model
+    agent.provider = new_provider
+    if new_provider != old_provider:
+        runner.conversations.clear()
+    if not agent.save():
+        await _send(transport, session_id, channel, "❌ Failed to save agent JSON.")
+        return
+    # Push the new model into any surviving live Conversation objects so the
+    # next turn uses it (panel's final step).
+    n = _propagate_model_to_live_conversations(agent.id)
+    prov_note = f" (provider → `{new_provider}`)" if new_provider != old_provider else ""
+    await _send(
+        transport, session_id, channel,
+        f"✅ Model: `{old_model}` → `{new_model}`{prov_note} "
+        f"(updated {n} live conversation(s)).",
+    )
 
 
 async def _do_status(runner, ch_id, channel, transport, session_id) -> None:
