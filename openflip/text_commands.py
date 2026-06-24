@@ -101,6 +101,25 @@ async def handle_text_command(
     # checks (/help), which must never follow the link.
     conv_key = runner.conv_key_for_session(session, ch_id) if session is not None else runner.conv_key(ch_id)
 
+    # Preload the target conversation from disk before the _do_* handlers run.
+    # They look it up with a raw `runner.conversations.get(conv_key)`, which is
+    # None for a conversation that exists on disk but isn't loaded this
+    # process-run (e.g. right after a restart, or the first touch of a channel)
+    # — surfacing a false "no active conversation in this channel" for /effort,
+    # /compact, /uncompact, /status. get_conversation get-or-creates from disk
+    # under the SAME key conv_key resolves to, so the lookups below succeed.
+    _conv_id = (getattr(session, "conversation_id", "") or "") if session is not None else ""
+    if _conv_id:
+        try:
+            runner.get_conversation(ch_id, _conv_id)
+        except Exception as _preload_err:
+            print_ts(
+                f"{COLOR_YELLOW}text_commands: conversation preload failed "
+                f"({_preload_err}); a command may report no active conversation"
+                f"{COLOR_END}",
+                agent=runner.agent.id,
+            )
+
     # Transport-aware owner identity for the gated commands below.
     tname = getattr(session, "transport", "discord") or "discord"
     handle = getattr(session, "handle", "") or ""
