@@ -169,6 +169,7 @@ async def _process_one(path: str) -> None:
     channel_id = sentinel.get("channel_id")
     channel_transport = sentinel.get("channel_transport") or ""
     channel_is_dm = bool(sentinel.get("channel_is_dm"))
+    channel_handle = sentinel.get("channel_handle") or ""
     speaker_id = sentinel.get("speaker_id") or 0
     reason = sentinel.get("reason") or "Gateway restarted."
     continuation = sentinel.get("continuation") or None
@@ -361,29 +362,36 @@ async def _process_one(path: str) -> None:
             if getattr(_t, "name", "") == channel_transport:
                 announce_transport = _t
                 break
-    # Resolve the actual send target. A DM channel id can't be resolved by
-    # bare id from a cold cache right after restart — Discord's get_channel
-    # misses and fetch_channel can't fetch DMs, so transport.send() logs
-    # "channel <id> unresolved" and silently no-ops (and announce_ok below
-    # would still go True because send() swallows its own errors). For a DM we
-    # instead resolve through the recipient via the transport's existing
-    # resolve_session_for_user (create_dm is cache-independent). Transports
-    # without that method (iMessage/null) or non-DM channels keep using the
-    # channel id directly — iMessage's numeric chat id already routes fine.
+    # Resolve the actual send target — the captured channel id is often NOT
+    # usable after a restart, differently per transport:
+    #  - Discord DM: the id can't be resolved from a cold cache right after
+    #    restart (get_channel misses, fetch_channel can't fetch DMs), so
+    #    transport.send() logs "channel <id> unresolved" and silently no-ops.
+    #    Resolve through the recipient account via resolve_session_for_user
+    #    (create_dm is cache-independent).
+    #  - iMessage: the captured numeric chat-id is a chat.db rowid, which RESETS
+    #    across chat.db rebuilds — so `imsg send --chat-id <stale>` fails
+    #    ("target=1 / imsg rc=1", and the operator gets no restart message).
+    #    Address by the STABLE participant handle instead (imsg send --to). The
+    #    iMessage transport's send() routes a non-numeric target via --to.
     announce_target = session_id_str
-    if channel_is_dm and speaker_id:
-        _resolve_user = getattr(announce_transport, "resolve_session_for_user", None)
-        if _resolve_user is not None:
-            try:
-                _dm_session = await _resolve_user(int(speaker_id))
-                if _dm_session is not None:
-                    announce_target = str(getattr(_dm_session, "transport_id", session_id_str))
-            except Exception as _dm_err:
-                print_ts(
-                    f"{COLOR_YELLOW}restart-sentinel: DM resolve via user {speaker_id} "
-                    f"failed ({_dm_err}); falling back to channel id{COLOR_END}",
-                    agent=agent_id,
-                )
+    _resolve_user = (
+        getattr(announce_transport, "resolve_session_for_user", None)
+        if channel_is_dm else None
+    )
+    if _resolve_user is not None and speaker_id:
+        try:
+            _dm_session = await _resolve_user(int(speaker_id))
+            if _dm_session is not None:
+                announce_target = str(getattr(_dm_session, "transport_id", session_id_str))
+        except Exception as _dm_err:
+            print_ts(
+                f"{COLOR_YELLOW}restart-sentinel: DM resolve via user {speaker_id} "
+                f"failed ({_dm_err}); falling back to channel id{COLOR_END}",
+                agent=agent_id,
+            )
+    elif channel_handle:
+        announce_target = channel_handle
     try:
         await asyncio.wait_for(
             announce_transport.send(announce_target, announce),

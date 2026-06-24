@@ -258,6 +258,12 @@ async def restart_gateway(reason: str, continuation: str = "", force: bool = Fal
     # announcer resolves it via the recipient (create_dm) instead. Guild
     # channels resolve fine by id and don't need that path.
     channel_is_dm = bool(getattr(_restart_session, "is_dm", False))
+    # Participant handle (iMessage email/phone). It's the STABLE address for a
+    # 1:1 — the numeric chat-id (channel_id) resets across chat.db rebuilds, so
+    # the post-restart announce on iMessage must address by handle (imsg --to),
+    # not the captured chat-id which often no longer resolves (was the "target=1
+    # / imsg rc=1" failure). Empty for Discord (which resolves DMs by account).
+    channel_handle = getattr(_restart_session, "handle", "") or ""
 
     # Preflight: refuse if any other agent is mid-work, unless force=True.
     if not force:
@@ -352,6 +358,7 @@ async def restart_gateway(reason: str, continuation: str = "", force: bool = Fal
         "channel_id": channel_id,
         "channel_transport": channel_transport,
         "channel_is_dm": channel_is_dm,
+        "channel_handle": channel_handle,
         "speaker_id": speaker_id,
         "reason": reason,
         "continuation": continuation.strip() or None,

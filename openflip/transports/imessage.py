@@ -453,20 +453,32 @@ class IMessageTransport:
             self._reader_task.cancel()
             self._reader_task = None
 
+    @staticmethod
+    def _addr_args(session_id) -> list[str] | None:
+        """imsg addressing args for a target. A pure-digit value is a chat.db
+        rowid → `--chat-id`; anything else is a participant handle (email or
+        +phone) → `--to`. The handle is the STABLE identifier for a 1:1 chat:
+        chat rowids reset across chat.db rebuilds, so handle-addressing is what
+        makes sends survive a restart (the chat-id captured before the restart
+        may no longer resolve). Returns None for an empty/unusable target."""
+        s = str(session_id).strip()
+        if not s:
+            return None
+        return ["--chat-id", s] if s.isdigit() else ["--to", s]
+
     async def send(self, session_id: str, text: str) -> None:
-        """Send text to an iMessage chat via `imsg send --chat-id`."""
-        try:
-            chat_id = int(session_id)
-        except (ValueError, TypeError):
+        """Send text to an iMessage chat via `imsg send` (handle or chat-id)."""
+        addr = self._addr_args(session_id)
+        if addr is None:
             print_ts(
-                f"{COLOR_RED}IMessageTransport.send: non-numeric session_id {session_id!r}{COLOR_END}",
+                f"{COLOR_RED}IMessageTransport.send: empty session_id{COLOR_END}",
                 error=True,
             )
             return
         try:
             proc = await asyncio.create_subprocess_exec(
                 self.imsg_path, "send",
-                "--chat-id", str(chat_id),
+                *addr,
                 "--text", text,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -486,12 +498,11 @@ class IMessageTransport:
             print_ts(f"imsg send failed: {e}", error=True)
 
     async def send_file(self, session_id: str, path: str, content: str = "") -> None:
-        """Send a file attachment via `imsg send --chat-id --file`."""
-        try:
-            chat_id = int(session_id)
-        except (ValueError, TypeError):
+        """Send a file attachment via `imsg send --file` (handle or chat-id)."""
+        addr = self._addr_args(session_id)
+        if addr is None:
             return
-        args = [self.imsg_path, "send", "--chat-id", str(chat_id), "--file", path]
+        args = [self.imsg_path, "send", *addr, "--file", path]
         if content:
             args.extend(["--text", content])
         try:
