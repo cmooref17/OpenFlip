@@ -342,7 +342,7 @@ def should_respond(agent: Agent, inbound: InboundMessage, bot_user_id: int) -> b
 MEMORY_TOOL_NAMES = {"save_memory", "update_core_memory", "search_memory", "read_memory", "list_memory_files"}
 
 
-def build_visible_tools(agent: Agent, *, speaker_id, speaker_role_ids, channel_id, owner: bool = False, transport: str = "discord", chain_terminator_mode: bool = False, chain_root_operator: bool = True, handle: str = "", tool_grants: list[str] | None = None):
+def build_visible_tools(agent: Agent, *, speaker_id, speaker_role_ids, channel_id, owner: bool = False, transport: str = "discord", chain_terminator_mode: bool = False, chain_root_operator: bool = True, handle: str = "", tool_grants: list[str] | None = None, tool_allowlist: list[str] | None = None):
     """Return (callable_tool_funcs, system_extension_text, user_preamble_text).
 
     The split is for prompt caching:
@@ -365,6 +365,13 @@ def build_visible_tools(agent: Agent, *, speaker_id, speaker_role_ids, channel_i
     `tool_grants` is a per-session additive allow-path (cron/synthetic sessions
     with no human speaker). It is forwarded to `evaluate_tools_for_speaker` and
     only widens callability — it never weakens per-user ACL. See Session.tool_grants.
+
+    `tool_allowlist` is the RESTRICTIVE opposite (external transport's per-token
+    `allowed_tools`): None = no narrowing, [] = no tools, [names] = intersect the
+    ACL ceiling down to those names. It is forwarded to `evaluate_tools_for_
+    speaker` and can only narrow — it never widens. Because it gates the callable
+    set computed here, it controls BOTH what the model is told exists and what is
+    actually invocable. See Session.tool_allowlist.
     """
     visibility = evaluate_tools_for_speaker(
         agent,
@@ -374,6 +381,7 @@ def build_visible_tools(agent: Agent, *, speaker_id, speaker_role_ids, channel_i
         channel_id=channel_id,
         handle=handle,
         tool_grants=tool_grants,
+        tool_allowlist=tool_allowlist,
     )
     callable_funcs = []
     known_but_blocked = []
@@ -388,9 +396,18 @@ def build_visible_tools(agent: Agent, *, speaker_id, speaker_role_ids, channel_i
         elif v.known:
             known_but_blocked.append(tool)
     # Always inject memory tools when memory_enabled, even if not in allowed_tools.
+    # EXCEPT when a RESTRICTIVE tool_allowlist is active (external per-token
+    # ceiling): memory tools bypass the ACL ceiling, so without this gate a token
+    # scoped to `allowed_tools: []` (or a list that omits memory) would still get
+    # them injected — silently widening past the intersection. The allowlist must
+    # cap memory injection too, or "no tools / chat only" wouldn't hold. None =
+    # no narrowing → inject as before; a list (incl. []) → inject only named ones.
+    _mem_allow: set[str] | None = None if tool_allowlist is None else {str(t) for t in tool_allowlist}
     if agent.memory_enabled:
         for mname in MEMORY_TOOL_NAMES:
             if mname not in seen_names:
+                if _mem_allow is not None and mname not in _mem_allow:
+                    continue
                 mtool = TOOL_REGISTRY.get(mname)
                 if mtool:
                     callable_funcs.append(mtool.func)

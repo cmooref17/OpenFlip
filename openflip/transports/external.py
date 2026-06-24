@@ -7,10 +7,16 @@ response body. This transport is built for reach-out-from-the-internet use:
   - Binds 0.0.0.0 (the configured port is open / off-network reachable).
   - TLS with a self-signed cert auto-generated on first start (10-year life).
   - Per-token config in a gitignored token file: each bearer token pins the
-    agent, a FIXED session name, a default model, optional model-choice, and a
-    per-token rate limit. Tokens never choose their session — it is operator-
-    assigned, so a caller can only ever talk into the conversation the operator
-    bound their token to.
+    agent, a FIXED session name, a default model, optional model-choice, a
+    per-token rate limit, and an optional `allowed_tools` list. Tokens never
+    choose their session — it is operator-assigned, so a caller can only ever
+    talk into the conversation the operator bound their token to.
+  - `allowed_tools` (optional) is a RESTRICTIVE intersection on top of the
+    agent's `auth.external` ACL ceiling: key absent → full ceiling unchanged;
+    `[]` → no tools (chat only); `["a","b"]` → the ceiling INTERSECTED with that
+    list. It can only narrow, never widen — a token can't gain a tool the agent
+    doesn't already expose on `external`. Malformed (non-list) → deny-all (fail
+    closed). Threaded through Session.tool_allowlist → evaluate_tools_for_speaker.
 
 Endpoint:  POST /<agent_id>            (path agent_id must equal this agent)
 Auth:      Authorization: Bearer <token>
@@ -214,6 +220,38 @@ class ExternalTransport:
                 match = entry
         return match
 
+    def _normalize_allowed_tools(self, raw: Any, agent_id: str) -> Optional[list[str]]:
+        """Normalize a token's `allowed_tools` into the RESTRICTIVE ceiling value.
+
+        Returns the value to hand to Session.tool_allowlist:
+          - None  when the key is absent or explicitly null → NO narrowing. The
+            token keeps the full `auth.external` ceiling (legacy behavior).
+          - a list of strings when the key is a list → INTERSECT with the ceiling.
+            Non-string elements are dropped (shrinking the set, never growing it).
+            An empty list (whether authored `[]` or left empty after dropping
+            junk) is preserved as a deliberate deny-all (chat only).
+          - [] when the key is present but NOT a list (string/number/dict/junk)
+            → deny-all. Fail CLOSED: a malformed allowlist must never fall open
+            to the full ceiling on this internet-facing transport.
+
+        The distinction between "key absent" (None → full ceiling) and "key
+        present but empty/junk" ([] → no tools) is deliberate and load-bearing.
+        """
+        if raw is None:
+            return None  # key absent / null → no narrowing
+        if isinstance(raw, list):
+            return [t for t in raw if isinstance(t, str)]
+        # Present but not a list — junk. Fail closed to deny-all, and warn so a
+        # typo'd config (e.g. a bare string instead of a list) is debuggable
+        # instead of silently locking the token out of every tool.
+        print_ts(
+            f"{COLOR_YELLOW}ExternalTransport: token for {agent_id} has a "
+            f"non-list 'allowed_tools' ({type(raw).__name__}); treating as "
+            f"deny-all (no tools).{COLOR_END}",
+            agent=agent_id,
+        )
+        return []
+
     def _check_rate_limit(self, token_key: str, limit_per_min: int) -> bool:
         """Sliding-window rate limit. True if the request is allowed."""
         now = time.time()
@@ -332,7 +370,23 @@ class ExternalTransport:
             return web.json_response({"error": "server misconfigured"}, status=500)
         session_name = session_name.strip()
 
-        session = make_external_session(session_name, speaker_label=sender_label)
+        # Per-token tool ceiling (RESTRICTIVE intersection — see
+        # Session.tool_allowlist). This NARROWS the agent's `auth.external` ACL
+        # ceiling; it can never widen it. Fail-closed normalization, three cases:
+        #   - key ABSENT / null      → None  → no narrowing (full ceiling; this is
+        #                              the legacy behavior, so existing tokens
+        #                              without the key are unaffected).
+        #   - key present, a list    → [str items] (non-string junk dropped, which
+        #                              only ever shrinks the set = safer). May be
+        #                              [] (a deliberate deny-all = chat only).
+        #   - key present, NOT a list→ []    → deny-all. A malformed value must not
+        #                              fall open to the full ceiling on an
+        #                              internet-facing transport.
+        tool_allowlist = self._normalize_allowed_tools(entry.get("allowed_tools"), agent_id)
+
+        session = make_external_session(
+            session_name, speaker_label=sender_label, tool_allowlist=tool_allowlist,
+        )
         text = f"[{sender_label}]: {message}" if sender_label else message
 
         inbound = InboundMessage(
