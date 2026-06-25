@@ -538,7 +538,7 @@ nested object. `respond_to_bots`, `memory_enabled`, etc. are top-level.
 | `proactive.interval_minutes` | int | `30` | Tick interval (must be > 0). |
 | `proactive.quiet_hours` | object \| null | `null` | e.g. `{"start":"23:00","end":"08:00","timezone":"US/Mountain"}`. |
 | `proactive.channel_id` | int | `0` | Channel the tick anchors / posts to. |
-| `allowed_read_paths` | list[string] OR dict | agent's own dir | Dirs the agent may read. `["*"]` = unrestricted. Dict form is transport-keyed (`{"discord": {"users", "all_users"}}`), mirroring tool `auth` = per-user scope — see "Per-user path scope". |
+| `allowed_read_paths` | list[string] OR dict | agent's own dir | Dirs the agent may read. `["*"]` = unrestricted. Dict form is transport-keyed (`{"discord": {"users", "all_users"}}`), mirroring tool `auth` = per-user scope — see "Per-user path scope". ⚠️ A transport with no block gets ZERO scopes (silent deny) — incl. CRON turns, which resolve under their target session's transport (often `cron`); see the cron silent-deny trap note in the cron section. |
 | `allowed_write_paths` | list[string] OR dict | agent's own dir | Dirs the agent may write. `["*"]` = unrestricted. Dict form = transport-keyed per-user scope. |
 | `denied_paths` | list[string] | `[]` | Always blocked; wins over allow lists; checked first; flat list only (no per-user form). |
 | `agent_specific_commands` | list[string] | `[]` | Slash commands registered only on this agent's bot. |
@@ -776,6 +776,17 @@ entry before invocation. The owner ID is always allowed on Discord (see
   (`speaker_id=0`), so a tool gated to specific human users would
   normally fail; grant it here instead. See "Per-session tool grants"
   under the auth section below for the exact semantics and limits.
+  **Cron turns + dict path scopes (silent-deny trap).** A cron turn runs under
+  the transport its TARGET session resolves to — `cron` for a `cron:<job-name>`
+  sessionId, but `internal`/`imessage`/etc. if the job targets one of those. If
+  the agent uses the DICT (per-transport) form of `allowed_read_paths` /
+  `allowed_write_paths`, that dict MUST contain a block for whatever transport
+  the job resolves to — otherwise the turn gets ZERO path scopes and every file
+  read/write is denied, silently (the job can't read its inputs and just fails
+  with no obvious error). Fix: add the matching transport block (commonly
+  `cron`, mirroring your `internal` block). FLAT-LIST path configs are
+  unaffected — they apply to all transports. See the `allowed_read_paths` row in
+  the agent.json table for the dict shape.
 - **`list_cron_jobs(agent_id="", include_all_agents=False)`** —
   defaults to your own jobs.
 - **`cancel_cron_job(job_id: str)`** — delete the job. No archive.
