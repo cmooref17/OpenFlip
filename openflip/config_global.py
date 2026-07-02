@@ -1,7 +1,7 @@
 """Global config singleton, loaded once at startup. Tools and runtime read it via get_config()."""
 from __future__ import annotations
 import os
-from .utils import load_json
+from .utils import load_json, print_ts
 
 _config: dict = {}
 
@@ -93,19 +93,27 @@ def get_admin_ids(integration: str = "discord") -> list[int]:
 
 # ── Cross-transport identity links ──
 #
-# Top-level `identity_links` in config.json maps a per-transport identity to a
-# canonical id so one person's 1:1 conversations on different transports share
-# ONE conversation history:
+# Top-level `identity_links` in config.json is ANCHOR-based: it maps a
+# SECONDARY identity ("<transport>:<native_id>") to a PRIMARY conversation_id
+# (a real existing session key). The secondary's 1:1 session then FORWARDS
+# INTO the primary and reuses its history. The primary keeps its own native
+# session, untouched.
 #
 #   "identity_links": {
-#     "discord:139243578504249344": "flip",
-#     "imessage:+15551234567": "flip"
+#     "discord:139243578564971520": "imessage:+15551234567"
 #   }
 #
-# Keys are "<transport>:<native_id>" (Discord: numeric user id; iMessage: the
-# raw handle). Values are an arbitrary canonical string. A linked speaker's
-# 1:1 sessions get conversation_id "linked:<canonical>" instead of the
-# transport-native id (see make_discord_session / make_imessage_session).
+# means: this Discord user's DM forwards into the imessage:+15551234567
+# session (iMessage is the primary/anchor; Discord is the secondary). Flip it
+# to make Discord the primary. Whichever conversation_id is the VALUE is the
+# home; the KEY forwards into it. The primary is NEVER itself a key.
+#
+# Guards (get_identity_links, warn+skip): single-hop only (a primary can't
+# also be a secondary), and no identity is both a key and a value. Legacy
+# "linked:<canonical>" configs are auto-migrated at load (one identity picked
+# as primary, others forward into it) — there is no "linked:" prefix anymore.
+# The forwarded conversation_id IS the primary's real key (see
+# resolve_linked_conversation_id + is_forwarded_conversation).
 #
 # SECURITY: links rewrite conversation ROUTING ONLY (which history file +
 # in-memory conversation a session resolves to). They confer NO privilege:
@@ -113,8 +121,6 @@ def get_admin_ids(integration: str = "discord") -> list[int]:
 # native handle/id (_acl_transport/_acl_speaker/_acl_handle in _run_turn) and
 # never consult identity_links. Being owner on Discord does not make the
 # linked iMessage handle owner, and vice versa.
-
-LINKED_CONV_PREFIX = "linked:"
 
 
 def get_identity_links() -> dict[str, str]:
@@ -128,18 +134,87 @@ def get_identity_links() -> dict[str, str]:
     raw = cfg.get("identity_links")
     if not isinstance(raw, dict):
         return {}
-    links: dict[str, str] = {}
+
+    # Pass 1: normalize + drop malformed entries.
+    norm: dict[str, str] = {}
     for k, v in raw.items():
         key = str(k).strip().lower()
         val = str(v).strip()
         if ":" not in key or not key.split(":", 1)[1] or not val:
             continue
-        links[key] = val
+        norm[key] = val
+
+    # Legacy migration: the OLD scheme mapped every identity -> an arbitrary
+    # canonical string (a value with NO "transport:" prefix). The new scheme
+    # maps a SECONDARY "transport:id" -> a PRIMARY "transport:id" conversation
+    # key. Detect old-shape entries (value has no transport-prefix colon) and
+    # migrate: group identities by their shared canonical, pick ONE primary
+    # (prefer an imessage identity, else the first), rewrite the others to
+    # forward into that primary's native session key. Log what changed.
+    def _looks_like_native_key(s: str) -> bool:
+        # A real conversation key is "<transport>:<native>" with a known-ish
+        # transport prefix. Treat any value containing ':' as a native key.
+        return ":" in s
+
+    old_shape = {k: v for k, v in norm.items() if not _looks_like_native_key(v)}
+    if old_shape:
+        from collections import defaultdict
+        groups: dict[str, list[str]] = defaultdict(list)
+        for k, canon in old_shape.items():
+            groups[canon].append(k)
+        migrated: dict[str, str] = {}
+        for canon, members in groups.items():
+            # primary = an imessage identity if present, else first member
+            primary = next((m for m in members if m.startswith("imessage:")), members[0])
+            for m in members:
+                if m != primary:
+                    migrated[m] = primary  # secondary -> primary native key
+            print_ts(
+                f"identity_links: migrated legacy canonical '{canon}' "
+                f"({len(members)} identities) → primary '{primary}', "
+                f"secondaries forward into it",
+                error=False,
+            )
+        # keep any already-new-shape entries, add migrated ones, drop old raw
+        norm = {k: v for k, v in norm.items() if _looks_like_native_key(v)}
+        norm.update(migrated)
+
+    # Guard 1 (no-cycle / single-hop) + Guard 2 (primary-never-secondary):
+    # a valid map has KEYS (secondaries) disjoint from VALUES (primaries).
+    # If an entry's key is also used as a value, OR its value is also a key,
+    # that entry would chain — skip it and warn. Resolution stays single-hop.
+    keys = set(norm.keys())
+    values = set(norm.values())
+    links: dict[str, str] = {}
+    for k, v in norm.items():
+        if v in keys:
+            print_ts(
+                f"identity_links: SKIP '{k}' → '{v}' — the primary '{v}' is "
+                f"also a secondary (chaining not allowed; links are single-hop)",
+                error=True,
+            )
+            continue
+        if k in values:
+            print_ts(
+                f"identity_links: SKIP '{k}' → '{v}' — '{k}' is also used as a "
+                f"primary elsewhere (an identity cannot be both primary and secondary)",
+                error=True,
+            )
+            continue
+        links[k] = v
     return links
 
 
 def resolve_linked_conversation_id(transport: str, native_id) -> str:
-    """Return "linked:<canonical>" if "<transport>:<native_id>" is linked, else "".
+    """Return the PRIMARY conversation_id this identity forwards INTO, else "".
+
+    Anchor-based linking: `identity_links` maps a SECONDARY identity
+    ("<transport>:<native_id>") to a PRIMARY conversation_id (a real existing
+    session key like "imessage:+15551234567"). When the given transport+native
+    identity is a secondary, this returns that primary conversation_id so the
+    secondary's 1:1 session forwards into — and reuses the history of — the
+    primary. The primary identity is never itself a key, so it resolves to ""
+    here and keys by its own native session, history untouched.
 
     `native_id` is the transport-native speaker identity: the int user id for
     Discord, the raw handle string for iMessage. Lookup is case-folded to
@@ -151,8 +226,33 @@ def resolve_linked_conversation_id(transport: str, native_id) -> str:
     if not links:
         return ""
     key = f"{transport}:{native_id}".strip().lower()
-    canonical = links.get(key, "")
-    return f"{LINKED_CONV_PREFIX}{canonical}" if canonical else ""
+    return links.get(key, "")
+
+
+def is_forwarded_conversation(conv_id, native_key) -> bool:
+    """True when conv_id is a forwarded (identity-linked) key, not the native.
+
+    A secondary identity's conversation_id is rewritten to the PRIMARY's
+    session key (e.g. "imessage:+1555" while this session's own native key is
+    "discord:12345"). In that case the in-memory conversation dict must key by
+    conv_id (the shared primary key) so both transports share ONE live
+    conversation object and never double-write the same history file.
+
+    `native_key` MUST be the session's own FULL "transport:id" key (e.g.
+    "discord:12345", "imessage:+1555") — the same shape as conv_id. Callers
+    thread this canonically; never pass a bare native id (that would be
+    transport-blind and can't distinguish "discord:12345" from a forward into
+    "imessage:12345"). A normal, unlinked conversation has conv_id == native_key.
+
+    Returns True iff conv_id is a non-empty string that differs from native_key
+    — i.e. it points at some OTHER session (the linked primary).
+    """
+    if not isinstance(conv_id, str) or not conv_id:
+        return False
+    nk = str(native_key) if native_key is not None else ""
+    if not nk:
+        return False
+    return conv_id != nk
 
 
 # ── Handle-based identity accessors (iMessage, future SMS/email) ──

@@ -764,6 +764,18 @@ def _openflip_msgs_to_anthropic(messages: list, system_prompt: str) -> tuple[str
 
         if role == "assistant":
             tool_calls = _msg_tool_calls(m)
+            # Claude Code parity (normalizeMessage / isNotEmptyMessage): an
+            # assistant message with NO tool_calls and empty/whitespace content
+            # is a "(no content)" artifact — a prior empty end_turn that got
+            # persisted. Anthropic rejects empty assistant content, and it
+            # trips our own empty_assistant_content validator every turn,
+            # eventually failing the terminal contract and silencing the agent.
+            # Skip it entirely so it never reaches the API. (Messages WITH
+            # tool_calls always build non-empty tool_use blocks, so this only
+            # drops genuinely-empty text turns.)
+            if not tool_calls and not (content or "").strip():
+                i += 1
+                continue
             if tool_calls:
                 # Try to gather matched tool results from the immediately
                 # following tool messages. Each tool message must have a

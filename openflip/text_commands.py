@@ -98,7 +98,7 @@ async def handle_text_command(
     ch_id = int(getattr(channel, "id", 0) or 0)
     # Conversation key for the dicts (conversations/_pending_inject): the
     # native int unless the session is identity-linked, in which case the
-    # shared "linked:<canonical>" key. ch_id itself stays native — it backs
+    # shared forwarded primary conversation_id key. ch_id itself stays native — it backs
     # reply routing (CURRENT_CHANNEL_ID in /restart) and channel-scoped ACL
     # checks (/help), which must never follow the link.
     conv_key = runner.conv_key_for_session(session, ch_id) if session is not None else runner.conv_key(ch_id)
@@ -213,9 +213,11 @@ def _conversation_id_for_channel(channel: Any, ch_id: int) -> str:
     fall back to assuming "discord:" — that breaks iMessage and any other
     non-Discord transport (a real bug I shipped on first cut).
     """
-    # Linked conversations: the dict key IS the conversation id
-    # ("linked:<canonical>") — no session lookup needed.
-    if isinstance(ch_id, str) and ch_id.startswith("linked:"):
+    # Identity-linked (forwarded) conversations key the dict by the PRIMARY
+    # conversation_id STRING (e.g. "imessage:+1555"); normal conversations key
+    # by the native int. So if ch_id is already a string, it IS the
+    # conversation id — no session lookup needed.
+    if isinstance(ch_id, str) and ch_id:
         return ch_id
     try:
         # TransportChannel/_SessionChannel expose `_session`; accept a plain

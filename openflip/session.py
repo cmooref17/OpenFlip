@@ -130,7 +130,7 @@ def make_discord_session(
 
     Identity links: if this is a DM and the speaker is in config.json's
     `identity_links` ("discord:<user_id>" → canonical), conversation_id is
-    rewritten to "linked:<canonical>" so the conversation history is shared
+    rewritten to the forwarded primary conversation_id (e.g. "imessage:+1555") so the conversation history is shared
     with the same person's linked sessions on other transports. DM-only:
     guild channels are a shared space keyed by channel, not by speaker —
     rewriting them would split one channel's history across speakers.

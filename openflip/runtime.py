@@ -221,7 +221,7 @@ class AgentRunner:
         self._transport_tasks: list[asyncio.Task] = []
         # Keyed by "conversation key": the int transport-native channel id for
         # normal conversations (unchanged legacy behavior), or the canonical
-        # "linked:<canonical>" conversation_id STRING for identity-linked
+        # the forwarded primary conversation_id (e.g. "imessage:+1555") for identity-linked
         # conversations — so a linked person's Discord DM and iMessage chat
         # resolve to ONE live conversation object instead of two objects
         # fighting over the same JSONL. See conv_key_for_session().
@@ -276,7 +276,7 @@ class AgentRunner:
         # next chat() call. Wiped on hard interrupt and on /reset.
         self._pending_inject: dict[int | str, list[str]] = {}
         # Native channel id → linked conversation key. Populated whenever a
-        # session whose conversation_id is "linked:<canonical>" passes through
+        # session whose conversation_id is the forwarded primary conversation_id (e.g. "imessage:+1555") passes through
         # inbound handling / get_conversation, so consumers that only have a
         # transport-native int id (slash commands, tools holding
         # CURRENT_CHANNEL_ID) can resolve the shared key via conv_key().
@@ -289,7 +289,7 @@ class AgentRunner:
         # so a turn that was already mid-flight when /reset fired cannot
         # resurrect the just-deleted history by re-appending its now-stale
         # in-memory messages. Keyed by conv_key (int channel id, or
-        # "linked:<canonical>") — never crosses channels. Grows by one int per
+        # the forwarded primary conversation_id (e.g. "imessage:+1555")) — never crosses channels. Grows by one int per
         # channel that's ever been reset; negligible.
         self._conv_epochs: dict[int | str, int] = {}
         # Timestamp (ms since epoch) of the most recent INBOUND human
@@ -373,7 +373,7 @@ class AgentRunner:
     # The three per-conversation dicts (conversations / _active_turns /
     # _pending_inject) are keyed by "conversation key": the transport-native
     # int channel id for normal conversations (byte-identical to the pre-link
-    # behavior), or the "linked:<canonical>" conversation_id string for
+    # behavior), or the forwarded primary conversation_id (e.g. "imessage:+1555") for
     # identity-linked conversations, so every transport a linked person uses
     # resolves to the SAME live conversation object, active-turn slot, and
     # soft-inject buffer. ROUTING/AUTH NOTE: keys govern conversation state
@@ -384,13 +384,20 @@ class AgentRunner:
     def conv_key_for_session(self, session, native_channel_id: int) -> int | str:
         """Conversation-dict key for a session.
 
-        Linked sessions (conversation_id "linked:...") key by that string —
+        Identity-linked (forwarded) sessions key by their PRIMARY
+        conversation_id string (a real session key like "imessage:+1555") —
         and the native id → key alias is recorded so raw-int consumers can
         resolve it later via conv_key(). Everything else keys by the native
         int channel id, exactly as before identity links existed.
         """
+        from .config_global import is_forwarded_conversation
         conv_id = getattr(session, "conversation_id", "") or "" if session is not None else ""
-        if isinstance(conv_id, str) and conv_id.startswith("linked:"):
+        # This session's OWN native "transport:id" key — a normal (unlinked)
+        # conversation has conv_id == this, so is_forwarded returns False.
+        _tr = getattr(session, "transport", "") if session is not None else ""
+        _tid = getattr(session, "transport_id", "") if session is not None else ""
+        native_key = f"{_tr}:{_tid}" if _tr else ""
+        if is_forwarded_conversation(conv_id, native_key):
             if native_channel_id:
                 self._linked_channel_keys[int(native_channel_id)] = conv_id
             return conv_id
@@ -452,28 +459,36 @@ class AgentRunner:
                     key = linked
         return key
 
-    def get_conversation(self, channel_id: int | str, conversation_id: str) -> DiscordConversation | AnthropicConversation | OpenAIConversation:
+    def get_conversation(self, channel_id: int | str, conversation_id: str, native_key: str = "") -> DiscordConversation | AnthropicConversation | OpenAIConversation:
         """Get-or-create the conversation for this channel.
 
         `conversation_id` must be the full transport-prefixed id from the
-        Session object (e.g. "discord:<id>", "imessage:<chat_id>",
-        "linked:<canonical>"). No fallback — callers must thread the real
-        value through from the session. Hardcoding a default here was the bug
-        that produced cross-transport collisions and `discord:` filenames for
-        iMessage conversations.
+        Session object (e.g. "discord:<id>", "imessage:<chat_id>"), OR — for an
+        identity-linked (forwarded) session — the PRIMARY conversation_id it
+        forwards into. No fallback — callers must thread the real value through
+        from the session. Hardcoding a default here was the bug that produced
+        cross-transport collisions and `discord:` filenames for iMessage
+        conversations.
 
         In-memory dict key: the int channel_id for normal conversations (fast
-        lookup, unchanged), or `conversation_id` itself when it is a linked id
-        — so two transports sharing a linked conversation get ONE live object.
-        The on-disk filename is always governed by `conversation_id`.
+        lookup, unchanged), or `conversation_id` itself when it is a forwarded
+        (identity-linked) key — so two transports sharing a primary session get
+        ONE live object. The on-disk filename is always governed by
+        `conversation_id`.
         """
+        from .config_global import is_forwarded_conversation
         if not conversation_id:
             raise ValueError(
                 f"get_conversation requires conversation_id (channel_id={channel_id}). "
                 f"Pass session.conversation_id from the inbound message."
             )
         key: int | str = channel_id
-        if conversation_id.startswith("linked:"):
+        # native_key = this session's own FULL "transport:id" key (threaded by
+        # the caller). If not provided, fall back to conversation_id itself so
+        # is_forwarded is False (treats it as this channel's own session — the
+        # safe default that keys by the native int, never mis-forwards).
+        _nk = native_key or conversation_id
+        if is_forwarded_conversation(conversation_id, _nk):
             key = conversation_id
             try:
                 _native = int(channel_id)
@@ -496,7 +511,7 @@ class AgentRunner:
         """Hard-interrupt the active turn (if any) for `channel_id`.
 
         `channel_id` is a conversation key — int for normal conversations,
-        "linked:<canonical>" for identity-linked ones (see conv_key).
+        the forwarded primary conversation_id (e.g. "imessage:+1555") for identity-linked ones (see conv_key).
 
         Cancels the in-flight `_run_turn` task and clears the channel's
         pending soft-inject buffer. Transport-agnostic — called by both:
@@ -532,7 +547,7 @@ class AgentRunner:
         """Remove not-yet-dispatched queued turns for `channel_id` from the
         inbound queue.
 
-        `channel_id` is a conversation key (int or "linked:<canonical>" — see
+        `channel_id` is a conversation key (int or the forwarded primary conversation_id (e.g. "imessage:+1555") — see
         conv_key). Pairs with `_hard_interrupt`: that cancels the ACTIVE turn,
         this removes turns still sitting in `_inbound_queue` that haven't been
         dispatched yet — synthetic turns from cron/talk_to_agent (which enqueue
@@ -678,7 +693,7 @@ class AgentRunner:
 
     def _drain_pending_injects(self, channel_id: int | str, conv) -> int:
         """Soft-inject drain. `channel_id` is a conversation key (int or
-        "linked:<canonical>" — see conv_key). Pops everything in _pending_inject[channel_id]
+        the forwarded primary conversation_id (e.g. "imessage:+1555") — see conv_key). Pops everything in _pending_inject[channel_id]
         and appends each message as a user-role [FRAMEWORK] marker on the
         conversation so the model sees it at its next chat() call.
 
@@ -1998,16 +2013,36 @@ class AgentRunner:
                     _conv_id = getattr(_ss, "conversation_id", "") or ""
             except Exception:
                 pass
-        conv = self.get_conversation(channel.id, conversation_id=_conv_id)
+        from .config_global import is_forwarded_conversation as _is_fwd
+        _native_ch = int(getattr(channel, "id", 0) or 0)
+        # Build this session's OWN full "transport:id" native key so the
+        # forwarded-check is transport-aware (never a bare-id guess).
+        # Pull session from inbound OR the CURRENT_SESSION fallback — the SAME
+        # source _conv_id came from above — so on synthetic turns (cron /
+        # restart-continuation / chain-terminator, where inbound.session is
+        # None) native and conv_id don't disagree on shape.
+        _sess = getattr(inbound, "session", None) if inbound is not None else None
+        if _sess is None:
+            try:
+                from .tool_executor import CURRENT_SESSION as _CS2
+                _sess = _CS2.get(None)
+            except Exception:
+                _sess = None
+        _tr = getattr(_sess, "transport", "") if _sess is not None else ""
+        _tid = getattr(_sess, "transport_id", "") if _sess is not None else ""
+        # Fallback mirrors get_conversation's: when no session at all, default
+        # native to _conv_id itself so is_forwarded is False (safe — keys native).
+        _native_full = f"{_tr}:{_tid}" if _tr else (_conv_id or str(_native_ch))
+        conv = self.get_conversation(channel.id, conversation_id=_conv_id, native_key=_native_full)
         # Conversation key for every _pending_inject/_active_turns access in
-        # this turn. For identity-linked conversations this is the
-        # "linked:<canonical>" string (shared across transports); otherwise
+        # this turn. For identity-linked (forwarded) conversations this is the
+        # PRIMARY conversation_id string (shared across transports); otherwise
         # the native int channel.id, exactly as before. CURRENT_CHANNEL_ID
         # (set above) deliberately stays the NATIVE id — it routes replies
         # and tool I/O to the originating transport, never to the link.
         _conv_key: int | str = (
-            _conv_id if _conv_id.startswith("linked:")
-            else int(getattr(channel, "id", 0) or 0)
+            _conv_id if _is_fwd(_conv_id, _native_full)
+            else _native_ch
         )
         # Capture the conversation's reset-generation epoch at turn start. If
         # /reset fires mid-turn it bumps this key's epoch (and deletes the
@@ -3779,15 +3814,37 @@ class AgentRunner:
                         f"Try `/reset` if it persists."
                     )
                     _log_reason = f"reason={_diag}"
-                print_ts(
-                    f"{COLOR_RED}{log_tag}TERMINAL CONTRACT FAILED: turn ended without "
-                    f"operator-visible output ({_log_reason}){COLOR_END}",
-                    agent=agent.id, error=True,
+                # Claude Code parity (queryHelpers.ts isResultSuccessful): a
+                # clean empty end_turn — the model fired nothing and there was
+                # no provider error — is a LEGITIMATE outcome, not a failure.
+                # It happens on drain/no-op turns (a tool ran and the model had
+                # nothing to add). Surfacing a "⚠️ empty response" to the
+                # operator on those turns is noise that has repeatedly read as
+                # "the bot is broken." So: when the ONLY diagnosis is a bare
+                # empty_assistant_message AND no provider error was captured,
+                # log it quietly and suppress the operator-facing warning.
+                # Every other case (provider errors, text-present-but-not-posted,
+                # tools-called-but-no-reply, no_assistant_message) still surfaces.
+                _clean_empty_end_turn = (
+                    not _captured_framework_error
+                    and _diag == "empty_assistant_message"
                 )
-                try:
-                    await _safe_channel_send(channel, _user_msg)
-                except Exception:
-                    pass
+                if _clean_empty_end_turn:
+                    print_ts(
+                        f"{COLOR_YELLOW}{log_tag}empty end_turn (no output, no error) "
+                        f"— accepted as legitimate, warning suppressed (CC parity){COLOR_END}",
+                        agent=agent.id,
+                    )
+                else:
+                    print_ts(
+                        f"{COLOR_RED}{log_tag}TERMINAL CONTRACT FAILED: turn ended without "
+                        f"operator-visible output ({_log_reason}){COLOR_END}",
+                        agent=agent.id, error=True,
+                    )
+                    try:
+                        await _safe_channel_send(channel, _user_msg)
+                    except Exception:
+                        pass
         except Exception as _term_err:
             # The terminal check itself must never raise — that would defeat
             # its purpose. Log and move on.
