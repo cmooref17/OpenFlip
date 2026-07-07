@@ -286,10 +286,18 @@ class MessageStopEvent:
 @dataclass(frozen=True)
 class FrameworkErrorEvent:
     """Terminal error mid-stream. `kind` is one of: auth, rate_limit,
-    bad_request, timeout, transport, json_decode, sse_protocol.
-    Consumer should stop iterating; no MessageStopEvent follows."""
+    overloaded, bad_request, timeout, transport, json_decode, sse_protocol.
+    Consumer should stop iterating; no MessageStopEvent follows.
+
+    `status` carries the HTTP status when one exists (0 otherwise).
+    `retry_after` is the parsed retry-after header in seconds for
+    rate_limit errors (0.0 when absent) — chat()'s transient-retry loop
+    honors it.
+    """
     message: str
     kind: str
+    status: int = 0
+    retry_after: float = 0.0
 
 
 async def stream_sse_events(resp_content) -> "AsyncIterator":  # type: ignore

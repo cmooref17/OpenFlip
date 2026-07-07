@@ -485,7 +485,7 @@ async def edit_file(path: str, old_string: str, new_string: str) -> ToolResult:
     To make multiple edits, call edit_file multiple times. To replace an entire file,
     delete_file first then write_file (two deliberate steps).
 
-    Writes atomically (tempfile + rename) — a crash mid-write cannot torn the file.
+    Writes atomically (tempfile + rename) — a crash mid-write cannot corrupt the file.
 
     Args:
         path: Path to the existing file.
@@ -599,7 +599,7 @@ async def list_files(path: str = ".") -> ToolResult:
 
 @tool
 async def delete_file(path: str) -> ToolResult:
-    """Delete a file.
+    """Permanently delete a file (a snapshot is taken first so restore_snapshot can undo it). Requires write access to the path.
 
     Args:
         path: Path to the file to delete.

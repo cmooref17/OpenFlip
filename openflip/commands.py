@@ -25,7 +25,7 @@ def _conv_key_for_interaction(runner, interaction) -> int | str:
     """Conversation-dict key for the channel a slash command fired in.
 
     Mirrors the runtime's conversation keying: an identity-linked DM resolves
-    to the shared "linked:<canonical>" key — via the runner's alias map, or
+    to the forwarded primary conversation_id key (e.g. "imessage:+1555") — via the runner's alias map, or
     the link map directly when the alias isn't registered yet this process
     (in a DM the invoking user IS the conversation peer, so the lookup is
     deterministic). Everything else returns the native channel id, unchanged.
@@ -581,7 +581,7 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         if not await _owner_check(interaction): return
         ch_id = int(getattr(interaction.channel, "id", 0) or 0)
         # Interrupt by conversation key: a linked DM's active turn is slotted
-        # under "linked:<canonical>", not the native channel id.
+        # under the forwarded primary conversation_id (e.g. "imessage:+1555"), not the native channel id.
         runner._hard_interrupt(_conv_key_for_interaction(runner, interaction))
         # Form the synthetic user_text exactly as the text-prefix path
         # would land it ("/stop" or "/stop <instruction>") so the model

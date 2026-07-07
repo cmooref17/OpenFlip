@@ -87,16 +87,6 @@ characters have predictable emotional reactions; flat assistants don't.
 """
 
 
-_DEFAULT_REMINDER_TEMPLATE = """Respond in accordance with your SOUL and shared framework files.
-
-Edit this file to add short, high-priority reminders the model sees at the
-end of every payload (after cached history, before each new user message).
-Position-at-end means highest model attention — useful for things you keep
-forgetting in the moment. Keep it tight: paid every turn, soft-warned over
-~500 tokens / ~2000 chars. Delete or blank the file to disable.
-"""
-
-
 def _agents_dir() -> Path:
     return Path(project_root()) / "agents"
 
@@ -312,17 +302,7 @@ def discover_agents() -> dict[str, Agent]:
                     _DEFAULT_SOUL_TEMPLATE.format(display_name=display_name),
                     encoding="utf-8",
                 )
-            # And a REMINDER.md stub. Optional surface, injected at end-of-
-            # payload right before each new user turn. Empty/missing = no-op,
-            # so the default text is itself the operator hint about what
-            # the file is for.
-            reminder_path = agent_dir / "REMINDER.md"
-            if not reminder_path.exists():
-                reminder_path.write_text(
-                    _DEFAULT_REMINDER_TEMPLATE,
-                    encoding="utf-8",
-                )
-            print_ts(f"Generated default agent.json + SOUL.md + REMINDER.md for '{agent_id}' — fill in {soul_path}")
+            print_ts(f"Generated default agent.json + SOUL.md for '{agent_id}' — fill in {soul_path}")
         # Ensure blank personal AGENT.md + TOOLS.md for EVERY agent (not just
         # brand-new ones). Same helper is called on /reload, so a missing stub
         # is backfilled on either path.

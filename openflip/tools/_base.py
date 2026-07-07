@@ -112,26 +112,42 @@ def _build_parameters_schema(func: Callable, param_descriptions: dict[str, str])
     }
 
 
-def _parse_param_descriptions(docstring: str) -> tuple[str, dict[str, str]]:
-    """Pull "name: description" lines out of an Args: block."""
+def _parse_param_descriptions(docstring: str, param_names: set[str] | None = None) -> tuple[str, dict[str, str]]:
+    """Pull "name: description" lines out of an Args: block.
+
+    A line inside the Args block starts a new parameter only when the text
+    before the colon is one of the function's actual parameter names —
+    otherwise it's a continuation of the previous parameter's description
+    (multi-line arg docs routinely contain colons, e.g. 'Example: "..."').
+    """
     if not docstring:
         return "", {}
     lines = [l.rstrip() for l in docstring.strip().split("\n")]
     desc_lines = []
     in_args = False
+    current: Optional[str] = None
     param_descriptions: dict[str, str] = {}
     for line in lines:
         stripped = line.strip()
         if stripped.lower() in ("args:", "arguments:", "parameters:"):
             in_args = True
+            current = None
             continue
         if in_args:
             if not stripped:
                 in_args = False
+                current = None
                 continue
-            if ":" in stripped:
-                pname, _, pdesc = stripped.partition(":")
-                param_descriptions[pname.strip()] = pdesc.strip()
+            pname, sep, pdesc = stripped.partition(":")
+            pname = pname.strip()
+            starts_param = bool(sep) and pname.isidentifier() and (
+                param_names is None or pname in param_names
+            )
+            if starts_param:
+                current = pname
+                param_descriptions[current] = pdesc.strip()
+            elif current:
+                param_descriptions[current] = (param_descriptions[current] + " " + stripped).strip()
         else:
             desc_lines.append(stripped)
     return " ".join(l for l in desc_lines if l).strip(), param_descriptions
@@ -140,7 +156,10 @@ def _parse_param_descriptions(docstring: str) -> tuple[str, dict[str, str]]:
 def tool(func: Callable) -> Callable:
     """Decorator: registers a tool. Function must have a docstring whose first line/paragraph
     is the description shown to the model. An Args: block can document parameters."""
-    description, param_descriptions = _parse_param_descriptions(func.__doc__ or "")
+    sig_param_names = {
+        p for p in inspect.signature(func).parameters if p not in ("self", "cls")
+    }
+    description, param_descriptions = _parse_param_descriptions(func.__doc__ or "", sig_param_names)
     if not description:
         description = func.__name__.replace("_", " ")
     schema = _build_parameters_schema(func, param_descriptions)
@@ -152,6 +171,14 @@ def tool(func: Callable) -> Callable:
         parameters_schema=schema,
         is_async=is_async,
     )
+    # Providers (anthropic/openai conversation builders) read this attribute to
+    # send real parameter schemas to the API. Without it they fall back to an
+    # empty additionalProperties schema and the model has to guess arg names.
+    func.tool_spec = {
+        "name": func.__name__,
+        "description": description,
+        "input_schema": schema,
+    }
     return func
 
 

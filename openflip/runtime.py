@@ -13,7 +13,7 @@ from .conversation import DiscordConversation
 from .anthropic_conversation import AnthropicConversation, MalformedRequestError
 from .openai_conversation import OpenAIConversation
 from .providers import make_conversation, chat_message_class
-from .pipeline import build_user_prompt, should_respond, build_visible_tools, extract_image_attachments, build_inbound_from_discord
+from .pipeline import build_user_prompt, should_respond, build_visible_tools, build_api_tool_funcs, extract_image_attachments, build_inbound_from_discord
 from .session import InboundMessage, Session
 from .tool_executor import execute_tool_calls, build_model_feedback
 from .tools import TOOL_REGISTRY
@@ -45,7 +45,21 @@ from .discord_io import (
 # with attachment" mode is *intended* to fire repeatedly with identical
 # args: each call walks one step further back through history. Deduping it
 # would stop the walk after the first call. Keep this set minimal.
-_DEDUPE_EXEMPT_TOOLS = {"delete_message"}
+_DEDUPE_EXEMPT_TOOLS = {
+    # Intentionally repeatable with identical args (e.g. delete_message
+    # walking back through history).
+    "delete_message",
+    # Read-only tools: state they observe can change mid-turn (a write_file/
+    # edit_file between two identical read_file calls, new memory entries,
+    # a page updating). Blanket turn-wide dedup here blocked legitimate
+    # read-after-write verification — the second read was silently skipped
+    # and the model told to finalize (removed 2026-07-06). In-batch dupes
+    # are still wasteful but harmless; cross-iteration repeats are usually
+    # deliberate.
+    "read_file", "list_files", "list_memory_files", "read_memory",
+    "search_memory", "fetch_discord_message", "fetch_url", "web_search",
+    "list_cron_jobs", "list_snapshots",
+}
 
 
 # Silence sentinel. An agent woken on every channel message (e.g. an agent
@@ -1996,6 +2010,17 @@ class AgentRunner:
             tool_grants=_acl_tool_grants,
             tool_allowlist=_acl_tool_allowlist,
         )
+        # Schemas sent to the API are the agent-stable union, NOT the
+        # per-speaker callable set — per-speaker schema churn invalidates the
+        # position-0 tools cache and with it the entire cached prefix on every
+        # speaker rotation. callable_funcs above still gates actual dispatch
+        # (execute_tool_calls) and drives the per-speaker preamble.
+        api_tool_funcs = build_api_tool_funcs(
+            agent,
+            transport=_acl_transport,
+            tool_grants=_acl_tool_grants,
+            tool_allowlist=_acl_tool_allowlist,
+        )
 
         # Pull conversation_id from the session if we have one — that's the
         # only place that knows the right transport prefix ("discord:" vs
@@ -2182,8 +2207,25 @@ class AgentRunner:
                 conv.messages[0]['content'] = conv.system_message
 
         ChatMessage = chat_message_class(self.agent.provider)
-        CHAT_TIMEOUT_S = 300
+        # Per-round backstop only. Stream liveness is guarded by the
+        # provider's 90s sock_read inactivity timeout, and transient API
+        # errors are retried inside conv.chat() (up to ~90s of budgeted
+        # backoff) — so this outer cap must leave room for a long healthy
+        # stream PLUS the retry budget. It should fire only on true hangs.
+        CHAT_TIMEOUT_S = 600
         MAX_TOOL_TURNS = 100
+        # Provider retry-notice hook: fires once per chat() call when
+        # transient-error recovery is taking more than a few seconds, so
+        # the operator isn't staring at a silent typing indicator.
+        if not silent:
+            async def _retry_notice(_txt: str):
+                try:
+                    await _safe_channel_send(channel, _txt)
+                except Exception:
+                    pass
+            conv.retry_notice_cb = _retry_notice
+        else:
+            conv.retry_notice_cb = None
         callable_names = {f.__name__ for f in callable_funcs}
         media_only = (agent.tool_response_mode == "media_only")
         any_attachments_this_turn = False
@@ -2306,7 +2348,7 @@ class AgentRunner:
         # deliberately NOT _drained_count: the per-iteration drain pops
         # _pending_inject before finally runs, so it never reaches _drained_count
         # (which therefore only ever reflects finally/post-loop drains, not the
-        # post_drain_retry path). This flag overrides media_only attachment-
+        # per-iteration tool-dispatch path). This flag overrides media_only attachment-
         # suppression at the final-text post-sites: when the operator spoke
         # mid-turn, the agent's reply MUST post even though the turn also made
         # media. Without it, that reply lands in history and never reaches Discord.
@@ -2325,23 +2367,9 @@ class AgentRunner:
                                 pass
                         break
 
-                    # Per-iteration soft-inject drain count. Set in the inner-
-                    # loop drain block (after tool_results) and consumed by
-                    # the produced_attachment break check. Re-initialised at
-                    # the top of every iteration so it ONLY reflects drains
-                    # that happened during THIS iteration's tool dispatch.
-                    # The previous design used a turn-wide counter
-                    # (_drained_during_turn) which fired the retry on stale
-                    # state after the model had already responded to the
-                    # marker in a subsequent chat() — sending the assistant
-                    # message as the trailing entry, which Opus rejects
-                    # with 400 "model does not support assistant message
-                    # prefill" (incident 2026-05-25).
-                    _drained_this_iter = 0
-
                     _prov = agent.provider or "ollama"
                     print_ts(
-                        f"  → {_prov} chat ({len(conv.messages)} msgs, {len(callable_funcs)} tools, turn {turn_count}) {log_tag}".rstrip(),
+                        f"  → {_prov} chat ({len(conv.messages)} msgs, {len(api_tool_funcs)} tools, turn {turn_count}) {log_tag}".rstrip(),
                         agent=agent.id,
                     )
 
@@ -2411,7 +2439,7 @@ class AgentRunner:
                     # `for await (const message of deps.callModel(...))`
                     # exhausts).
                     ai_message = await asyncio.wait_for(
-                        conv.chat(tools=callable_funcs or None, think=agent.think,
+                        conv.chat(tools=api_tool_funcs or None, think=agent.think,
                                   tool_choice=_tc_this_turn),
                         timeout=CHAT_TIMEOUT_S,
                     )
@@ -2477,22 +2505,44 @@ class AgentRunner:
                                 _posted_assistant_text = True
                             except Exception:
                                 pass
-                        if conv.messages and conv.messages[-1].role == 'user':
-                            conv.messages.pop()
-                        _err_text = (getattr(ai_message, "content_text", None) or
-                                     getattr(ai_message, "content", "") or "framework error")
-                        _err_preview = str(_err_text)[:200].replace("\n", " ")
-                        try:
-                            conv.messages.append(ChatMessage(
-                                'user',
-                                f'[FRAMEWORK]: Previous turn failed before a reply was generated. Reason: {_err_preview}'
-                            ))
-                        except Exception:
-                            pass
-                        print_ts(
-                            f"{COLOR_YELLOW}  framework error — popped trailing user, injected [FRAMEWORK] note{COLOR_END}",
-                            agent=agent.id,
-                        )
+                        # Pop the triggering user message ONLY for structural
+                        # failures (bad_request: re-sending those exact bytes
+                        # is guaranteed to 4xx again — popping breaks the
+                        # death loop). Transient failures (rate_limit /
+                        # overloaded / timeout / transport — already retried
+                        # inside conv.chat()) keep the message: nothing is
+                        # wrong with it, the next turn answers it naturally,
+                        # and a plain "try again" works without retyping.
+                        # No permanent [FRAMEWORK] note in that case either —
+                        # the kept unanswered message is self-explanatory,
+                        # and error strings in history are cached bytes paid
+                        # on every future request.
+                        _err_kind = getattr(ai_message, "framework_error_kind", "") or ""
+                        _structural = _err_kind == "bad_request"
+                        if _structural:
+                            if conv.messages and conv.messages[-1].role == 'user':
+                                conv.messages.pop()
+                            _err_text = (getattr(ai_message, "content_text", None) or
+                                         getattr(ai_message, "content", "") or "framework error")
+                            _err_preview = str(_err_text)[:200].replace("\n", " ")
+                            try:
+                                conv.messages.append(ChatMessage(
+                                    'user',
+                                    f'[FRAMEWORK]: Previous turn failed before a reply was generated. Reason: {_err_preview}'
+                                ))
+                            except Exception:
+                                pass
+                            print_ts(
+                                f"{COLOR_YELLOW}  framework error (structural: {_err_kind or 'unknown'}) — "
+                                f"popped trailing user, injected [FRAMEWORK] note{COLOR_END}",
+                                agent=agent.id,
+                            )
+                        else:
+                            print_ts(
+                                f"{COLOR_YELLOW}  framework error (transient: {_err_kind or 'unknown'}) — "
+                                f"user message kept in history{COLOR_END}",
+                                agent=agent.id,
+                            )
                         break
 
                     _tc = getattr(ai_message, "tool_calls", None) or []
@@ -2739,11 +2789,10 @@ class AgentRunner:
                         # with the just-emitted assistant text as the trailing
                         # entry, which Opus rejects with 400 "model does not
                         # support assistant message prefill. conversation
-                        # must end with a user message." The structural retry
-                        # for "drain happened but model never got a chat()"
-                        # lives ONLY in the produced_attachment branch below,
-                        # where the break would otherwise exit BEFORE the
-                        # next chat() runs.
+                        # must end with a user message." Drains that happen
+                        # during tool dispatch are always seen: the loop now
+                        # continues to the next chat() after every tool batch
+                        # (the attachment early-exit was removed 2026-07-06).
                         break
 
                     # ===== Tool dispatch =====
@@ -2843,11 +2892,9 @@ class AgentRunner:
                         if _name in _REPLY_EQUIVALENT_TOOLS:
                             reply_equivalent_tool_fired = True
                             break
-                    produced_attachment = False
                     for _, r in tool_results:
                         if r.attachments:
                             any_attachments_this_turn = True
-                            produced_attachment = True
 
                     if not tool_results:
                         # All calls were ACL-blocked/locked/dry-run and yielded
@@ -2908,19 +2955,11 @@ class AgentRunner:
                         _ch_id_drain = _conv_key
                         _drained_n = self._drain_pending_injects(_ch_id_drain, conv)
                         if _drained_n > 0:
-                            # Turn-cumulative: this per-iteration drain is the
-                            # primary bug path (post_drain_retry below continues
-                            # the loop so the model replies to the operator, but
-                            # _drained_count never sees this drain). Mark it here
-                            # so the reply survives media_only suppression.
+                            # Mark the drain so the model's reply survives
+                            # media_only suppression. The loop always continues
+                            # to another chat() after a tool batch, so the
+                            # drained marker is guaranteed a decision point.
                             _human_softinject_drained_this_turn = True
-                            # Per-iteration counter consumed by the
-                            # produced_attachment break check below. Stays
-                            # local to THIS iteration so a stale value from
-                            # an earlier iteration cannot mis-fire the
-                            # retry after the model has already responded
-                            # to the marker on the next chat() call.
-                            _drained_this_iter = _drained_n
                         # If a human soft-injected during a synthetic turn
                         # (e.g. operator messaged us mid-talk_to_agent
                         # exchange), the silent-by-default visibility no
@@ -2945,51 +2984,14 @@ class AgentRunner:
                             agent=agent.id,
                         )
 
-                    # Attachment-satisfied early exit: an attachment is a
-                    # terminal artifact for the operator (Claude Code has a
-                    # similar pattern where a successful tool result with
-                    # attached files signals task completion). Loop continues
-                    # only when no attachment was produced.
-                    if produced_attachment:
-                        # Post-drain retry — STRUCTURAL invariant:
-                        #   fire iff a soft-inject drained THIS iteration
-                        #   (after this iteration's tool dispatch) AND the
-                        #   loop is about to break before the next chat()
-                        #   can run.
-                        #
-                        # Without this, the [FRAMEWORK] marker just appended
-                        # by the drain block above sits in history with the
-                        # model never given a chat() iteration to respond.
-                        # The post-loop synthetic follow-up also misses it
-                        # (the safety drain sees _pending_inject empty by
-                        # then). Result: silent drop of operator's mid-tool
-                        # message.
-                        #
-                        # Kill switch: OPENFLIP_DISABLE_POST_DRAIN_RETRY=1
-                        # disables the retry and falls through to break.
-                        # The drained marker is still in history; the post-
-                        # loop synthetic follow-up below will re-fire it
-                        # as a fresh turn (the slower path, but safe).
-                        _pdr_disabled = (
-                            os.environ.get("OPENFLIP_DISABLE_POST_DRAIN_RETRY") == "1"
-                        )
-                        if (_drained_this_iter > 0
-                                and not _pdr_disabled
-                                and not locals().get("_post_drain_retry_used")
-                                and not is_chain_terminator
-                                and not str(log_tag or "").strip().startswith("[synthetic]")):
-                            _post_drain_retry_used = True
-                            print_ts(
-                                f"{COLOR_YELLOW}{log_tag}post_drain_retry fired: "
-                                f"drained {_drained_this_iter} message(s) this iteration — "
-                                f"continuing so the model can respond (was about to "
-                                f"break on attachment){COLOR_END}",
-                                agent=agent.id,
-                            )
-                            continue
-                        break
-                    # Otherwise: continue loop (model gets tool results,
-                    # can either emit more tool_use or stop).
+                    # No attachment early-exit (removed 2026-07-06): the loop
+                    # continues after media generations like any other tool
+                    # result, so the model can compose (generate → animate),
+                    # react to what it produced, or stop naturally via the
+                    # no-tool-use gate above. This also guarantees any soft-
+                    # injected operator message drained during tool dispatch
+                    # gets a chat() decision point, which the old break needed
+                    # a dedicated post-drain retry to ensure.
         except asyncio.CancelledError:
             print_ts(
                 f"{COLOR_YELLOW}{log_tag}turn interrupted by new inbound{COLOR_END}",
@@ -3071,11 +3073,13 @@ class AgentRunner:
             print_ts(f"{COLOR_RED}{log_tag}Chat timeout after {CHAT_TIMEOUT_S}s — model unresponsive{COLOR_END}", agent=agent.id, error=True)
             if auto_post_final_text:
                 try:
-                    await _safe_channel_send(channel, f"⚠️ The model didn't reply within {CHAT_TIMEOUT_S}s. Try again, or check Ollama.")
+                    await _safe_channel_send(channel, f"⚠️ The model didn't reply within {CHAT_TIMEOUT_S//60} minutes. Say \"try again\" to retry — your message is still in the conversation.")
                 except Exception:
                     pass
-            if conv.messages and conv.messages[-1].role == 'user':
-                conv.messages.pop()
+            # The user's message stays in history: a hang is a service
+            # problem, not a content problem (Ollama-era thinking popped it
+            # here). Kept, a "try again" retries it; popped, the operator
+            # had to retype the whole thing.
             try:
                 self._drain_pending_injects(_conv_key, conv)
             except Exception:
@@ -3110,6 +3114,15 @@ class AgentRunner:
                     pass
             if conv.messages and conv.messages[-1].role == 'user':
                 conv.messages.pop()
+            # Note so the model knows why there's a gap (the pop is
+            # required — re-sending the same shape fails identically).
+            try:
+                conv.messages.append(ChatMessage(
+                    'user',
+                    f'[FRAMEWORK]: Previous turn was aborted pre-send (malformed request: {_problems_short[:200]}).'
+                ))
+            except Exception:
+                pass
             try:
                 self._drain_pending_injects(_conv_key, conv)
             except Exception:

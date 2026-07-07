@@ -1534,7 +1534,14 @@ class AnthropicConversation:
 
     async def _ensure_http_session(self) -> aiohttp.ClientSession:
         if self._http_session is None or self._http_session.closed:
-            timeout = aiohttp.ClientTimeout(total=300, connect=30)
+            # No `total` cap: it covers the ENTIRE streamed body, so a
+            # healthy long generation (or a slow server-side compaction)
+            # would be killed mid-stream and its billed tokens discarded.
+            # Liveness comes from `sock_read` instead — a per-chunk
+            # inactivity timeout. Anthropic's SSE stream emits regular
+            # events (including pings) while alive, so 90s of silence
+            # means the connection is genuinely stalled.
+            timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=90)
             self._http_session = aiohttp.ClientSession(timeout=timeout)
         return self._http_session
 
@@ -1580,7 +1587,8 @@ class AnthropicConversation:
         # at the end. The streaming path delivers content in arrival order
         # via ContentBlockStopEvent; we preserve that order in the final
         # message so the model's next turn sees text/tool_use interleaved
-        # exactly as it emitted them.
+        # exactly as it emitted them. Declared here, RESET per attempt in
+        # the transient-retry loop below.
         text_parts: list[str] = []
         thinking_parts: list[str] = []
         tool_calls: list[AnthropicToolCall] = []
@@ -1589,85 +1597,173 @@ class AnthropicConversation:
         stop_reason: str | None = None
         stop_details: dict | None = None
 
-        try:
-            async for event in self.chat_stream(
-                tools=tools, think=think,
-                tool_choice=tool_choice,
-                _retry_attempt=_retry_attempt,
-            ):
-                if isinstance(event, FrameworkErrorEvent):
-                    framework_error = event
-                    # Continue iterating to let chat_stream finish its
-                    # `finally` cleanup; don't break early. chat_stream
-                    # itself will `return` after FrameworkErrorEvent so
-                    # the loop ends naturally.
-                    continue
-                if isinstance(event, ContentBlockStopEvent):
-                    blk = event.completed_block
-                    btype = blk.get("type", "")
-                    ordered_blocks.append(blk)
-                    if btype == "text":
-                        text_parts.append(blk.get("text", "") or "")
-                    elif btype == "thinking":
-                        thinking_parts.append(blk.get("thinking", "") or "")
-                    elif btype == "tool_use":
-                        name = blk.get("name", "")
-                        args = blk.get("input", {}) or {}
-                        tool_use_id = blk.get("id", "")
-                        # Always append the tool_call. If the name is unknown,
-                        # let the downstream executor surface the error to
-                        # the model — dropping silently here produces an
-                        # empty assistant message and a terminal-contract
-                        # failure the user sees as "no reply".
-                        tool_calls.append(AnthropicToolCall(
-                            function_name=name,
-                            args=args,
-                            tool_use_id=tool_use_id,
-                            function=tools_map.get(name),
-                        ))
-                    # compaction blocks are handled by chat_stream's
-                    # side-effect path — they update self._compaction_block
-                    # and self.compacted_this_turn directly.
-                elif isinstance(event, MessageDeltaEvent):
-                    # Carries the terminal stop_reason (+ stop_details on a
-                    # refusal). Previously dropped here, which turned a
-                    # zero-text response (e.g. stop_reason="refusal") into a
-                    # silent empty reply with no explanation. Capture it so
-                    # the assembly step below can surface WHY the turn
-                    # produced no text instead of returning a blank.
-                    if event.stop_reason is not None:
-                        stop_reason = event.stop_reason
-                    if event.stop_details is not None:
-                        stop_details = event.stop_details
-                # Other event types (MessageStart, ContentBlockStart,
-                # ContentBlockDelta, MessageStop) don't contribute to the
-                # final AnthropicAIChatMessage shape; chat_stream handles
-                # their side effects (last_usage, etc).
-        except MalformedRequestError:
-            # Let pre-flight validation failures propagate so runtime.py
-            # can surface a clear user-visible message and route to the
-            # malformed-request error path instead of the generic chat
-            # error path. Don't bury it as a framework-error string.
-            raise
-        except Exception as _wrapper_e:
-            print_ts(
-                f"{COLOR_RED}chat() wrapper consumption error: {_wrapper_e}{COLOR_END}",
-                agent=self.agent.id, error=True,
-            )
-            return AnthropicAIChatMessage(
-                content=f"⚠️ chat() wrapper failed: {_wrapper_e}",
-                is_framework_error=True,
-            )
+        # ---------- Transient-error retry loop (2026-07-06) ----------
+        # Mirrors the Anthropic SDK / Claude Code resilience model: 429,
+        # 5xx/529, timeouts, and connection errors are retried here with
+        # exponential backoff + jitter (retry-after honored on 429) before
+        # ANY error surfaces to the runtime. This wrapper buffers the whole
+        # stream and nothing is user-visible until the turn ends, so a
+        # retry-from-scratch after a mid-stream death is invisible — unlike
+        # a live-streaming client we can safely re-request even after
+        # partial content arrived (capped at ONE retry in that case to
+        # bound double-billing). Structural errors (bad_request, auth)
+        # never retry. Total wait is budgeted to stay well inside the
+        # runtime's per-round wait_for.
+        import random as _random
+        _TRANSIENT_KINDS = {
+            "rate_limit", "overloaded", "timeout", "transport",
+            "json_decode", "sse_protocol",
+        }
+        _MAX_TRANSIENT_RETRIES = 3
+        _RETRY_BUDGET_S = 90.0
+        _waited = 0.0
+        _notice_fired = False
+        _transient_attempt = 0
 
-        # Stream-side framework error → return error message. Reviewer
-        # guidance: don't return partial content/tool_calls on a failed
-        # stream — that's how you get a NEW "said it without doing it"
-        # failure mode.
+        while True:
+            text_parts = []
+            thinking_parts = []
+            tool_calls = []
+            ordered_blocks = []
+            framework_error = None
+            stop_reason = None
+            stop_details = None
+            try:
+                async for event in self.chat_stream(
+                    tools=tools, think=think,
+                    tool_choice=tool_choice,
+                    _retry_attempt=_retry_attempt,
+                ):
+                    if isinstance(event, FrameworkErrorEvent):
+                        framework_error = event
+                        # Continue iterating to let chat_stream finish its
+                        # `finally` cleanup; don't break early. chat_stream
+                        # itself will `return` after FrameworkErrorEvent so
+                        # the loop ends naturally.
+                        continue
+                    if isinstance(event, ContentBlockStopEvent):
+                        blk = event.completed_block
+                        btype = blk.get("type", "")
+                        ordered_blocks.append(blk)
+                        if btype == "text":
+                            text_parts.append(blk.get("text", "") or "")
+                        elif btype == "thinking":
+                            thinking_parts.append(blk.get("thinking", "") or "")
+                        elif btype == "tool_use":
+                            name = blk.get("name", "")
+                            args = blk.get("input", {}) or {}
+                            tool_use_id = blk.get("id", "")
+                            # Always append the tool_call. If the name is unknown,
+                            # let the downstream executor surface the error to
+                            # the model — dropping silently here produces an
+                            # empty assistant message and a terminal-contract
+                            # failure the user sees as "no reply".
+                            tool_calls.append(AnthropicToolCall(
+                                function_name=name,
+                                args=args,
+                                tool_use_id=tool_use_id,
+                                function=tools_map.get(name),
+                            ))
+                        # compaction blocks are handled by chat_stream's
+                        # side-effect path — they update self._compaction_block
+                        # and self.compacted_this_turn directly.
+                    elif isinstance(event, MessageDeltaEvent):
+                        # Carries the terminal stop_reason (+ stop_details on a
+                        # refusal). Previously dropped here, which turned a
+                        # zero-text response (e.g. stop_reason="refusal") into a
+                        # silent empty reply with no explanation. Capture it so
+                        # the assembly step below can surface WHY the turn
+                        # produced no text instead of returning a blank.
+                        if event.stop_reason is not None:
+                            stop_reason = event.stop_reason
+                        if event.stop_details is not None:
+                            stop_details = event.stop_details
+                    # Other event types (MessageStart, ContentBlockStart,
+                    # ContentBlockDelta, MessageStop) don't contribute to the
+                    # final AnthropicAIChatMessage shape; chat_stream handles
+                    # their side effects (last_usage, etc).
+            except MalformedRequestError:
+                # Let pre-flight validation failures propagate so runtime.py
+                # can surface a clear user-visible message and route to the
+                # malformed-request error path instead of the generic chat
+                # error path. Don't bury it as a framework-error string.
+                raise
+            except Exception as _wrapper_e:
+                print_ts(
+                    f"{COLOR_RED}chat() wrapper consumption error: {_wrapper_e}{COLOR_END}",
+                    agent=self.agent.id, error=True,
+                )
+                _msg = AnthropicAIChatMessage(
+                    content=f"⚠️ chat() wrapper failed: {_wrapper_e}",
+                    is_framework_error=True,
+                )
+                _msg.framework_error_kind = "transport"
+                return _msg
+
+            if framework_error is None:
+                break  # success — fall through to post-processing
+
+            _kind = framework_error.kind
+            _had_partial = bool(ordered_blocks)
+            _retry_cap = 1 if _had_partial else _MAX_TRANSIENT_RETRIES
+            if _kind not in _TRANSIENT_KINDS or _transient_attempt >= _retry_cap:
+                break  # terminal, or retries exhausted — give up below
+
+            if _kind == "rate_limit":
+                _wait = framework_error.retry_after or 5.0
+            else:
+                _wait = min(1.0 * (2 ** _transient_attempt), 8.0)
+            _wait += _random.uniform(0, _wait * 0.2)
+            if _waited + _wait > _RETRY_BUDGET_S:
+                break  # would blow the budget (e.g. huge retry-after) — give up
+
+            # Stay silent under the typing indicator for short waits; let
+            # the operator know only when recovery is taking a while.
+            if not _notice_fired and (_waited + _wait) > 8.0:
+                _notice_fired = True
+                _cb = getattr(self, "retry_notice_cb", None)
+                if _cb is not None:
+                    try:
+                        await _cb("⏳ Anthropic's having a moment — retrying…")
+                    except Exception:
+                        pass
+            print_ts(
+                f"{COLOR_YELLOW}transient {_kind}"
+                f"{f' (HTTP {framework_error.status})' if framework_error.status else ''}"
+                f" — retry {_transient_attempt + 1}/{_retry_cap} in {_wait:.1f}s"
+                f"{' (had partial content)' if _had_partial else ''}{COLOR_END}",
+                agent=self.agent.id,
+            )
+            await asyncio.sleep(_wait)
+            _waited += _wait
+            _transient_attempt += 1
+
+        # Stream-side framework error survived the retry loop → give up.
         if framework_error is not None:
-            return AnthropicAIChatMessage(
+            # Salvage a substantial pure-text partial instead of discarding
+            # billed tokens: only when NO tool calls completed (a partial
+            # tool exchange must not be half-acted-on) and the death was
+            # transient (a bad_request's partial is untrustworthy).
+            _salvage = "".join(text_parts).strip()
+            if (framework_error.kind in _TRANSIENT_KINDS
+                    and len(_salvage) >= 200 and not tool_calls):
+                print_ts(
+                    f"{COLOR_YELLOW}stream died after {len(_salvage)} chars of text — "
+                    f"salvaging partial response{COLOR_END}",
+                    agent=self.agent.id,
+                )
+                response = AnthropicAIChatMessage(
+                    content=_salvage + "\n\n*(response was cut off mid-stream)*",
+                    tool_calls=[],
+                )
+                response.raw_response = {"content": ordered_blocks}
+                return response
+            _msg = AnthropicAIChatMessage(
                 content=framework_error.message,
                 is_framework_error=True,
             )
+            _msg.framework_error_kind = framework_error.kind
+            return _msg
 
         # ----------- Malformed-tool_use detection + retry -----------
         # Mirrors the legacy chat() post-collect logic. Anthropic
@@ -1901,60 +1997,11 @@ class AnthropicConversation:
                     {"role": "assistant", "content": [cb]},
                 ] + api_messages
 
-        # REMINDER.md injection.
-        # Uncached, position-before-new-user-message, soft-warned at 2k chars,
-        # never persisted to self.messages. Cache breakpoint placement below
-        # accounts for _reminder_injected when present.
-        _reminder_injected = False
-        try:
-            import os as _os
-            agent_dir = _os.path.dirname(self.agent.path) if getattr(self.agent, "path", None) else None
-            if agent_dir:
-                reminder_path = _os.path.join(agent_dir, "REMINDER.md")
-                if _os.path.exists(reminder_path):
-                    with open(reminder_path, "r", encoding="utf-8") as _f:
-                        reminder_text = _f.read().strip()
-                    if reminder_text:
-                        if len(reminder_text) > 2000:
-                            print_ts(
-                                f"{COLOR_YELLOW}REMINDER.md is {len(reminder_text)} chars "
-                                f"(~{len(reminder_text) // 4} tokens) — paid every turn. "
-                                f"Consider trimming.{COLOR_END}",
-                                agent=self.agent.id,
-                            )
-                        # CRITICAL: skip when last user message carries
-                        # tool_result blocks. Inserting REMINDER between an
-                        # assistant tool_use and the user tool_result that
-                        # must immediately follow it returns 400.
-                        _skip_for_tool_result = False
-                        if api_messages:
-                            _last = api_messages[-1]
-                            _last_content = _last.get("content")
-                            if isinstance(_last_content, list):
-                                for _block in _last_content:
-                                    if isinstance(_block, dict) and _block.get("type") == "tool_result":
-                                        _skip_for_tool_result = True
-                                        break
-                        if _skip_for_tool_result:
-                            pass
-                        else:
-                            reminder_msg = {
-                                "role": "user",
-                                "content": f"[SYSTEM REMINDER]: {reminder_text}",
-                            }
-                            if api_messages:
-                                api_messages = (
-                                    api_messages[:-1] + [reminder_msg] + [api_messages[-1]]
-                                )
-                            else:
-                                api_messages = [reminder_msg]
-                            _reminder_injected = True
-        except Exception as _rem_err:
-            print_ts(
-                f"{COLOR_YELLOW}REMINDER.md injection failed (continuing without): "
-                f"{_rem_err}{COLOR_END}",
-                agent=self.agent.id,
-            )
+        # REMINDER.md per-turn injection removed (2026-07-06, operator
+        # decision): the mechanic was inconsistent and accreted hyper-specific
+        # content paid uncached every turn. Standing guidance belongs in the
+        # cached system files (AGENT.md / SOUL.md); agents that still have a
+        # REMINDER.md deliver it via system_files instead.
 
         # Convert openflip tools to Anthropic JSON schema. Same call as
         # chat() — use the canonical helper that takes the list and
@@ -2029,19 +2076,12 @@ class AnthropicConversation:
             if tool_choice is not None:
                 body["tool_choice"] = tool_choice
 
-        # Extend caching past system prompt to conversation history.
-        # When REMINDER.md was injected, the LAST two messages (REMINDER +
-        # new user turn) are intentionally uncached so REMINDER edits take
-        # effect immediately. Cache breakpoint lands on the PRIOR turn's
-        # last user message in that case.
+        # Extend caching past system prompt to conversation history: the
+        # breakpoint lands on the newest user message so the whole history
+        # prefix (including this turn's input) is a cache read next turn.
         if api_messages:
             last_user_idx = None
-            # Start scan two messages earlier than the tail when REMINDER
-            # was injected. Without that, we'd cache the REMINDER itself
-            # and edits wouldn't take effect on the next turn.
             scan_end = len(api_messages) - 1
-            if _reminder_injected and len(api_messages) >= 3:
-                scan_end = len(api_messages) - 3
             for i in range(scan_end, -1, -1):
                 if api_messages[i].get("role") == "user":
                     last_user_idx = i
@@ -2178,9 +2218,19 @@ class AnthropicConversation:
                         )
                         return
                     if status == 429:
+                        # retry-after is authoritative — chat()'s transient
+                        # retry loop waits it out (earlier retries are
+                        # guaranteed to fail).
+                        _ra = 0.0
+                        try:
+                            _ra = float(resp.headers.get("retry-after", "") or 0)
+                        except (TypeError, ValueError):
+                            _ra = 0.0
                         yield FrameworkErrorEvent(
                             message="⚠️ Anthropic rate limit (429). Subscription quota — wait and retry.",
                             kind="rate_limit",
+                            status=429,
+                            retry_after=_ra,
                         )
                         return
                     # 400 recovery paths — mirror chat()'s behavior.
@@ -2235,7 +2285,24 @@ class AnthropicConversation:
                             return
                         finally:
                             self._retry_budget = None
-                    # Other non-200 — terminal
+                    # Transient server-side errors (529 overloaded, 5xx,
+                    # 408) — nothing is wrong with the request; chat()'s
+                    # retry loop backs off and re-sends.
+                    if status in (408, 500, 502, 503, 504, 529):
+                        print_ts(
+                            f"{COLOR_YELLOW}Anthropic API {status} (transient): "
+                            f"{text[:300]}{COLOR_END}",
+                            agent=self.agent.id,
+                        )
+                        snippet = text[:200].replace("\n", " ")
+                        yield FrameworkErrorEvent(
+                            message=f"⚠️ Anthropic API {status} (server busy): {snippet}",
+                            kind="overloaded",
+                            status=status,
+                        )
+                        return
+                    # Other non-200 (400/403/404/413/422 …) — structurally
+                    # unsendable; terminal, never retried.
                     print_ts(
                         f"{COLOR_RED}Anthropic API {status}: {text[:600]}{COLOR_END}",
                         agent=self.agent.id, error=True,
@@ -2244,6 +2311,7 @@ class AnthropicConversation:
                     yield FrameworkErrorEvent(
                         message=f"⚠️ Anthropic API {status}: {snippet}",
                         kind="bad_request",
+                        status=status,
                     )
                     return
 
@@ -2402,7 +2470,7 @@ class AnthropicConversation:
 
         except asyncio.TimeoutError:
             yield FrameworkErrorEvent(
-                message="⚠️ Anthropic API timed out (5 min).",
+                message="⚠️ Anthropic API stalled (no data for 90s).",
                 kind="timeout",
             )
             return
