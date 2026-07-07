@@ -29,9 +29,9 @@ async def run_command(command: str, timeout: int = 30) -> ToolResult:
             /bin/sh -c on Linux/macOS, cmd.exe /c on Windows).
         timeout: Max seconds to wait before killing the process (default 30, max 120).
     """
-    from ..acl import current_caller_is_owner
-    if not current_caller_is_owner():
-        return ToolResult.fail("run_command is owner-only.")
+    from ..acl import current_caller_is_admin
+    if not current_caller_is_admin():
+        return ToolResult.fail("run_command is admin-only.")
 
     command = (command or "").strip()
     if not command:

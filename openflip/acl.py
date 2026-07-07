@@ -271,15 +271,51 @@ def current_caller_is_owner() -> bool:
         return False
 
 
+def current_caller_is_admin() -> bool:
+    """Whether the CURRENT tool caller (from the contextvars set by the
+    executor) is an admin (owner OR configured admin_ids/admin_handles).
+    Defense-in-depth guard for elevated tools that admins are permitted to
+    use (e.g. run_command). Like current_caller_is_owner it puts the check ON
+    the operation so it can't be waved through by an upstream ACL bug, but it
+    admits the admin tier — the tool itself is still scoped by the per-user
+    ACL in agent.json. Fail closed: any error / unknown caller → False.
+
+    Mirrors the ACL-context derivation in runtime.py: Session is the source of
+    truth for transport + handle on handle-based transports (iMessage); Discord
+    uses the numeric speaker_id.
+    """
+    from .tool_executor import CURRENT_SPEAKER_ID, CURRENT_SESSION
+    try:
+        speaker_id = int(CURRENT_SPEAKER_ID.get(None) or 0)
+    except Exception:
+        speaker_id = 0
+    transport = "discord"
+    handle = ""
+    try:
+        sess = CURRENT_SESSION.get(None)
+    except Exception:
+        sess = None
+    if sess is not None:
+        transport = getattr(sess, "transport", "discord") or "discord"
+        if transport != "discord":
+            handle = getattr(sess, "handle", "") or ""
+    try:
+        if transport == "discord":
+            return is_admin(speaker_id)
+        return is_admin(speaker_id, integration=transport, handle=handle)
+    except Exception:
+        return False
+
+
 def is_admin(user_id: int, integration: str = "discord", *, handle: str = "") -> bool:
     """Elevated-admin check — true for the owner AND anyone in `admin_ids`.
 
     This is the privilege tier ABOVE normal users but BELOW owner-only powers.
-    Use this to gate elevated-but-not-dangerous capabilities. Keep genuinely
-    dangerous powers (run_command, restart_gateway, claude_code) on
-    `is_owner()` — admins must NOT get a shell or the ability to restart the
-    framework. The owner is always an admin (get_admin_ids/get_admin_handles
-    append the owner).
+    Use this to gate elevated capabilities. `run_command` is admin-gated (via
+    current_caller_is_admin) — admins get a shell, still scoped by the per-user
+    ACL in agent.json. Keep the most dangerous framework-control powers
+    (restart_gateway, claude_code) on `is_owner()`. The owner is always an admin
+    (get_admin_ids/get_admin_handles append the owner).
 
     Transport-aware, mirroring is_owner(). Discord (default) keeps the numeric
     path. Handle-based transports (`integration != "discord"`) compare the

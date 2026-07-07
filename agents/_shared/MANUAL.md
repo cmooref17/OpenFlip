@@ -12,6 +12,13 @@ reference — fetch it (`read_file("agents/_shared/MANUAL.md")`) when you
 need to look up a field, a tool, an ACL shape, a recovery recipe, or a
 diagnostic move.
 
+NOTE — reading this file requires read access: `read_file` is gated by
+your `allowed_read_paths`, and `agents/_shared/` is OUTSIDE the default
+read scope (your own agent dir + the system temp dir). Owner-triggered
+turns on agents whose owner scope is `["*"]` always work; for other
+speakers/turns (including cron) the operator must add `agents/_shared`
+to the relevant read scope, or the fetch is denied.
+
 Behavioral rules live in `_shared/FRAMEWORK.md` (auto-loaded). This file
 is reference, not rules.
 
@@ -37,7 +44,7 @@ agents/<id>/
 ├── SOUL.md               # Character / persona. Auto-injected by default (first in system_files).
 ├── AGENT.md              # Per-agent extension of _shared/FRAMEWORK.md. Auto-created empty, auto-injected by default. Empty = no-op.
 ├── TOOLS.md              # Per-agent extension of _shared/TOOLS.md. Auto-created empty, auto-injected by default. Empty = no-op.
-├── REMINDER.md           # End-of-payload nudge. Uncached. Paid every turn. Soft-warned >2000 chars.
+├── REMINDER.md           # (optional, legacy) Plain system file — loads ONLY if listed in system_files (agent_a and agent_c do). The per-turn uncached end-of-payload injection mechanic was REMOVED; no special handling remains.
 ├── HEARTBEAT.md          # (optional) Prompt loaded when a `heartbeat:true` cron job fires.
 ├── MEMORY.md             # Core memory. NOT auto-loaded — accessed via memory tools.
 ├── conversations/        # Per-channel <conv_id>.jsonl + <conv_id>.meta.json. Auto-managed.
@@ -120,8 +127,14 @@ them), not in any agent.json.
 - `owner_id` — single supreme operator. `integrations.discord.owner_id`
   canonical, legacy top-level `owner_id` honored. `is_owner(id)` gates the
   dangerous stuff: `run_command`, `restart_gateway`, `claude_code`,
-  `/reset`, `/say`, `/restart`, `/stop`, and the other sensitive slash
-  commands. Exactly one owner.
+  `/restart`, the `/stop` slash command, and the other sensitive slash
+  commands. Exactly one owner. NOTE — `/reset` is NOT owner-gated (slash
+  or text-prefix), and the text-prefix `/compact` and text-prefix `/stop`
+  are also ungated: any speaker who passes `should_respond` can fire
+  them. This asymmetry (slash `/compact` and slash `/stop` owner-only,
+  their text mirrors and both `/reset` paths open) is the current,
+  intentional-until-changed state — describe it accurately, don't assume
+  owner-only.
 - `admin_ids` — list of elevated users. `integrations.discord.admin_ids`
   canonical, legacy top-level `admin_ids` honored. `is_admin(id)` returns
   true for the owner (always implicitly an admin) PLUS everyone in the
@@ -251,9 +264,9 @@ Then in the agent's `agent.json`: `"provider": "openai"`,
 
 Supported (same UX as an anthropic agent): streaming, full tool calling
 (every framework tool works unchanged), JSONL conversation persistence +
-`/reset`, image attachments (vision via base64 data URLs), REMINDER.md
-injection, `/status` (context + cache-read stats), usage-ledger
-recording, malformed-tool-call retry, mid-turn soft-inject.
+`/reset`, image attachments (vision via base64 data URLs), `/status`
+(context + cache-read stats), usage-ledger recording,
+malformed-tool-call retry, mid-turn soft-inject.
 
 NOT supported (deliberate differences — these commands answer
 "Anthropic-only"):
@@ -336,9 +349,13 @@ NOT supported (deliberate differences — these commands answer
 These govern `read_file`, `write_file`, `edit_file`, `delete_file`,
 `list_files`.
 
-- `allowed_read_paths` — directories the agent may read. Default: the
-  agent's own directory only. Use `["*"]` for unrestricted.
-- `allowed_write_paths` — same shape. Default: agent's own directory.
+- `allowed_read_paths` — directories the agent may read. Empty/missing
+  falls back to a safe default: the agent's own directory PLUS the system
+  temp dir (`/tmp` on POSIX, `%TEMP%` on Windows). Use `["*"]` for
+  unrestricted.
+- `allowed_write_paths` — same shape, but NO fallback: empty/missing is
+  a **hard deny** — writes require an explicit allow list (see
+  `_check_access` in `tools/files.py`).
 - `denied_paths` — always blocked. Wins over allow lists, checked first,
   applies to everyone. Flat list only (no per-user form). Use for
   secret/config paths the agent should never touch.
@@ -430,11 +447,15 @@ stays list-only in both editors.
 
 ## Transport
 
-- `transport` — `"discord"` (default) or `"imessage"`. Selects which
-  Transport class `AgentRunner` instantiates. Per-transport config lives
-  in `config.json` under `integrations.<transport>.agents.<id>`. iMessage
-  agents need `handle`, optional `imsg_path`, optional `allowlist_chats`
-  there. macOS-only.
+- `transport` — single-transport selector, default `"discord"`. Any of
+  the four built-ins registered in `_TRANSPORT_BUILDERS` in
+  `openflip/main.py` — `"discord"`, `"imessage"`, `"internal"`
+  (headless), `"external"` (HTTPS ingress) — plus any plugin transport
+  (see below). Use the `transports` list instead to run several at once.
+  Per-transport config lives in `config.json` under
+  `integrations.<transport>.agents.<id>`. iMessage agents need `handle`,
+  optional `imsg_path`, optional `allowlist_chats`, optional
+  `allowlist_senders` there. iMessage is macOS-only.
 
 ### Adding a custom transport (plugin discovery)
 
@@ -538,12 +559,30 @@ nested object. `respond_to_bots`, `memory_enabled`, etc. are top-level.
 | `proactive.interval_minutes` | int | `30` | Tick interval (must be > 0). |
 | `proactive.quiet_hours` | object \| null | `null` | e.g. `{"start":"23:00","end":"08:00","timezone":"US/Mountain"}`. |
 | `proactive.channel_id` | int | `0` | Channel the tick anchors / posts to. |
-| `allowed_read_paths` | list[string] OR dict | agent's own dir | Dirs the agent may read. `["*"]` = unrestricted. Dict form is transport-keyed (`{"discord": {"users", "all_users"}}`), mirroring tool `auth` = per-user scope — see "Per-user path scope". ⚠️ A transport with no block gets ZERO scopes (silent deny) — incl. CRON turns, which resolve under their target session's transport (often `cron`); see the cron silent-deny trap note in the cron section. |
-| `allowed_write_paths` | list[string] OR dict | agent's own dir | Dirs the agent may write. `["*"]` = unrestricted. Dict form = transport-keyed per-user scope. |
+| `allowed_read_paths` | list[string] OR dict | agent dir + system temp dir (fallback) | Dirs the agent may read. `["*"]` = unrestricted. Dict form is transport-keyed (`{"discord": {"users", "all_users"}}`), mirroring tool `auth` = per-user scope — see "Per-user path scope". ⚠️ A transport with no block gets ZERO scopes (silent deny) — incl. CRON turns, which resolve under the transport of the job's target session (`discord`/`imessage`/`internal`); see the cron silent-deny trap note in the cron section. |
+| `allowed_write_paths` | list[string] OR dict | **deny** (no fallback) | Dirs the agent may write. Empty/missing = hard deny — writes need an explicit allow list. `["*"]` = unrestricted. Dict form = transport-keyed per-user scope. |
 | `denied_paths` | list[string] | `[]` | Always blocked; wins over allow lists; checked first; flat list only (no per-user form). |
 | `agent_specific_commands` | list[string] | `[]` | Slash commands registered only on this agent's bot. |
-| `transport` | string | `"discord"` | `"discord"` or `"imessage"`. Single-transport selector. |
+| `transport` | string | `"discord"` | Single-transport selector: `"discord"`, `"imessage"`, `"internal"`, `"external"`, or a plugin transport name. |
 | `transports` | list[string] | `[]` | Multi-transport list (e.g. `["discord","imessage"]`). Empty = use `transport`. |
+
+## Global service keys (config.json, not agent.json)
+
+Read once at startup (`config_global.get_config` — changes need a
+gateway restart). Beyond `integrations.*`, `models.*`, and
+`identity_links` covered above:
+
+- `searxng_host` — SearXNG instance for `web_search` (default
+  `http://127.0.0.1:8888`; needs `json` in its `search.formats`).
+- `comfyui_host` — ComfyUI for the image/video tools.
+- `tts_gradio_host` — Gradio TTS server for `generate_tts`.
+- `ollama_host` — Ollama for the ollama provider + embeddings.
+- `embedding_model` — memory-embedding model (default
+  `nomic-embed-text`; see §6).
+- `dry_run_tools` — when `true`, EVERY tool call is logged + announced
+  instead of executed. If tools seem to "do nothing", check this first.
+- `data_dir` / `tmp_dir` / `output_dir` / `tts_models_dir` — data paths,
+  resolved via `utils.resolve_path`.
 
 ---
 
@@ -555,9 +594,31 @@ counts, dimensions) live in `/toolset` and `data/tool_settings.json`
 and are not exposed to the model. All tools are async.
 
 ACL gating: every tool is checked against the speaker's `allowed_tools`
-entry before invocation. The owner ID is always allowed on Discord (see
-`_check_acl` in `openflip/acl.py`). Tools also tagged
-`silent_to_discord` send their text to the model only, not the channel.
+entry before invocation. Owner + admins bypass every ACL on every
+transport with configured identities — Discord matches the numeric id
+against `admin_ids`, handle-based transports (iMessage) match the
+case-folded handle against `integrations.<transport>.admin_ids` (see
+`_check_acl` / `is_admin` in `openflip/acl.py`; the owner is always an
+admin). Tools also tagged `silent_to_discord` send their text to the
+model only, not the channel.
+
+Schemas sent to the model are the agent-stable FULL registry — every
+registered tool, in registry order — NOT the per-speaker callable set
+(`build_api_tool_funcs` in `pipeline.py`). Per-speaker schema churn
+would bust the prompt cache on every speaker rotation, and the
+owner/admin bypass makes every tool callable on owner turns anyway, so
+the registry is the only set that serves all speakers with stable
+bytes. A restrictive session `tool_allowlist` (external per-token
+ceiling) still narrows it. Per-speaker enforcement happens at dispatch:
+a blocked call fails with a model-visible permission error, and the
+per-speaker user preamble lists tools the current speaker can't use so
+you can decline up front.
+
+Tool docstrings are load-bearing: the first paragraph is the
+model-visible description, and the `Args:` block becomes the
+per-parameter JSON-schema descriptions sent to the provider (`@tool` in
+`tools/_base.py`). Sibling-tool selection accuracy is a docstring
+problem.
 
 ## Memory
 
@@ -573,12 +634,21 @@ entry before invocation. The owner ID is always allowed on Discord (see
 - **`read_memory(file: str = "")`** — empty arg reads `MEMORY.md`. A
   date (`"2026-05-21"`) reads that day's log.
 - **`list_memory_files()`** — list daily logs with dates and sizes.
+- **`dream()`** — run the 4-phase memory-consolidation pass NOW (reads
+  MEMORY.md + recent daily logs, rewrites core memory via
+  `update_core_memory`). Same pass the `/dream` command and auto-dream
+  fire (see §10). Registered like any tool; usually owner-gated.
 
 ## Files (path-ACL gated)
 
 - **`read_file(path: str)`** — read a text file. Path can be absolute
   or relative to the agent's directory. Subject to `allowed_read_paths`
   + `denied_paths`.
+- **`send_file(path: str, caption: str = "", channel_id: int = 0)`** —
+  deliver an EXISTING on-disk file to the conversation as an attachment
+  (e.g. an audio/image output already saved). Read-ACL gated;
+  cross-channel delivery is owner-gated. Still `channel_id`-keyed (not
+  yet migrated to `session_id` — see the multi-agent section note).
 - **`write_file(path: str, content: str)`** — CREATE-ONLY. Refuses to
   overwrite an existing file. Max 8000 bytes. Atomic via tmp+rename.
   Subject to `allowed_write_paths` + `denied_paths`.
@@ -642,6 +712,10 @@ entry before invocation. The owner ID is always allowed on Discord (see
   asked for it. The optional `continuation` fires as a synthetic turn
   after restart so you can resume what you were doing. Persists
   in-flight conversation state first.
+- **`restart_flask_app(reason: str = "")`** — restart the separate
+  webapp systemd user unit (`systemctl --user`). Owner-only —
+  enforced inside the tool via `current_caller_is_owner()`, same as
+  `run_command`/`restart_gateway`/`claude_code`.
 
 ## Discord
 
@@ -777,16 +851,18 @@ entry before invocation. The owner ID is always allowed on Discord (see
   normally fail; grant it here instead. See "Per-session tool grants"
   under the auth section below for the exact semantics and limits.
   **Cron turns + dict path scopes (silent-deny trap).** A cron turn runs under
-  the transport its TARGET session resolves to — `cron` for a `cron:<job-name>`
-  sessionId, but `internal`/`imessage`/etc. if the job targets one of those. If
-  the agent uses the DICT (per-transport) form of `allowed_read_paths` /
+  the transport its TARGET session resolves to: the prefix of the job's
+  `sessionId` (`discord:`/`imessage:`/`internal:`…), or — for a legacy bare
+  `channelId` job — the runner's first real transport (`cron._resolve_target`).
+  If the agent uses the DICT (per-transport) form of `allowed_read_paths` /
   `allowed_write_paths`, that dict MUST contain a block for whatever transport
   the job resolves to — otherwise the turn gets ZERO path scopes and every file
   read/write is denied, silently (the job can't read its inputs and just fails
-  with no obvious error). Fix: add the matching transport block (commonly
-  `cron`, mirroring your `internal` block). FLAT-LIST path configs are
-  unaffected — they apply to all transports. See the `allowed_read_paths` row in
-  the agent.json table for the dict shape.
+  with no obvious error). Fix: add a block for the transport the job actually
+  resolves to (usually `discord` or `internal` — check the job's `sessionId`
+  prefix). FLAT-LIST path configs are unaffected — they apply to all
+  transports. See the `allowed_read_paths` row in the agent.json table for the
+  dict shape.
 - **`list_cron_jobs(agent_id="", include_all_agents=False)`** —
   defaults to your own jobs.
 - **`cancel_cron_job(job_id: str)`** — delete the job. No archive.
@@ -878,14 +954,21 @@ framework hard-fails with a pointer at the offending entry.
    callable.
 5. **`exclude` always wins.** Matching anything in
    `exclude.{users,roles,channels}` blocks regardless of inclusions.
-6. **Admin bypass on Discord.** Any admin (the `owner_id` plus everyone
-   in `admin_ids`) passes every ACL on the Discord transport. iMessage has
-   no admin bypass (no canonical handle mapping yet). This means an
-   auto-injected blank entry surfaces the tool for all admins. NOTE: the
-   ACL bypass is `is_admin`, but the genuinely dangerous capabilities
-   (`run_command`, `restart_gateway`, `claude_code`, `/reset`, `/say`,
-   `/restart`, `/stop`) are gated on `is_owner` separately and are NOT
-   widened by admin status — see "Owner vs admin" in §3.
+6. **Admin bypass, transport-aware.** Any admin (the `owner_id` plus
+   everyone in `admin_ids`) passes every ACL. The bypass works on every
+   transport with configured identities: Discord matches the numeric
+   speaker id against `admin_ids`; handle-based transports (iMessage)
+   match the case-folded sender handle against
+   `integrations.<transport>.admin_ids` (handle strings; the owner
+   handle is auto-appended — `is_admin` in `acl.py`). No configured
+   handles on a handle transport → no bypass there (fail closed). An
+   admin can thus CALL any tool at dispatch even on a blank-auth entry.
+   NOTE: the ACL bypass is `is_admin`, but the genuinely dangerous
+   capabilities (`run_command`, `restart_gateway`, `restart_flask_app`,
+   `claude_code`, `/restart`, slash `/stop`) are gated on `is_owner`
+   separately and are NOT widened by admin status — see "Owner vs admin"
+   in §3 (which also documents which commands are NOT owner-gated at
+   all, e.g. `/reset`).
 7. **`roles` and `channels` are Discord-only.** Belong inside
    `auth.discord` only.
 8. **User-ID types are transport-native.** Discord = int IDs.
@@ -967,9 +1050,11 @@ agent's `allowed_tools`, listing it in `tool_grants` would do nothing.
 ## Optional fields
 
 - **`visibility_when_denied`** — `"hidden"` (default) or `"known"`.
-  `"known"` surfaces the tool to the model with a note "exists but you
-  can't use it" so you can decline politely instead of pretending the
-  tool doesn't exist.
+  `"known"` names the tool in the per-speaker user preamble ("exists but
+  this speaker can't use it") so you can decline politely up front.
+  Presentation-only: the schema may still be in the API tools union
+  either way (see the §4 preamble), and a denied call always fails at
+  dispatch with a permission error.
 
 ## Editing via slash commands
 
@@ -983,10 +1068,16 @@ agent's `allowed_tools`, listing it in `tool_grants` would do nothing.
 
 Every tool registered in `TOOL_REGISTRY` gets a blank-auth entry
 appended at agent-load if missing from `allowed_tools`. The blank entry
-denies everyone on every transport — but the Discord owner bypass means
-the operator still sees and can call every framework tool without
-listing it. New tools shipped in the framework appear automatically in
-`/agents` and `/grant` autocomplete without per-agent config changes.
+denies everyone on every transport — at DISPATCH. Model visibility is
+separate: the tools array sent to the API is the full registry (see the
+§4 preamble), so the model can always EMIT a call to any tool, but a
+call the current speaker isn't authorized for fails at dispatch with a
+permission error (owner/admins pass every ACL via the admin bypass, so
+blank-auth tools are effectively admin-only until granted). To let a
+non-admin use an unlisted tool, give it an auth block via `/grant` /
+`/agents` (or a session `tool_grants` entry). New tools shipped in the
+framework appear automatically in `/agents` and `/grant` autocomplete
+without per-agent config changes.
 
 When the agent saves its config, only entries with a non-empty `auth`
 are serialized. Blank auto-injected entries don't pollute on-disk
@@ -1017,8 +1108,8 @@ both tiers with `search_memory(query)`. List dates with
 `list_memory_files()`.
 
 Memory is FACTS. Behavioral rules go in `SOUL.md` / `AGENT.md` /
-`REMINDER.md` / `_shared/FRAMEWORK.md`; tool-specific notes go in your
-personal `TOOLS.md` (extends `_shared/TOOLS.md`).
+`_shared/FRAMEWORK.md`; tool-specific notes go in your personal
+`TOOLS.md` (extends `_shared/TOOLS.md`).
 
 ## Embeddings
 
@@ -1088,8 +1179,9 @@ silence sentinel: if the agent's final reply text, stripped, equals
 **exactly** `STAY_SILENT` (case-sensitive, nothing else), `runtime._run_turn`
 blanks `final_text` so the normal "nothing to post" path runs and NOTHING
 reaches the channel — the literal token is never posted. Defined as
-`STAY_SILENT_SENTINEL` in `openflip/runtime.py`; detection sits right where
-`final_text` is first resolved (~line 2435) so every downstream post-site
+`STAY_SILENT_SENTINEL` in `openflip/runtime.py` (grep the symbol — line
+numbers rot); detection sits right where `final_text` is first resolved
+inside `_run_turn` so every downstream post-site
 (inter-agent route, silent-drop branches, main auto-post) sees the already-
 empty value. The terminal-result contract is also told the empty output was
 intentional, so it won't fire its "no visible reply" warning. Suppression is
@@ -1228,9 +1320,11 @@ agents/<id>/conversations/
 └── <conversation_id>.jsonl.pre_uncompact_<ts>.bak.jsonl # Made by /uncompact.
 ```
 
-`<conversation_id>` is `discord:<channel_id>`, `imessage:<handle>` (1:1) /
-`imessage:<chat_id>` (group), or `linked:<canonical>` for identity-linked
-conversations (see below). On Windows the on-disk filename encodes the
+`<conversation_id>` is `discord:<channel_id>`, or `imessage:<handle>` (1:1) /
+`imessage:<chat_id>` (group). An identity-linked SECONDARY identity (see
+below) has no file of its own — its sessions forward into the PRIMARY
+identity's native conversation_id, so its history lives in the primary's
+file. On Windows the on-disk filename encodes the
 `:` as `%3A` (NTFS forbids colons) — e.g. `discord%3A12345.jsonl`. The
 conversation_id itself keeps the colon form everywhere in memory, URLs,
 and config; only the filename differs. The codec is
@@ -1243,30 +1337,44 @@ never by joining the raw id.
 One person talking to the same agent on Discord AND iMessage normally gets
 two separate conversation histories (`discord:<dm_channel>` and
 `imessage:<handle>`). The top-level `identity_links` map in `config.json`
-merges them into ONE shared history:
+merges them — ANCHOR-based: a SECONDARY identity forwards into a PRIMARY
+identity's native conversation:
 
 ```json
 "identity_links": {
-  "discord:139243578504249344": "flip",
-  "imessage:+15551234567": "flip"
+  "discord:139243578504249344": "imessage:+15551234567"
 }
 ```
 
-- **Keys** are `<transport>:<native_id>` — the Discord **user id** (not a
-  channel id) or the raw iMessage **handle** (phone/email). Keys are
-  case-folded on load, so handle casing doesn't matter.
-- **Values** are an arbitrary canonical string. Every identity mapped to the
-  same value shares one conversation.
+- **Keys** are the SECONDARY identity: `<transport>:<native_id>` — the
+  Discord **user id** (not a channel id) or the raw iMessage **handle**
+  (phone/email). Keys are case-folded on load, so handle casing doesn't
+  matter.
+- **Values** are the PRIMARY **conversation_id** — a real existing session
+  key (`imessage:+15551234567`, `discord:<dm_channel>`, …). Whichever id is
+  the VALUE is the home; the KEY forwards into it. Flip key/value to make
+  the other side primary. There is NO `linked:` prefix and no arbitrary
+  canonical string anymore.
+- **Guards** (`get_identity_links` in `config_global.py`, warn+skip):
+  single-hop only — a primary can never itself be a secondary, and no
+  identity may appear as both a key and a value. Legacy configs in the old
+  shape (every identity → an arbitrary canonical string) are auto-migrated
+  at load: one member is picked as primary (an imessage identity if
+  present, else the first) and the rest forward into it — but write the new
+  shape for anything new.
 
 **How it works.** At session construction, if the speaker's
-`<transport>:<id>` is in the map, the session's `conversation_id` is
-rewritten to `linked:<canonical>` — so history lives in
-`conversations/linked:<canonical>.jsonl` and the runtime's in-memory
-conversation state (live conversation object, active-turn slot, soft-inject
-buffer) is keyed by that same string on every transport. Both transports see
-each other's turns live, no restart needed. Turns from the two transports
-serialize against each other like two messages in one channel (they ARE one
-conversation).
+`<transport>:<id>` is a KEY in the map
+(`resolve_linked_conversation_id`), the session's `conversation_id` is
+rewritten to the PRIMARY's native conversation_id — so history lives in
+the primary's existing `.jsonl` and the runtime's in-memory conversation
+state (live conversation object, active-turn slot, soft-inject buffer) is
+keyed by that same string on every transport
+(`is_forwarded_conversation`). The primary identity's own sessions are
+untouched — it keys by its native id as always. Both transports see each
+other's turns live, no restart needed. Turns from the two transports
+serialize against each other like two messages in one channel (they ARE
+one conversation).
 
 **1:1 only.** The rewrite applies to DMs / 1:1 chats. Guild channels and
 iMessage group chats are shared spaces keyed by channel — they are never
@@ -1291,26 +1399,28 @@ privilege across transports:
   applies independently.
 
 **Adding a link.**
-1. Add both `<transport>:<id>` entries to `identity_links` in `config.json`
-   pointing at the same canonical value.
+1. Pick the PRIMARY (the conversation whose history you want to keep
+   living in its native file) and add ONE entry mapping the secondary
+   identity to the primary's conversation_id:
+   `"discord:<user_id>": "imessage:<handle>"` (or the reverse).
 2. Restart the gateway (config.json is read at startup).
-3. New messages from either transport now land in
-   `linked:<canonical>.jsonl`. Existing per-transport histories are NOT
-   auto-merged — they stay on disk under their old names. To carry one
-   forward, stop the gateway and rename/concatenate the old `.jsonl` into
-   `linked:<canonical>.jsonl` first.
+3. New messages from the secondary transport now land in the PRIMARY's
+   existing `.jsonl`. The secondary's old per-transport history is NOT
+   auto-merged — it stays on disk under its old name. To carry it
+   forward, stop the gateway and concatenate the old `.jsonl` into the
+   primary's file first.
 
 **Tools and commands.** `/reset`, `/compact`, `/uncompact`, `/status`,
-`/stop` and the text-command mirrors operate on the linked conversation when
-fired from a linked DM on either transport (one `/reset` wipes the shared
-history). `inject_context` / `talk_to_agent` accept
-`session_id: "linked:<canonical>"` to target the shared history directly.
-A `talk_to_agent` recipient's reply doesn't post anywhere (inter-agent
-traffic is silent end-to-end) — it auto-routes back into the caller's own
-conversation; when the caller is itself in a linked conversation, the
-threaded `originator_session` keeps the return on the shared
-`linked:<canonical>` history instead of forking it onto a native channel
-key.
+`/stop` and the text-command mirrors operate on the shared (primary)
+conversation when fired from a linked DM on either transport (one
+`/reset` wipes the shared history). `inject_context` / `talk_to_agent`
+target the shared history via the PRIMARY's conversation_id (e.g.
+`session_id: "imessage:+15551234567"`).
+A `talk_to_agent` recipient's reply doesn't post anywhere on its own —
+it auto-routes back into the caller's own conversation; when the caller
+is itself in a linked conversation, the threaded `originator_session`
+keeps the return on the shared primary history instead of forking it
+onto a native channel key.
 
 ## JSONL shape
 
@@ -1343,8 +1453,10 @@ when the guard reports a mid-turn reset.
 
 ## /reset
 
-Owner-only slash command. Backs up the live `.jsonl` to
-`.pre_reset_<ts>.bak.jsonl`, then deletes both `.jsonl` and
+NOT owner-gated — any speaker who passes `should_respond` can fire it,
+slash or text-prefix (intentional-until-changed; if you need it locked
+down, tell the operator, don't assume it already is). Backs up the live
+`.jsonl` to `.pre_reset_<ts>.bak.jsonl`, then deletes both `.jsonl` and
 `.meta.json`. Retention: 5 backups per channel; older pruned on every
 `/reset`. To restore, copy a `.pre_reset_*.bak.jsonl` over the live
 file and `pop` the in-memory conversation by restarting or by
@@ -1393,6 +1505,11 @@ so the next message starts genuinely fresh. Epochs, interrupts, and the
 queue drain are all per-conversation and never cross conversations.
 
 ## /compact and /uncompact (Anthropic only)
+
+Gating: the SLASH `/compact` and `/uncompact` are owner-only; the
+TEXT-PREFIX `/uncompact` is owner-only too, but the text-prefix
+`/compact` is ungated (any speaker who passes `should_respond`) —
+intentional-until-changed asymmetry, see "Owner vs admin" in §3.
 
 `/compact` sets `conv.force_compact_next = True` **and**
 `conv.force_compact_trigger_override = True`, then fires a synthetic
@@ -1547,8 +1664,10 @@ calls.
 ## Hard interrupt
 
 Triggered by:
-- Operator typing a message starting with `/stop` in the channel.
-- Operator firing the `/stop` slash command.
+- A message starting with `/stop` typed in the channel — NOT owner-gated:
+  any speaker who passes `should_respond` can hard-interrupt this way
+  (intentional-until-changed).
+- The `/stop` slash command (owner-only).
 
 Effect: cancels the active `_run_turn` task (`task.cancel()`), wipes
 `_pending_inject[channel_id]`, and drops the queued soft-injects. The
@@ -1698,7 +1817,8 @@ when disabled. Default interval 30 min.
 - Retry-heuristic location — the four in-loop turn-retry heuristics
   (action-promise, peer-prose, empty-reply, and the `promise_without_action`
   stop-hook invocation) were extracted out of `runtime._run_turn` into
-  `openflip/turn_retries.py` (audit §4 item 1, 2026-06-07). The decision
+  `openflip/turn_retries.py` (extracted 2026-06-07; see
+  `agents/agent_a/audits/full_audit_2026-06-07.md`). The decision
   logic — phrase lists, peer-prose line scan, nudge text, env kill switches
   (`OPENFLIP_DISABLE_ACTION_PROMISE_RETRY` / `_PEER_PROSE_RETRY` /
   `_EMPTY_RETRY`), and the `stop_hooks.evaluate_stop_hooks` wrapper — lives
@@ -1847,12 +1967,19 @@ owner-rooted chains; 2026-06-15.)
 
 ## Visibility
 
-**Inter-agent traffic is silent end-to-end (enforced 2026-06).** Neither
-the recipient's turns nor the chain-terminator return turns at the caller
-auto-post to any human channel, regardless of how the chain started. The
-ONLY way agent-to-agent traffic reaches a human is an explicit
-`send_message`. The operator's window into inter-agent conversations is
-the OpenFlip dashboard (reads conversation files directly).
+**Inter-agent traffic is silent by default (2026-06 leak fix), with ONE
+carve-out (2026-06-15 safety net).** The recipient's turns and nested /
+background chain-terminator turns never auto-post to a human channel.
+The single exception: the GENUINE top-level operator terminator — a
+chain-terminator turn where the chain root is operator-visible AND this
+agent is the chain-root agent (the one the human directly messaged) —
+has its plain final text posted to the originating human channel
+(`_terminator_text_surfaces` in `runtime.py`; also requires a real human
+channel and no send_message/end_chain already delivered this turn). Everything else stays silent, so the only OTHER
+way agent-to-agent traffic reaches a human is an explicit
+`send_message` — still the preferred, explicit path. The operator's
+window into inter-agent conversations is the OpenFlip dashboard (reads
+conversation files directly).
 
 Chain root still matters for two things (tagged via
 `originator_visibility`, propagated along the whole chain):
@@ -1882,27 +2009,51 @@ Chain root still matters for two things (tagged via
   handle-keyed 1:1s). Plain Discord channels use the bare channel id as
   before.
 - **End-of-chain.** A chain-terminator turn that ends in plain text
-  simply closes the chain — the text is saved to history (dashboard-
-  visible) but posted nowhere. `end_chain()` remains as an explicit
-  no-op terminator where it's in the toolset.
+  closes the chain. For the genuine top-level operator terminator (chain
+  root = operator-visible AND this agent is the chain-root agent) that
+  text POSTS to the originating channel — the 2026-06-15 safety net
+  above. For every other terminator (nested, agent-rooted, background)
+  the text is saved to history (dashboard-visible) but posted nowhere.
+  `end_chain()` remains as an explicit no-op terminator where it's in
+  the toolset.
 
 ## Discovering peers
 
 `list_files("agents/")` — every non-underscore subdir is a peer agent
 id. Each has its own `agent.json`, `SOUL.md`, conversation, memory.
+NOTE: `agents/` is outside the default read scope (own agent dir +
+system temp dir), so this only works when your effective
+`allowed_read_paths` for the current speaker covers it (e.g. the owner
+scope `["*"]`). Otherwise ask the operator, or use `run_command` if you
+have it.
 
 ## Isolation
 
 You cannot read another agent's:
 - `MEMORY.md` (path ACL).
 - Conversation `.jsonl` files (path ACL).
-- `agent.json` (allowed_read_paths default to your own dir).
+- `agent.json` (default read scope is your own dir + the system temp
+  dir).
 
-The exception: `_shared/` files are readable by every agent that lists
-them.
+`_shared/` files are NOT an ACL exception: listing one in `system_files`
+loads it into your prompt (the prompt loader isn't gated by path ACLs),
+but reading it via `read_file` still requires your effective
+`allowed_read_paths` to cover `agents/_shared/` — see the note at the
+top of this file.
 
 ## Robustness (timeouts)
 
+- **Model round-trips: layered timeouts + transient retries.** The
+  anthropic provider has no total request timeout — a healthy long
+  stream is never killed mid-generation. Liveness comes from a 90s
+  `sock_read` per-chunk inactivity timeout (stalled connection → error
+  → retried), and transient errors (429 honoring retry-after, 5xx/529,
+  network drops) retry inside `conv.chat()` with exponential backoff +
+  jitter (~90s budget; `⏳ retrying…` notice posts if recovery takes
+  more than ~8s). The runtime's `asyncio.wait_for` per chat round
+  (`CHAT_TIMEOUT_S = 600` in `runtime.py`) is a backstop that should
+  fire only on true hangs; when it does, the user's message stays in
+  history so "try again" retries it.
 - **Auto-route return-channel resolution is timeout-bounded.** When a
   recipient's reply auto-routes back to the operator, the originator's
   bot resolves a DM channel via `fetch_user` + `create_dm`. Both calls
@@ -1926,8 +2077,10 @@ over `agent.json` + every file in `system_files` + project `CLAUDE.md`.
 If any byte differs, the agent reloads and the next turn picks up:
 
 - `agent.json` field changes (tools, channels, model… everything).
-- `SOUL.md` / `AGENT.md` / personal `TOOLS.md` / `REMINDER.md` edits.
-- `_shared/FRAMEWORK.md` and `_shared/TOOLS.md` edits.
+- Edits to any file listed in `system_files` — `SOUL.md`, `AGENT.md`,
+  personal `TOOLS.md`, `_shared/FRAMEWORK.md`, `_shared/TOOLS.md`, and
+  a legacy `REMINDER.md` if an agent still lists it there.
+- Project-level `CLAUDE.md` edits (it's in the fingerprint too).
 - New files added to `system_files`.
 
 The `/reload` slash command forces it explicitly.
@@ -1941,7 +2094,9 @@ The `/reload` slash command forces it explicitly.
   refresh state caches across the process.
 - Transport class swap (changing `transport: "discord"` →
   `"imessage"` mid-run).
-- `api_config.json` token changes.
+- Bot token changes — canonical home is `integrations.discord.tokens`
+  in `config.json` (read once at startup); the legacy `api_config.json`
+  `tokens` block is still honored as a Discord-only fallback.
 
 Use `restart_gateway(reason, continuation=, force=False)` to do this
 safely. The preflight blocks unsafe restarts; pass `force=True` only
@@ -2037,8 +2192,9 @@ non-content errors and does NOT append them to conversation history
   subscription routing on sonnet/opus. Without it, those models 429
   with the third-party harness tier rate limit.
 - Cache breakpoints: one on the system block (1h TTL), one on the
-  rolling tail (1h TTL). REMINDER.md injection moves the tail
-  breakpoint up to `-3` to keep REMINDER edits uncached.
+  rolling tail (1h TTL) — the tail breakpoint lands on the newest user
+  message so the whole history caches. (The old REMINDER.md `-3` offset
+  is gone with the REMINDER injection mechanic.)
 - `output_config.effort` — present only when an effort level resolves to
   a valid value (`low`/`medium`/`high`/`xhigh`/`max`); otherwise the key
   is absent and the API uses its default (`high`). Resolved by
@@ -2117,8 +2273,8 @@ survive `git pull`.
 2. Add its files:
    - `agent.json` — see "Example minimal agent.json" above for the
      skeleton. (Create the dir without one and the framework
-     auto-generates a default `agent.json` + `SOUL.md` + `REMINDER.md`
-     stub on next startup — but authoring your own is the point.)
+     auto-generates a default `agent.json` + `SOUL.md` stub on next
+     startup — but authoring your own is the point.)
    - `SOUL.md` — the character/personality prompt.
 3. Add the bot token to `config.json` under
    `integrations.discord.tokens.<id>`:
@@ -2133,7 +2289,8 @@ survive `git pull`.
    auto-added to `agent_state.json` with `enabled: true`, then spawned
    — no manual flag flip needed. (To keep a discovered agent from
    spawning, set its `agent_state.json` entry to `{"enabled": false}`
-   or use the owner disable slash command.)
+   or toggle it off in the `/agents` panel — there is no dedicated
+   enable/disable slash command.)
 
 **Pull-safe:** personal agent dirs (`agents/*/`, except `_shared/` and
 `example_agent/`), `config.json`, and `agent_state.json` are all
@@ -2144,7 +2301,10 @@ gitignored — a new agent survives `git pull`.
 1. Write a `.py` in `openflip/tools/` with a function decorated
    `@tool` (imported from `openflip/tools/_base.py`), following the
    shape of an existing tool — return a `ToolResult`; honor the tool
-   design rules + the path-redaction note above.
+   design rules + the path-redaction note above. The docstring is
+   load-bearing: its first paragraph is the model-visible description
+   and the `Args:` block becomes the per-parameter schema descriptions
+   sent to the provider — write both carefully.
 2. It auto-loads. `openflip/tools/__init__.py` explicitly imports the
    framework-core tools, then dynamically scans the tools dir and
    imports every other `.py` (or package dir with `__init__.py`),
@@ -2296,13 +2456,6 @@ update_core_memory("""
 Read first (`read_memory()`), edit the string, write the whole file
 back. There is no partial-update tool — the whole file is replaced.
 
-## Trim REMINDER.md
-
-`REMINDER.md` is paid every turn (uncached, end of payload). Soft-warn
-at ~2000 chars. Keep tight: behavioral drift you keep slipping on. If
-the nudge no longer fires for you, remove it — every line is paid
-forever.
-
 ## Restore a conversation from backup
 
 ```
@@ -2336,10 +2489,20 @@ openflip --since "10 minutes ago"`.
      the cause: `(reason=...)` means the model genuinely returned no
      text and no tool dispatched; `(provider_error: ...)` means the
      provider (Anthropic) returned a non-200 — rate limit (429),
-     overload (529), auth, or 400. **Provider errors are now surfaced
-     to the operator verbatim** ("⚠️ The model provider returned an
-     error: ...") instead of the old generic "known bug" catch-all, so
-     a 429/529 reads as a temporary rate limit/overload, not a bug. The
+     overload (529), auth, or 400. **Transient errors (429/5xx/529,
+     network drops, stalled streams) are retried inside `conv.chat()`**
+     with exponential backoff + jitter (retry-after honored on 429, up
+     to ~90s total, `transient <kind> — retry N/M` log lines) before
+     anything surfaces, so most of these recover invisibly. When
+     retries exhaust, the error posts verbatim ("⚠️ Anthropic API
+     529 ..."), the user's message STAYS in history (say "try again"
+     to retry — no retyping), and no [FRAMEWORK] note is written. Only
+     structural failures (bad_request 4xx, malformed pre-flight) pop
+     the trailing user message and leave a [FRAMEWORK] note, because
+     re-sending those exact bytes would fail identically. A stream
+     that dies mid-response after substantial text (and no tool calls)
+     is salvaged and posted with a "(response was cut off mid-stream)"
+     marker instead of discarding the billed tokens. The
      genuinely-empty case posts "⚠️ The model returned an empty
      response (reason: ...). Try `/reset` if it persists." When the
      in-loop framework-error branch already posted the error to the
@@ -2418,9 +2581,13 @@ byte-for-byte. Always verify.
 
 ## "What tools can I actually call right now?"
 
-In Discord: `/help` (visible to the speaker). In a tool call: every
-function in your local scope IS callable for the current speaker —
-denied tools don't get function references injected.
+In Discord: `/help` (visible to the speaker). Note the tools you SEE are
+not necessarily the tools THIS speaker can call: the API tools array is
+the agent-stable full registry (see the §4 preamble), and per-speaker
+ACL is enforced at dispatch — a blocked call returns "You don't have
+permission to call '<tool>' for this user."
+The per-speaker user preamble on each turn lists tools the current
+speaker can't use; check it before promising a tool will work.
 
 ## "What's the current model / context window?"
 
@@ -2477,9 +2644,13 @@ caveat applies: don't set `xhigh`/`max` on a model that doesn't support it.
 
 Available as both the Discord slash command and a cross-transport text-prefix
 mirror (iMessage + any non-Discord transport), alongside `/reset`, `/compact`,
-`/uncompact`, `/model`, `/status`, `/reload`, `/restart`, `/help`. The text arg is
-optional: bare `/effort` shows the current override + usage; `/effort <level>`
-sets it. Owner-only and Anthropic-only on every transport.
+`/uncompact`, `/model` (alias `/models`), `/dream`, `/status`, `/reload`,
+`/restart`, `/help`. The text arg is optional: bare `/effort` shows the current
+override + usage; `/effort <level>` sets it. `/effort` is owner-only and
+Anthropic-only on every transport. Text-mirror gating in general: `/effort`,
+`/model`, `/models`, `/dream`, `/uncompact`, `/reload`, `/restart` are
+owner-only; `/reset`, `/compact`, `/status`, `/help` are ungated (see "Owner
+vs admin" in §3).
 
 `/model` is also a cross-transport text-prefix mirror (the Discord slash `/model`
 opens an interactive panel that can't render off-Discord): bare `/model` shows the
@@ -2488,6 +2659,26 @@ current model + provider + usage, `/model <model-name>` switches the agent's mod
 Owner-only on every transport.
 
 `/status` slash command shows runtime state.
+
+### Other slash commands (Discord-only, owner-gated)
+
+- `/conversation [full]` — dump THIS channel's full conversation payload
+  (messages, tool calls, options, and optionally the system extension
+  that would be injected next turn). Diagnostic gold for "what does the
+  model actually see".
+- `/eval [agent] [mode] [category]` — run the behavioral test suite
+  (`tests/eval_behavior.py`) against an agent; fast (~3 min, pinned
+  strings) or full (~10 min, AI-generated prompts). Results post in the
+  channel.
+- `/toolset [tool]` — interactive panel for owner-locked tool parameters
+  (models, steps, dimensions — `data/tool_settings.json`).
+  `/toolset_reset <tool>` resets one tool's params to defaults;
+  `/toolset_reset_all` resets every tool.
+- `/options` — interactive panel for an agent's Ollama options.
+- `/models` — interactive model-management panel (list/pull/unload;
+  distinct from the text-prefix `/models` alias of `/model`).
+- `/agents` — agent overview panel: enable/disable, reload, per-agent
+  tool toggles.
 
 ### `/usage` — aggregated API usage (owner-only)
 

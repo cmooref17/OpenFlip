@@ -23,8 +23,9 @@ false-positive on legitimate openflip traffic:
     appear as the first message in assistant role.
   * `body["system"]` shape checks — the billing block lives there and
     has its own shape; tool_use/tool_result pairing does not apply.
-  * strict user/assistant alternation — REMINDER.md injection produces
-    consecutive user messages by design.
+  * strict user/assistant alternation — soft-inject [FRAMEWORK] markers
+    and timestamp/preamble handling produce consecutive user messages
+    by design (REMINDER.md injection did too before its 2026-07 removal).
   * "first user message must follow a preceding assistant" — restart-
     resume injects synthetic continuation user messages with no prior
     assistant turn.
@@ -36,8 +37,9 @@ framework with HTTP 400 "model does not support assistant message
 prefill. conversation must end with a user message." The post-drain
 retry false-fire (incident 2026-05-25) was exactly this shape and
 went straight to the operator's channel. False-positive guards:
-  1. We never legitimately end on assistant — even REMINDER injection
-     adds a user role marker AFTER the assistant turn.
+  1. We never legitimately end on assistant — every injection path
+     (soft-inject markers, tool_results) lands a user-role entry
+     AFTER the assistant turn.
   2. Compaction blocks appear at message[0], not message[-1].
   3. Restart-resume injects a synthetic user message; trailing slot
      is always user.
@@ -546,13 +548,13 @@ if __name__ == "__main__":
         ],
     })
 
-    # E: REMINDER between cached history and the real new user message
-    _expect_ok("E: REMINDER consecutive user messages", {
+    # E: consecutive user messages (soft-inject markers etc.) must pass
+    _expect_ok("E: consecutive user messages", {
         "model": "claude-x",
         "messages": [
             {"role": "user", "content": "earlier"},
             {"role": "assistant", "content": "earlier reply"},
-            {"role": "user", "content": "[SYSTEM REMINDER]: stay on task"},
+            {"role": "user", "content": "[FRAMEWORK]: While you were working, the operator sent this new message: hi"},
             {"role": "user", "content": "real question"},
         ],
     })

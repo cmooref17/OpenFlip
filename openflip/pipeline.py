@@ -9,15 +9,16 @@ calls the model, and hands tool calls off to the executor.
 # busts the cached prefix.
 #
 #  ┌─ agent.system_message (assembled at agent load) ────────────────┐
-#  │   1. SOUL.md                  (per-agent character — stable)    │
-#  │   2. AGENT.md                 (per-agent supplement, optional)  │
-#  │   3. _shared/FRAMEWORK.md     (universal rules, with template   │
-#  │                                substitution for {agent_id} etc) │
-#  │   4. _shared/TOOLS.md         (universal tool hygiene)          │
+#  │   0. project CLAUDE.md        (prepended by _load_system_files)  │
+#  │   then agent.json's system_files IN LISTED ORDER — currently     │
+#  │   SOUL.md → _shared/FRAMEWORK.md → AGENT.md → _shared/TOOLS.md   │
+#  │   → TOOLS.md for most agents (template substitution for          │
+#  │   {agent_id}/{agent_dir}/{display_name} applies to each file)    │
 #  └─────────────────────────────────────────────────────────────────┘
 #
 #  ┌─ system_extension (built per-turn by build_visible_tools) ──────┐
-#  │   5. tool_rules.for_extension (when any tools — stable)         │
+#  │   tool_rules.for_extension (byte-stable across speakers) plus    │
+#  │   the chain-terminator steering block on chain turns             │
 #  └─────────────────────────────────────────────────────────────────┘
 #
 # Note: memory instructions are NOT injected per-turn — they live in the
@@ -26,10 +27,12 @@ calls the model, and hands tool calls off to the executor.
 # Per-speaker ACL state (blocked-tools list, settings filtered to
 # callable tools) is NOT in the system prompt. It rides on the
 # user-message preamble built by build_visible_tools — that way one
-# speaker rotation doesn't bust the cached system prefix.
+# speaker rotation doesn't bust the cached system prefix. Tool SCHEMAS
+# sent to the API are likewise agent-stable (build_api_tool_funcs);
+# per-speaker callability is enforced at dispatch.
 #
-# Hot reload is explicit (/reload slash command). The runtime no longer
-# stat()s files on every inbound message — see runtime.py for why.
+# Hot reload: system files are hash-checked and auto-reloaded before each
+# turn (see reload_if_changed in runtime.py); /reload forces it.
 """
 from __future__ import annotations
 from typing import Optional
@@ -131,9 +134,12 @@ def build_inbound_from_discord(message: nextcord.Message, bot_user_id: int, owne
         )
         for a in message.attachments
     ]
-    # Reply support: pull attachments from the resolved replied-to message too.
-    # Don't recurse into a full InboundMessage for the parent — Phase 1 only
-    # needs the surface that build_user_prompt currently uses.
+    # Reply support: pull attachments AND text from the resolved replied-to
+    # message. Without the quoted text, a user replying "yes do that" to an
+    # older message gives the model zero referent — the single cheapest
+    # comprehension win in active channels. The parent is wrapped in a
+    # shallow InboundMessage (same session object; no recursion).
+    reply_to = None
     ref = getattr(message, "reference", None)
     if ref is not None:
         resolved = getattr(ref, "resolved", None)
@@ -144,6 +150,23 @@ def build_inbound_from_discord(message: nextcord.Message, bot_user_id: int, owne
                     filename=(getattr(a, "filename", None) or "file"),
                     url=a.url,
                 ))
+        # DeletedReferencedMessage has no content/author — getattr guards.
+        r_text = getattr(resolved, "content", None) if resolved is not None else None
+        if r_text:
+            r_author = getattr(resolved, "author", None)
+            reply_to = InboundMessage(
+                session=session,
+                text=r_text,
+                sender_id=int(getattr(r_author, "id", 0) or 0),
+                sender_display_name=(
+                    getattr(r_author, "display_name", None)
+                    or getattr(r_author, "name", None)
+                    or "User"
+                ),
+                sender_is_bot=bool(getattr(r_author, "bot", False)),
+                is_dm=is_dm,
+                mentions_us=False,
+            )
     mentions_us = any(u.id == bot_user_id for u in message.mentions)
     return InboundMessage(
         session=session,
@@ -154,7 +177,7 @@ def build_inbound_from_discord(message: nextcord.Message, bot_user_id: int, owne
         is_dm=is_dm,
         mentions_us=mentions_us,
         attachments=attachments,
-        reply_to=None,
+        reply_to=reply_to,
     )
 
 
@@ -173,6 +196,11 @@ def build_user_prompt(inbound: InboundMessage) -> str:
     Attachment URLs go on their own line for tools that accept image/audio
     URLs via the [attachment: …] convention.
 
+    The configured owner's messages carry a framework-verified " [operator]"
+    suffix on the speaker name (spoof-stripped from everyone else), and a
+    reply to an earlier message is prefixed with a truncated
+    [replying to <name>: "…"] quote line.
+
     Takes an InboundMessage (transport-neutral). Discord-side wrapping happens
     at the on_message boundary in transports/discord.py.
     """
@@ -182,7 +210,24 @@ def build_user_prompt(inbound: InboundMessage) -> str:
     text = inbound.text
     raw_speaker = inbound.sender_display_name or "User"
     speaker = name_map.get(raw_speaker, raw_speaker)
+    # Authoritative operator tag. Display names are spoofable (any guild
+    # member can nickname themselves "Flip"), so prompt-level rules that key
+    # on WHO is speaking need a framework-verified signal: strip any
+    # user-supplied "[operator]" from the name, then append the real tag
+    # only when the session says the sender IS the configured owner.
+    speaker = speaker.replace("[operator]", "").strip() or "User"
+    sess = getattr(inbound, "session", None)
+    if sess is not None and getattr(sess, "is_owner", False):
+        speaker = f"{speaker} [operator]"
     formatted = f"{speaker}: {text}" if text else f"{speaker}:"
+    reply = getattr(inbound, "reply_to", None)
+    if reply is not None and getattr(reply, "text", ""):
+        r_raw = reply.sender_display_name or "User"
+        r_name = name_map.get(r_raw, r_raw).replace("[operator]", "").strip() or "User"
+        r_text = " ".join(reply.text.split())
+        if len(r_text) > 300:
+            r_text = r_text[:300] + "…"
+        formatted = f'[replying to {r_name}: "{r_text}"]\n{formatted}'
     attachment_urls = [a.url for a in inbound.attachments if a.url]
     if attachment_urls:
         urls = "\n".join(f"[attachment: {u}]" for u in attachment_urls)
@@ -342,6 +387,35 @@ def should_respond(agent: Agent, inbound: InboundMessage, bot_user_id: int) -> b
 MEMORY_TOOL_NAMES = {"save_memory", "update_core_memory", "search_memory", "read_memory", "list_memory_files"}
 
 
+def build_api_tool_funcs(agent: Agent, *, transport: str = "discord", tool_grants: list[str] | None = None, tool_allowlist: list[str] | None = None) -> list:
+    """Agent-stable tool list sent to the model API (NOT per-speaker).
+
+    Cache note: tool schemas render at position 0 of the prompt, so any
+    per-speaker variation in this list invalidates the tools + system +
+    message caches together — in a shared channel every speaker rotation
+    would re-read the whole conversation uncached. The old design sent the
+    per-speaker callable set, and the owner/admin ACL bypass makes EVERY
+    registered tool callable on owner turns — so owner/non-owner alternation
+    flipped the schema set constantly. The model therefore now always sees
+    the FULL registry, in registry (import) order, which is deterministic
+    across restarts. That matches what owner turns always exposed; per-
+    speaker enforcement stays at dispatch: execute_tool_calls() fails
+    blocked calls with a model-visible permission error, and the per-speaker
+    user preamble lists blocked-but-known tools to decline up front.
+
+    `tool_allowlist` (the restrictive per-session ceiling, e.g. external
+    per-token allowed_tools) is a security boundary and still narrows the
+    schema set — it is a session property, stable across a session's turns.
+    `transport`/`tool_grants` are accepted for call-site symmetry; grants
+    only ever name registered tools, which are all present already.
+    """
+    allow: set[str] | None = None if tool_allowlist is None else {str(t) for t in tool_allowlist}
+    return [
+        t.func for name, t in TOOL_REGISTRY.items()
+        if allow is None or name in allow
+    ]
+
+
 def build_visible_tools(agent: Agent, *, speaker_id, speaker_role_ids, channel_id, owner: bool = False, transport: str = "discord", chain_terminator_mode: bool = False, chain_root_operator: bool = True, handle: str = "", tool_grants: list[str] | None = None, tool_allowlist: list[str] | None = None):
     """Return (callable_tool_funcs, system_extension_text, user_preamble_text).
 
@@ -404,7 +478,7 @@ def build_visible_tools(agent: Agent, *, speaker_id, speaker_role_ids, channel_i
     # no narrowing → inject as before; a list (incl. []) → inject only named ones.
     _mem_allow: set[str] | None = None if tool_allowlist is None else {str(t) for t in tool_allowlist}
     if agent.memory_enabled:
-        for mname in MEMORY_TOOL_NAMES:
+        for mname in sorted(MEMORY_TOOL_NAMES):
             if mname not in seen_names:
                 if _mem_allow is not None and mname not in _mem_allow:
                     continue

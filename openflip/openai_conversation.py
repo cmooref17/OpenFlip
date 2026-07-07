@@ -1455,40 +1455,8 @@ class OpenAIConversation:
                     agent=self.agent.id,
                 )
 
-        # REMINDER.md injection — same semantics as the anthropic provider:
-        # uncached tail position, before the newest user message, never
-        # persisted. Skipped when the last api message is a tool result
-        # (OpenAI requires tool messages to immediately follow the assistant
-        # message that called them).
-        try:
-            agent_dir = os.path.dirname(self.agent.path) if getattr(self.agent, "path", None) else None
-            if agent_dir:
-                reminder_path = os.path.join(agent_dir, "REMINDER.md")
-                if os.path.exists(reminder_path):
-                    with open(reminder_path, "r", encoding="utf-8") as _f:
-                        reminder_text = _f.read().strip()
-                    if reminder_text:
-                        if len(reminder_text) > 2000:
-                            print_ts(
-                                f"{COLOR_YELLOW}REMINDER.md is {len(reminder_text)} chars "
-                                f"(~{len(reminder_text) // 4} tokens) — paid every turn. "
-                                f"Consider trimming.{COLOR_END}",
-                                agent=self.agent.id,
-                            )
-                        if api_messages and api_messages[-1].get("role") != "tool":
-                            reminder_msg = {
-                                "role": "user",
-                                "content": f"[SYSTEM REMINDER]: {reminder_text}",
-                            }
-                            api_messages = (
-                                api_messages[:-1] + [reminder_msg] + [api_messages[-1]]
-                            )
-        except Exception as _rem_err:
-            print_ts(
-                f"{COLOR_YELLOW}REMINDER.md injection failed (continuing without): "
-                f"{_rem_err}{COLOR_END}",
-                agent=self.agent.id,
-            )
+        # REMINDER.md per-turn injection removed (2026-07-06, operator
+        # decision) — standing guidance lives in the cached system files.
 
         body: dict[str, Any] = {
             "model": self.model,
@@ -1668,7 +1636,7 @@ class OpenAIConversation:
         the request; a 401 forces one refresh-and-retry (mirroring the
         anthropic provider's 401 path), then surfaces a terminal auth error.
         Side effects (last_usage / meta sidecar / usage ledger / pre-flight
-        trim / REMINDER.md / image injection) match the api-key worker.
+        trim / image injection) match the api-key worker.
         Recovery paths: 429 → rate_limit; 400 context overflow → halve
         budget + retry (≤3); other non-200 → bad_request.
         """
@@ -1704,42 +1672,8 @@ class OpenAIConversation:
                     agent=self.agent.id,
                 )
 
-        # REMINDER.md injection — same semantics as the other providers:
-        # uncached tail position, before the newest user message, never
-        # persisted. Skipped unless the last item is a user message (a
-        # function_call_output tail must stay adjacent to its call).
-        try:
-            agent_dir = os.path.dirname(self.agent.path) if getattr(self.agent, "path", None) else None
-            if agent_dir:
-                reminder_path = os.path.join(agent_dir, "REMINDER.md")
-                if os.path.exists(reminder_path):
-                    with open(reminder_path, "r", encoding="utf-8") as _f:
-                        reminder_text = _f.read().strip()
-                    if reminder_text:
-                        if len(reminder_text) > 2000:
-                            print_ts(
-                                f"{COLOR_YELLOW}REMINDER.md is {len(reminder_text)} chars "
-                                f"(~{len(reminder_text) // 4} tokens) — paid every turn. "
-                                f"Consider trimming.{COLOR_END}",
-                                agent=self.agent.id,
-                            )
-                        if input_items and input_items[-1].get("role") == "user":
-                            reminder_item = {
-                                "role": "user",
-                                "content": [{
-                                    "type": "input_text",
-                                    "text": f"[SYSTEM REMINDER]: {reminder_text}",
-                                }],
-                            }
-                            input_items = (
-                                input_items[:-1] + [reminder_item] + [input_items[-1]]
-                            )
-        except Exception as _rem_err:
-            print_ts(
-                f"{COLOR_YELLOW}REMINDER.md injection failed (continuing without): "
-                f"{_rem_err}{COLOR_END}",
-                agent=self.agent.id,
-            )
+        # REMINDER.md per-turn injection removed (2026-07-06, operator
+        # decision) — standing guidance lives in the cached system files.
 
         body: dict[str, Any] = {
             "model": self.model,
