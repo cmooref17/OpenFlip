@@ -1989,12 +1989,19 @@ class AgentRunner:
             if _ss is not None:
                 _acl_tool_grants = list(getattr(_ss, "tool_grants", None) or [])
                 _acl_tool_allowlist = getattr(_ss, "tool_allowlist", None)
-                if _ss.transport == "imessage":
-                    _acl_transport = "imessage"
-                    _acl_speaker = _ss.display_name or ""
+                if _ss.transport and _ss.transport != "discord":
+                    _acl_transport = _ss.transport
                     # Raw handle backs the admin bypass for handle-based transports
                     # (see _check_acl). Source of truth — not the unstable hash.
+                    # Extracted for EVERY non-Discord transport: is_admin/is_owner
+                    # fail closed on an empty handle, so limiting this to imessage
+                    # silently stripped the owner/admin tier from other transports
+                    # (their auto-injected blank-auth tools denied even the owner).
                     _acl_handle = getattr(_ss, "handle", "") or ""
+                    if _ss.transport == "imessage":
+                        # iMessage auth users are handle strings; the numeric
+                        # speaker_id is a per-process hash that can never match.
+                        _acl_speaker = _ss.display_name or ""
         except Exception:
             pass
         callable_funcs, system_extension, user_preamble = build_visible_tools(
