@@ -1830,6 +1830,23 @@ class AnthropicConversation:
                 msg = f"⚠️ Model declined (stop_reason=refusal, category={cat})."
                 if why:
                     msg += f" {why}"
+            elif stop_reason == "end_turn":
+                # A clean empty end_turn is a legitimate "nothing to add" finish,
+                # NOT an API failure — it routinely closes bookkeeping tool chains
+                # (save_memory etc.) where the model already said its piece
+                # earlier in the turn. Returning a framework error here posts
+                # "⚠️ Empty reply" straight to the operator, pre-empting the
+                # machinery that already handles this case: runtime's empty-reply
+                # nudge-and-retry (one shot, so the model gets a chance to close
+                # with text) and, if it stays empty, the terminal contract's
+                # _clean_empty_end_turn suppression (Claude Code parity). Defer
+                # to them instead.
+                print_ts(
+                    f"{COLOR_YELLOW}empty reply (stop_reason=end_turn) — deferring "
+                    f"to runtime nudge-and-retry / quiet-finish{COLOR_END}",
+                    agent=self.agent.id,
+                )
+                return response
             elif stop_reason:
                 msg = (
                     f"⚠️ Empty reply (stop_reason={stop_reason}). No text or "
