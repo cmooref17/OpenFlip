@@ -1209,8 +1209,21 @@ class AgentRunner:
                     f"— from {inbound.sender_display_name}{COLOR_END}",
                     agent=self.agent.id,
                 )
-                # Non-Discord transports: no inbound Message to add 👀
-                # reaction to. Operator gets visibility via log only.
+                # Ack through the transport when it can react natively:
+                # needs the platform message id (InboundMessage.native_message_id)
+                # and a transport add_reaction(session_id, message_id, emoji).
+                # Transports without either keep the old log-only behavior.
+                try:
+                    _mid = getattr(inbound, "native_message_id", "") or ""
+                    _react = getattr(_transport, "add_reaction", None)
+                    if _mid and _react is not None:
+                        await _react(inbound.session.transport_id, _mid, "👀")
+                except Exception as _react_err:
+                    print_ts(
+                        f"{COLOR_YELLOW}soft-inject 👀 via transport failed "
+                        f"(continuing): {_react_err}{COLOR_END}",
+                        agent=self.agent.id,
+                    )
                 return
 
         self._ensure_worker_started()
@@ -2155,31 +2168,65 @@ class AgentRunner:
         # AnthropicConversation / OpenAIConversation drains on its next
         # chat() / chat_stream().
         _img_tmp_paths: list[str] = []
+        _inbound_atts = (list(getattr(inbound, "attachments", None) or [])
+                         if discord_message is None else [])
         if (agent.provider in ("anthropic", "openai")
-                and discord_message is not None
-                and getattr(discord_message, "attachments", None)):
+                and ((discord_message is not None
+                      and getattr(discord_message, "attachments", None))
+                     or _inbound_atts)):
             try:
                 import aiohttp, tempfile, os as _os
-                from .pipeline import extract_image_attachments as _eia
-                img_meta = _eia(discord_message)
+                if discord_message is not None:
+                    from .pipeline import extract_image_attachments as _eia
+                    img_meta = _eia(discord_message)
+                else:
+                    # Transport-agnostic path (iMessage/goen/...): same image
+                    # filter, applied to the InboundMessage attachments.
+                    from .pipeline import _IMAGE_EXTS as _img_exts
+                    img_meta = []
+                    for _a in _inbound_atts:
+                        _ct = (getattr(_a, "content_type", "") or "").lower()
+                        _fn = (getattr(_a, "filename", "") or "").lower()
+                        if _ct.startswith("image/") or any(_fn.endswith(_e) for _e in _img_exts):
+                            img_meta.append({"url": getattr(_a, "url", "") or "",
+                                             "content_type": _ct or "image/png",
+                                             "filename": _fn or "image"})
                 if img_meta:
                     pending = list(getattr(conv, "_pending_image_attachments", None) or [])
+                    # Platforms whose attachment URLs need authentication (or
+                    # anti-bot-tolerant headers) expose an async
+                    # read_attachment(url) -> bytes on their transport; fall
+                    # back to a plain GET for public URLs (Discord CDN).
+                    _att_transport = getattr(channel, "_transport", None) or self.transport
+                    _read_hook = getattr(_att_transport, "read_attachment", None)
                     async with aiohttp.ClientSession() as _http:
                         for entry in img_meta:
                             url = entry.get("url")
                             if not url:
                                 continue
-                            try:
-                                async with _http.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                                    if r.status != 200:
-                                        continue
-                                    data = await r.read()
-                            except Exception as _dl_err:
-                                print_ts(
-                                    f"{COLOR_YELLOW}image attachment download failed: {_dl_err}{COLOR_END}",
-                                    agent=agent.id,
-                                )
-                                continue
+                            data = None
+                            if _read_hook is not None:
+                                try:
+                                    data = await _read_hook(url)
+                                except Exception as _hook_err:
+                                    print_ts(
+                                        f"{COLOR_YELLOW}transport read_attachment failed "
+                                        f"({_hook_err}); trying plain GET{COLOR_END}",
+                                        agent=agent.id,
+                                    )
+                                    data = None
+                            if data is None:
+                                try:
+                                    async with _http.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                                        if r.status != 200:
+                                            continue
+                                        data = await r.read()
+                                except Exception as _dl_err:
+                                    print_ts(
+                                        f"{COLOR_YELLOW}image attachment download failed: {_dl_err}{COLOR_END}",
+                                        agent=agent.id,
+                                    )
+                                    continue
                             fn = entry.get("filename") or "image"
                             ct = entry.get("content_type") or "image/png"
                             try:

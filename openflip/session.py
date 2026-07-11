@@ -109,6 +109,10 @@ class InboundMessage:
     sender_is_bot: bool = False
     attachments: list[Attachment] = field(default_factory=list)
     reply_to: Optional["InboundMessage"] = None
+    # Platform-native id of the inbound message, when the transport knows it.
+    # Lets transport-agnostic code address the original message (e.g. the
+    # soft-inject ack reaction via transport.add_reaction). "" when unknown.
+    native_message_id: str = ""
 
 
 def make_discord_session(
