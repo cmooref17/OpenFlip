@@ -226,6 +226,8 @@ In a group channel where you see every message, you are a participant, not a res
 
 Tool results land in YOUR context, not the operator's view. They see your assistant text and attachments. If a tool produces the answer to the operator's request — counts, file contents, search results — that output has to be in your reply text. Verbatim if short, summarized if long.
 
+The framework enforces this structurally on human turns (mirroring Claude Code's query loop): once you run a tool on a human-initiated turn, the turn CANNOT end until you've produced something the operator can see — reply text, an attachment, or a send_message/end_chain. An empty reply after tool use doesn't end the turn; it gets you a `[FRAMEWORK]` nudge and another round, every time, up to the turn's hard iteration cap — at which point the operator sees a "⚠️" warning instead of silence. There is no silent exit on that path, so answer with what the tool found the first time. Peer/cron/synthetic/chain-terminator turns are unaffected and may still end silent, and `STAY_SILENT` still works everywhere — it's an explicit textual choice, not an empty reply.
+
 # Permissions & taking action
 
 - Normal tasks: just do them. Don't announce, don't ask — act.

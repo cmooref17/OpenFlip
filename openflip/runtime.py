@@ -25,6 +25,9 @@ from .turn_retries import (
     detect_peer_prose,
     build_peer_prose_nudge,
     empty_retry_nudge,
+    no_final_text_guarantee_enabled,
+    no_final_text_nudge,
+    operator_facing_turn,
     run_stop_hooks,
 )
 from . import agent_state as _agent_state
@@ -2641,7 +2644,11 @@ class AgentRunner:
                         # turn ends with the operator-visible warn from the
                         # terminal-contract diagnostic).
                         # Gate (kill switch + one-shot) + nudge text extracted
-                        # to turn_retries.empty_retry_nudge.
+                        # to turn_retries.empty_retry_nudge. On an operator-
+                        # facing human turn that already ran a tool, exhausting
+                        # this one-shot is no longer terminal: the final-text
+                        # guarantee at the turn-completion gate below keeps
+                        # the loop alive until the operator has output.
                         nudge = empty_retry_nudge(bool(locals().get("_empty_retry_used")))
                         if nudge is not None:
                             _empty_retry_used = True
@@ -2702,6 +2709,11 @@ class AgentRunner:
                         try:
                             for chunk in _split_for_discord(_ct.strip()):
                                 await _safe_channel_send(channel, chunk)
+                            # The operator saw text this turn — the final-text
+                            # guarantee at the gate below and the terminal
+                            # contract must not treat a later textless
+                            # end_turn as dead air.
+                            _posted_assistant_text = True
                         except Exception:
                             pass
 
@@ -2784,6 +2796,76 @@ class AgentRunner:
                                         f"{_inject_err}{COLOR_END}",
                                         agent=agent.id,
                                     )
+                        # ----- Final-text guarantee (CC parity, 2026-07-15) -----
+                        # Claude Code's query loop cannot end a turn on the
+                        # round that ran tools: after tool_use it ALWAYS runs
+                        # another model round, and the turn only terminates on
+                        # a final tool-free assistant response — so "a tool
+                        # ran, then the turn ended with no assistant text" has
+                        # no exit path there. e19776b ported CC's empty-message
+                        # FILTER without that loop guarantee, which left that
+                        # exit open here: tool_use → tools run → next round
+                        # comes back an empty end_turn → break → dead air.
+                        # This closes it STRUCTURALLY, as part of the turn-
+                        # completion gate: on an operator-facing human turn
+                        # (operator_facing_turn — every silent-by-design
+                        # dispatch fails it) that executed at least one tool,
+                        # a textless round is NOT a valid terminal state. The
+                        # turn may only end once the operator has something to
+                        # look at — assistant text (posted intra-loop, or in
+                        # _ct for the post-loop poster), an attachment (the
+                        # executor posts attachments in every mode on visible
+                        # turns), or a reply-equivalent tool (send_message /
+                        # end_chain). Until then we feed the accumulated tool
+                        # results forward with a [FRAMEWORK] user nudge and
+                        # run another model round — CC's "loop until a
+                        # tool-free assistant response", conditioned on owing
+                        # a human output. History ends with tool/user messages
+                        # here (the empty assistant round was dropped above),
+                        # so the next chat() can't hit the assistant-prefill
+                        # 400 described in the post_drain_retry note below.
+                        # No separate retry counter: the loop's existing hard
+                        # cap (MAX_TOOL_TURNS) bounds it, and that break posts
+                        # an operator-visible ⚠️ — plus the terminal contract
+                        # below is un-suppressed for this shape — so the worst
+                        # case is a warning, never dead air. STAY_SILENT is
+                        # unaffected: the sentinel is text, so `_ct.strip()`
+                        # is truthy and the gate never sees it as textless.
+                        # Kill switch: OPENFLIP_DISABLE_NO_FINAL_TEXT_RETRY=1
+                        # restores the pre-fix behavior (textless exit allowed).
+                        if (no_final_text_guarantee_enabled()
+                                and any_tool_called
+                                and not _ct.strip()
+                                and not _posted_assistant_text
+                                and not reply_equivalent_tool_fired
+                                and not any_attachments_this_turn
+                                and operator_facing_turn(
+                                    auto_post_final_text=auto_post_final_text,
+                                    silent=silent,
+                                    is_chain_terminator=is_chain_terminator,
+                                    originator_agent_id=originator_agent_id,
+                                    auto_route_from_peer=auto_route_from_peer,
+                                    log_tag=log_tag,
+                                )):
+                            print_ts(
+                                f"{COLOR_YELLOW}{log_tag}human turn ran tools but has produced "
+                                f"no operator-facing output — not a valid terminal state; "
+                                f"continuing to another model round "
+                                f"(turn {turn_count}/{MAX_TOOL_TURNS}){COLOR_END}",
+                                agent=agent.id,
+                            )
+                            try:
+                                conv.messages.append(
+                                    ChatMessage('user', no_final_text_nudge()))
+                            except Exception as _nft_err:
+                                print_ts(
+                                    f"{COLOR_YELLOW}{log_tag}final-text guarantee nudge "
+                                    f"injection failed (falling through to exit): "
+                                    f"{_nft_err}{COLOR_END}",
+                                    agent=agent.id,
+                                )
+                            else:
+                                continue
                         # NOTE: no post_drain_retry here.
                         #
                         # The text-only break can only fire AFTER chat() has
@@ -3849,6 +3931,34 @@ class AgentRunner:
                     not _captured_framework_error
                     and _diag == "empty_assistant_message"
                 )
+                # 2026-07-15: the CC-parity suppression above is what turned
+                # the recurring "tool ran, then dead silence" bug into TOTAL
+                # dead air — it ate the last-resort warning too. On a HUMAN-
+                # initiated turn that executed at least one tool and posted
+                # no attachment (attachments post in every mode and count as
+                # output), an empty end is never a drain/no-op: the operator
+                # asked, watched the tool run, and is owed SOMETHING. The
+                # in-loop final-text guarantee normally prevents this shape
+                # from ever reaching here; it still can via MAX_TOOL_TURNS,
+                # a nudge-injection failure, or the kill switch — so re-arm
+                # the warning for exactly that shape. Every silent-by-design
+                # path (peer/cron/synthetic/chain-terminator) fails
+                # operator_facing_turn and keeps the suppression. Kill
+                # switch: OPENFLIP_DISABLE_NO_FINAL_TEXT_RETRY=1 restores
+                # the unconditional suppression.
+                if (_clean_empty_end_turn
+                        and any_tool_called
+                        and not any_attachments_this_turn
+                        and no_final_text_guarantee_enabled()
+                        and operator_facing_turn(
+                            auto_post_final_text=auto_post_final_text,
+                            silent=silent,
+                            is_chain_terminator=is_chain_terminator,
+                            originator_agent_id=originator_agent_id,
+                            auto_route_from_peer=auto_route_from_peer,
+                            log_tag=log_tag,
+                        )):
+                    _clean_empty_end_turn = False
                 if _clean_empty_end_turn:
                     print_ts(
                         f"{COLOR_YELLOW}{log_tag}empty end_turn (no output, no error) "

@@ -134,6 +134,68 @@ def empty_retry_nudge(already_used: bool) -> Optional[str]:
     return _EMPTY_RETRY_NUDGE
 
 
+# Nudge injected by the final-text guarantee (runtime._run_turn's turn-
+# completion gate) when a HUMAN turn that ran tools is about to end with
+# nothing operator-visible. Distinct wording from _EMPTY_RETRY_NUDGE so
+# history/logs show which mechanism fired.
+_NO_FINAL_TEXT_NUDGE = (
+    "[FRAMEWORK]: You ran tools this turn but your "
+    "last reply was empty — the operator has seen "
+    "NOTHING and is waiting. Reply now, in your "
+    "normal voice, with what the tool results above "
+    "showed. If another tool call is genuinely "
+    "needed, fire it. Do not stay silent."
+)
+
+
+def no_final_text_nudge() -> str:
+    """The [FRAMEWORK] nudge the final-text guarantee feeds forward with the
+    tool results when it forces another model round (see
+    no_final_text_guarantee_enabled for the feature description)."""
+    return _NO_FINAL_TEXT_NUDGE
+
+
+def no_final_text_guarantee_enabled() -> bool:
+    """Kill switch for the final-text guarantee + its terminal-contract
+    un-suppression (2026-07-15 fix for "tool ran, then dead silence" on
+    human turns). The guarantee mirrors Claude Code's query loop: on an
+    operator-facing human turn that executed at least one tool, the agentic
+    loop may not terminate on a textless round — it continues to another
+    model round until the turn has produced operator-visible output (text,
+    attachment, or reply-equivalent tool), bounded only by MAX_TOOL_TURNS.
+    OPENFLIP_DISABLE_NO_FINAL_TEXT_RETRY=1 restores the pre-fix behavior
+    wholesale: textless exits allowed, clean empty end_turns stay
+    warning-suppressed."""
+    return os.environ.get("OPENFLIP_DISABLE_NO_FINAL_TEXT_RETRY") != "1"
+
+
+def operator_facing_turn(
+    *,
+    auto_post_final_text: bool,
+    silent: bool,
+    is_chain_terminator: bool,
+    originator_agent_id: str,
+    auto_route_from_peer: str,
+    log_tag: str,
+) -> bool:
+    """True when THIS turn's output is destined for a human who is actively
+    awaiting it: a real inbound message (visible, top-level, not an
+    inter-agent hop). Built strictly from existing turn signals — every
+    synthetic dispatch (cron / kairos / dream / slash-command / follow-up /
+    talk_to_agent) carries the "[synthetic] " log_tag, peer turns carry
+    originator_agent_id, and chain-terminator returns carry
+    auto_route_from_peer. All of those are legitimately allowed to end
+    silent and MUST stay excluded here."""
+    return (
+        auto_post_final_text
+        and not silent
+        and not is_chain_terminator
+        and not originator_agent_id
+        and not auto_route_from_peer
+        and not str(log_tag or "").strip().startswith("[synthetic]")
+    )
+
+
 def run_stop_hooks(
     *,
     agent_id: str,
