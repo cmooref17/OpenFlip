@@ -1281,6 +1281,19 @@ class OpenAIConversation:
         if not response.content and not tool_calls:
             if stop_reason == "refusal":
                 msg = "⚠️ Model declined (finish_reason=content_filter)."
+            elif stop_reason == "end_turn":
+                # Clean empty finish (finish_reason="stop", normalized to
+                # end_turn) — a deliberate "nothing to add", not a failure.
+                # Same fix as anthropic_conversation.py: return the plain
+                # empty response so runtime's empty-reply handling (nudge-
+                # and-retry, final-text guarantee, terminal contract) owns
+                # it instead of a false "⚠️ Empty reply" framework error.
+                print_ts(
+                    f"{COLOR_YELLOW}empty reply (finish_reason=stop) — clean "
+                    f"finish, deferring to runtime empty-reply handling{COLOR_END}",
+                    agent=self.agent.id,
+                )
+                return response
             elif stop_reason:
                 msg = (
                     f"⚠️ Empty reply (stop_reason={stop_reason}). No text or "

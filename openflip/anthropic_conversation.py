@@ -1819,10 +1819,13 @@ class AnthropicConversation:
             response.thinking = "".join(thinking_parts)
         response.raw_response = {"content": ordered_blocks}
 
-        # Zero-text, zero-tool turn → would render as a silent blank reply.
-        # Surface the API's stop_reason (and stop_details on a refusal) so
-        # the void becomes an explanation instead of a mystery. Marked as a
-        # framework error so it doesn't pollute history as an assistant turn.
+        # Zero-text, zero-tool turn. Only a refusal or an abnormal
+        # stop_reason (max_tokens etc.) is stamped as a framework error —
+        # surfacing the API's stop_reason (and stop_details on a refusal)
+        # so the void becomes an explanation instead of a mystery, marked
+        # framework-error so it doesn't pollute history as an assistant
+        # turn. A clean end_turn and a missing stop_reason are NOT errors:
+        # both return the plain empty response for runtime.py to handle.
         if not response.content and not tool_calls:
             if stop_reason == "refusal":
                 cat = (stop_details or {}).get("category", "unspecified")
@@ -1830,6 +1833,23 @@ class AnthropicConversation:
                 msg = f"⚠️ Model declined (stop_reason=refusal, category={cat})."
                 if why:
                     msg += f" {why}"
+            elif stop_reason == "end_turn":
+                # Clean empty end_turn — the model deliberately finished the
+                # turn with nothing to add (routine after bookkeeping tools
+                # like save_memory). That is a legitimate finish, not a
+                # failure: stamping it as a framework error posted a false
+                # "⚠️ Empty reply" straight to the operator and
+                # short-circuited the machinery that owns this case —
+                # runtime's one-shot empty-reply nudge-and-retry, the
+                # final-text guarantee on human tool turns, and the
+                # terminal contract's clean-empty classification. Return
+                # the plain empty response and let them decide.
+                print_ts(
+                    f"{COLOR_YELLOW}empty reply (stop_reason=end_turn) — clean "
+                    f"finish, deferring to runtime empty-reply handling{COLOR_END}",
+                    agent=self.agent.id,
+                )
+                return response
             elif stop_reason:
                 msg = (
                     f"⚠️ Empty reply (stop_reason={stop_reason}). No text or "
