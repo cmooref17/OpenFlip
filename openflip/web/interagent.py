@@ -90,7 +90,7 @@ def find_interagent_links(focal_agent: str) -> List[Dict[str, Any]]:
     OWN conversation channel — discovered by looking at THEIR files for
     a focal_agent prefix."""
     focal = _data.get_agent(focal_agent)
-    if not focal:
+    if not focal or focal.get("error"):
         return []
     known_agents: Set[str] = {a["id"] for a in _data.list_agents()}
     out_by_pair: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -129,7 +129,7 @@ def find_peer_channel_for(focal_agent: str, peer_agent: str,
     closest timestamp overlap with focal_agent's activity in
     focal_channel."""
     peer = _data.get_agent(peer_agent)
-    if not peer:
+    if not peer or peer.get("error"):
         return None
     known_agents: Set[str] = {a["id"] for a in _data.list_agents()}
     # Collect candidate channels in peer's data where focal_agent sent

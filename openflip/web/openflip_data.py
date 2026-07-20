@@ -21,6 +21,7 @@ from .._constants import DANGEROUS_TOOL_NAMES
 # "%3A" (NTFS forbids colons); ids keep the colon form in memory and URLs.
 # Imported from the framework so the encoding has ONE source of truth.
 from .._conversation_io import fs_encode as _fs_encode, fs_decode as _fs_decode
+from ..utils import print_ts as _print_ts
 
 
 # ---------- agent discovery ----------
@@ -42,7 +43,22 @@ def list_agents() -> List[Dict[str, Any]]:
             continue
         try:
             cfg = json.loads(cfg_path.read_text())
-        except Exception:
+        except Exception as e:
+            # A corrupt agent.json must NOT make the agent silently vanish
+            # from the dashboard — emit a stub row the template renders as a
+            # broken-config card, so the operator sees the parse error at the
+            # moment it matters instead of "agent doesn't exist".
+            _print_ts(f"web: failed to parse {cfg_path}: {e}", error=True)
+            out.append({
+                "id": entry.name,
+                "dir": str(entry),
+                "display_name": entry.name,
+                "model": "?",
+                "provider": "?",
+                "enabled": True,
+                "config_mtime": cfg_path.stat().st_mtime,
+                "error": f"agent.json failed to parse: {e}",
+            })
             continue
         agent_id = cfg.get("id") or entry.name
         out.append({
@@ -58,13 +74,25 @@ def list_agents() -> List[Dict[str, Any]]:
 
 
 def get_agent(agent_id: str) -> Optional[Dict[str, Any]]:
+    """Load one agent's config for the web UI.
+
+    Returns None ONLY when the agent genuinely doesn't exist (no agent.json).
+    A present-but-unparseable agent.json returns an error-marked dict
+    ({"id", "dir", "config_path", "error"}) so routes can surface the parse
+    error instead of relabeling a broken config as "not found"."""
     cfg_path = OPENFLIP_AGENTS_DIR / agent_id / "agent.json"
     if not cfg_path.exists():
         return None
     try:
         cfg = json.loads(cfg_path.read_text())
-    except Exception:
-        return None
+    except Exception as e:
+        _print_ts(f"web: failed to parse {cfg_path}: {e}", error=True)
+        return {
+            "id": agent_id,
+            "dir": str(OPENFLIP_AGENTS_DIR / agent_id),
+            "config_path": str(cfg_path),
+            "error": f"agent.json failed to parse: {e}",
+        }
     agent_dir = OPENFLIP_AGENTS_DIR / agent_id
     state = _load_agent_state().get(agent_id, {})
     sys_files = []

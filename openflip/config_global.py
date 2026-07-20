@@ -31,6 +31,26 @@ def reload_config() -> dict:
 # separate file (`api_config.json`). Both old shapes are still honored as
 # fallback for backward compatibility with existing deployments.
 
+# Once-per-value guard for the unparseable-owner_id warning below —
+# get_owner_id is called on every permission check, so an unguarded
+# print would flood the log.
+_warned_bad_owner_ids: set[tuple[str, str]] = set()
+
+
+def _warn_bad_owner_id(integration: str, val) -> None:
+    key = (integration, repr(val))
+    if key in _warned_bad_owner_ids:
+        return
+    _warned_bad_owner_ids.add(key)
+    print_ts(
+        f"config.json: owner_id for integration '{integration}' is set but not "
+        f"parseable as an int ({val!r}) — the framework is running OWNERLESS: "
+        f"is_owner() is False for everyone, the admin tier is gone, and every "
+        f"owner-gated command/tool/path will be denied. Fix the value in config.json.",
+        error=True,
+    )
+
+
 def get_owner_id(integration: str = "discord") -> int:
     """Return the operator's user ID for the given integration.
 
@@ -38,6 +58,10 @@ def get_owner_id(integration: str = "discord") -> int:
       1. `integrations.<integration>.owner_id` (canonical)
       2. legacy top-level `owner_id` (when integration == "discord")
       3. 0 (no owner)
+
+    An owner_id that is PRESENT but unparseable is a config mistake, not an
+    intentionally owner-less deployment — it is warned loudly (once per bad
+    value) instead of silently degrading to 0/"nobody".
     """
     cfg = get_config()
     integrations = cfg.get("integrations") or {}
@@ -47,14 +71,14 @@ def get_owner_id(integration: str = "discord") -> int:
         try:
             return int(val)
         except (TypeError, ValueError):
-            pass
+            _warn_bad_owner_id(integration, val)
     if integration == "discord":
         legacy = cfg.get("owner_id")
         if legacy:
             try:
                 return int(legacy)
             except (TypeError, ValueError):
-                pass
+                _warn_bad_owner_id("discord (legacy top-level)", legacy)
     return 0
 
 

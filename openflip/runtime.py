@@ -361,14 +361,18 @@ class AgentRunner:
                 return t.bot
         return self._transports[0].bot
 
-    def reload_agent_config(self) -> bool:
+    def reload_agent_config(self) -> tuple[bool, int, list[str]]:
         """Reload this agent's config + system files from disk on demand.
 
-        Wired to the owner /reload slash command. Returns True if the on-disk
-        files actually changed since last load. Re-applies the new system
-        message to every live conversation so the next turn picks up the
-        update. Without this, edits to SOUL.md / _shared/FRAMEWORK.md etc.
-        only take effect after a process restart.
+        Wired to the owner /reload slash command and the pre-turn hot-reload
+        check. Returns `(changed, reapplied, failed_keys)`:
+          - `changed` — True if the on-disk files actually differed since last load.
+          - `reapplied` — number of live conversations the new system message
+            was successfully re-applied to.
+          - `failed_keys` — conversation keys where reapply_agent() raised;
+            those conversations are STILL ON THE STALE system prompt. Each
+            failure is also logged here — callers report the count so /reload
+            never claims "conversations re-applied" over a swallowed failure.
         """
         # Backfill blank personal AGENT.md/TOOLS.md first, so creating a missing
         # stub registers as a change and gets picked up by reload_if_changed().
@@ -377,13 +381,21 @@ class AgentRunner:
         ensure_personal_files(Path(self.agent.path).parent)
         changed = self.agent.reload_if_changed()
         if not changed:
-            return False
-        for conv in self.conversations.values():
+            return (False, 0, [])
+        reapplied = 0
+        failed: list[str] = []
+        for key, conv in self.conversations.items():
             try:
                 conv.reapply_agent()
-            except Exception:
-                pass
-        return True
+                reapplied += 1
+            except Exception as e:
+                failed.append(str(key))
+                print_ts(
+                    f"{COLOR_RED}reload: reapply_agent failed for conversation "
+                    f"{key} — it is still on the STALE system prompt: {e}{COLOR_END}",
+                    error=True, agent=self.agent.id,
+                )
+        return (True, reapplied, failed)
 
     # ---- Conversation-key resolution (identity links) ----
     #

@@ -408,6 +408,24 @@ def _apply_template_vars(content: str, *, agent_id: str, agent_dir: str, display
             .replace("{display_name}", display_name))
 
 
+# Once-per-path guard for the unreadable-system-file warning below —
+# _get_fingerprint runs before every turn, so an unguarded print would
+# repeat the same error each message until the file is fixed.
+_warned_unreadable_files: set[str] = set()
+
+
+def _warn_unreadable_system_file(fpath: str, err: Exception) -> None:
+    if fpath in _warned_unreadable_files:
+        return
+    _warned_unreadable_files.add(fpath)
+    print_ts(
+        f"system file '{fpath}' EXISTS but could not be read ({err}) — the "
+        f"agent is loading WITHOUT it. Its rules/personality are missing from "
+        f"the system prompt until the file is readable again.",
+        error=True,
+    )
+
+
 def _load_system_files(
     agent_dir: str,
     filenames: list[str],
@@ -431,8 +449,12 @@ def _load_system_files(
                 agent_dir=agent_dir,
                 display_name=display_name,
             ))
-    except (FileNotFoundError, OSError):
-        pass
+    except FileNotFoundError:
+        pass  # optional file — absence is fine
+    except OSError as e:
+        # Present but unreadable (permissions, I/O error) is NOT fine —
+        # loading without it silently changes the agent. Warn loudly.
+        _warn_unreadable_system_file(project_claude_md, e)
     for fname in filenames:
         fpath = _resolve_system_file(agent_dir, fname)
         try:
@@ -445,8 +467,10 @@ def _load_system_files(
                     agent_dir=agent_dir,
                     display_name=display_name,
                 ))
-        except (FileNotFoundError, OSError):
-            pass
+        except FileNotFoundError:
+            pass  # missing listed file is documented as skip-silently
+        except OSError as e:
+            _warn_unreadable_system_file(fpath, e)
     return "\n\n".join(parts)
 
 
@@ -471,8 +495,12 @@ def _get_fingerprint(path: str, agent_dir: str, system_files: list[str]) -> str:
         try:
             with open(fpath, "rb") as f:
                 h.update(f.read())
-        except (FileNotFoundError, OSError):
-            pass
+        except FileNotFoundError:
+            pass  # missing file hashes as empty (deleting a file IS a change)
+        except OSError as e:
+            # Present but unreadable — same signal as _load_system_files;
+            # warn (once per path) so hot-reload oddities are diagnosable.
+            _warn_unreadable_system_file(fpath, e)
         h.update(b"\0")
     return h.hexdigest()
 

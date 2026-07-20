@@ -167,6 +167,48 @@ def validate_job(job: dict, ident: str = "(job)") -> list[str]:
     else:
         errors.append("schedule kind missing")
 
+    # quiet_hours (optional) — validate at write/load time so a typo'd window
+    # is rejected when it enters the system instead of silently failing open
+    # at fire time (a malformed window means the job fires during the hours
+    # it was explicitly configured NOT to). Matches the "validators belong at
+    # set-time" project rule. See _in_quiet_hours for the runtime parse.
+    qh = job.get("quiet_hours")
+    if qh:
+        if not isinstance(qh, dict):
+            errors.append(f"quiet_hours must be an object (got {qh!r})")
+        else:
+            def _check_hhmm(fld: str) -> bool:
+                """Validate one bound; returns True if the field is PRESENT
+                (even if invalid — invalidity gets its own error line)."""
+                raw = qh.get(fld)
+                if raw is None or raw == "":
+                    return False
+                if not isinstance(raw, str):
+                    errors.append(f"quiet_hours.{fld} must be an 'HH:MM' string (got {raw!r})")
+                    return True
+                try:
+                    import datetime as _dt
+                    hh, mm = raw.strip().split(":")
+                    _dt.time(int(hh), int(mm))
+                except Exception:
+                    errors.append(f"quiet_hours.{fld} {raw!r} is not a valid 'HH:MM' time")
+                return True
+
+            has_start = _check_hhmm("start")
+            has_end = _check_hhmm("end")
+            if has_start != has_end:
+                errors.append("quiet_hours needs BOTH start and end (only one was given)")
+            tz_raw = qh.get("timezone")
+            if tz_raw:
+                if not isinstance(tz_raw, str):
+                    errors.append(f"quiet_hours.timezone must be an IANA name string (got {tz_raw!r})")
+                else:
+                    try:
+                        from zoneinfo import ZoneInfo
+                        ZoneInfo(tz_raw.strip())
+                    except Exception as e:
+                        errors.append(f"quiet_hours.timezone {tz_raw!r} is invalid: {e}")
+
     return errors
 
 
@@ -199,12 +241,20 @@ def _save_jobs(data: dict) -> None:
     save_json(_jobs_path(), data)
 
 
+# Once-per-job guard for the malformed-quiet_hours warning below — _due()
+# runs every tick, so an unguarded print would flood the log.
+_warned_quiet_hours_jobs: set[str] = set()
+
+
 def _in_quiet_hours(job: dict, now_ms: int) -> bool:
     """Return True if `now_ms` falls inside the job's quiet_hours window.
 
     quiet_hours schema on the job dict:
       {"start": "23:00", "end": "08:00", "timezone": "US/Mountain"}
-    Missing/empty/malformed → never quiet (returns False).
+    Missing/empty → never quiet. Malformed also fails open (never quiet) but
+    is WARNED once per job — the job will fire during the window the operator
+    explicitly configured it not to. validate_job rejects malformed values at
+    write/load time; this warning covers stored jobs that predate validation.
     """
     qh = job.get("quiet_hours")
     if not qh or not isinstance(qh, dict):
@@ -230,7 +280,17 @@ def _in_quiet_hours(job: dict, now_ms: int) -> bool:
         else:
             # Overnight window (e.g. 23:00–08:00)
             return cur_t >= start_t or cur_t < end_t
-    except Exception:
+    except Exception as e:
+        jid = str(job.get("id") or job.get("name") or "(unnamed)")
+        if jid not in _warned_quiet_hours_jobs:
+            _warned_quiet_hours_jobs.add(jid)
+            print_ts(
+                f"cron: job '{jid}' has malformed quiet_hours "
+                f"{job.get('quiet_hours')!r} ({e}) — quiet hours are NOT being "
+                f"applied; the job WILL fire inside the configured window. "
+                f"Fix the job's quiet_hours.",
+                error=True,
+            )
         return False
 
 

@@ -15,7 +15,11 @@
       <span class="muted">{% if agent.model.startswith(agent.provider + '/') %}{{ agent.model[(agent.provider|length + 1):] }}{% else %}{{ agent.model }}{% endif %}</span>
     </div>
     <div class="agent-id">{{ agent.id }}</div>
-    {% if not agent.enabled %}<div class="badge muted">disabled</div>{% endif %}
+    {% if agent.error %}
+    {# Broken-config row: agent.json exists but failed to parse. Click-through
+       shows the full parse error (agent_detail returns a 422 with it). #}
+    <div class="badge" style="color:#e5484d;border-color:#e5484d;" title="{{ agent.error }}">⚠ broken agent.json</div>
+    {% elif not agent.enabled %}<div class="badge muted">disabled</div>{% endif %}
   </a>
   {% else %}
   <p class="muted">No agents found under <code>agents/</code>.</p>

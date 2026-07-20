@@ -477,31 +477,47 @@ async def _do_status(runner, ch_id, channel, transport, session_id) -> None:
         lines.append(f"• Context: 0 / {window:,}")
     if conv:
         in_mem = len([m for m in conv.messages if m.get("role") != "system"])
+        # Honest on-disk count: never echo the in-memory number as if it
+        # were the persisted one — a missing file or read error is exactly
+        # the persistence failure this line exists to reveal.
         try:
             from . import _conversation_io as _cio
             conv_id = _conversation_id_for_channel(channel, ch_id)
             if conv_id:
                 path = _cio.conversation_path(os.path.dirname(agent.path), conv_id)
-                on_disk = sum(1 for _ in open(path)) if os.path.exists(path) else in_mem
+                if os.path.exists(path):
+                    on_disk = str(sum(1 for _ in open(path)))
+                else:
+                    on_disk = ("0 (⚠️ no file on disk — persistence may be broken)"
+                               if in_mem else "0 (no file yet)")
             else:
-                on_disk = in_mem
-        except Exception:
-            on_disk = in_mem
+                on_disk = "? (could not resolve conversation id)"
+        except Exception as e:
+            print_ts(f"/status: failed to read conversation file: {e}",
+                     error=True, agent=agent.id)
+            on_disk = "? (read failed — see log)"
         lines.append(f"• Messages: {in_mem} in memory / {on_disk} on disk")
     await _send(transport, session_id, channel, "\n".join(lines))
 
 
 async def _do_reload(runner, channel, transport, session_id) -> None:
     try:
-        changed = runner.reload_agent_config()
+        changed, reapplied, failed = runner.reload_agent_config()
     except Exception as e:
         await _send(transport, session_id, channel, f"⚠️ Reload failed: {e}")
         return
     if changed:
-        await _send(
-            transport, session_id, channel,
-            f"♻️ **{runner.agent.display_name}** reloaded — system files re-read, conversations re-applied.",
+        total = reapplied + len(failed)
+        msg = (
+            f"♻️ **{runner.agent.display_name}** reloaded — system files re-read, "
+            f"re-applied to {reapplied}/{total} live conversation(s)."
         )
+        if failed:
+            msg += (
+                f"\n⚠️ Re-apply FAILED for: {', '.join(failed)} — those conversations "
+                f"are still on the stale system prompt (details in log)."
+            )
+        await _send(transport, session_id, channel, msg)
     else:
         await _send(
             transport, session_id, channel,

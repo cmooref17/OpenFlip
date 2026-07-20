@@ -375,6 +375,9 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         # Message count.
         if conv:
             in_mem = len([m for m in conv.messages if m.get("role") != "system"])
+            # Honest on-disk count: never echo the in-memory number as if it
+            # were the persisted one — a missing file or read error is exactly
+            # the persistence failure this line exists to reveal.
             try:
                 from . import _conversation_io as _cio
                 # The conversation object knows its real id (handles linked
@@ -382,9 +385,15 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
                 # legacy discord:<id> guess only if the attr is missing.
                 _st_conv_id = getattr(conv, "conversation_id", "") or f"discord:{interaction.channel.id}"
                 path = _cio.conversation_path(os.path.dirname(agent.path), _st_conv_id)
-                on_disk = sum(1 for _ in open(path)) if os.path.exists(path) else in_mem
-            except Exception:
-                on_disk = in_mem
+                if os.path.exists(path):
+                    on_disk = str(sum(1 for _ in open(path)))
+                else:
+                    on_disk = ("0 (⚠️ no file on disk — persistence may be broken)"
+                               if in_mem else "0 (no file yet)")
+            except Exception as e:
+                print_ts(f"/status: failed to read conversation file: {e}",
+                         error=True, agent=agent.id)
+                on_disk = "? (read failed — see log)"
             lines.append(f"• Messages: {in_mem} in memory / {on_disk} on disk")
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
@@ -517,15 +526,22 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
     async def reload_cmd(interaction: nextcord.Interaction):
         if not await _admin_check(interaction): return
         try:
-            changed = runner.reload_agent_config()
+            changed, reapplied, failed = runner.reload_agent_config()
         except Exception as e:
             await interaction.response.send_message(f"⚠️ Reload failed: {e}", ephemeral=True)
             return
         if changed:
-            await interaction.response.send_message(
-                f"♻️ **{runner.agent.display_name}** reloaded — system files re-read, conversations re-applied.",
-                ephemeral=True,
+            total = reapplied + len(failed)
+            msg = (
+                f"♻️ **{runner.agent.display_name}** reloaded — system files re-read, "
+                f"re-applied to {reapplied}/{total} live conversation(s)."
             )
+            if failed:
+                msg += (
+                    f"\n⚠️ Re-apply FAILED for: {', '.join(failed)} — those conversations "
+                    f"are still on the stale system prompt (details in log)."
+                )
+            await interaction.response.send_message(msg, ephemeral=True)
         else:
             await interaction.response.send_message(
                 f"No on-disk changes detected for **{runner.agent.display_name}**.",

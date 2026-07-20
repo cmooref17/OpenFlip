@@ -48,5 +48,18 @@ for _fname in sorted(_os.listdir(_tools_dir)):
         continue
     try:
         __import__(f"openflip.tools.{_stem}", fromlist=[_stem])
-    except ImportError:
-        pass  # extras tool depends on something not installed — skip silently
+    except ImportError as _e:
+        # Silent skip is correct ONLY when the extras module itself is absent
+        # (a gitignored personal namespace that simply isn't present here).
+        # A module that IS present but fails to import — missing dependency
+        # (torch, demucs, …) or a broken import inside it — must be surfaced:
+        # otherwise its tools silently vanish from TOOL_REGISTRY and agents
+        # just stop having them with zero log output.
+        if isinstance(_e, ModuleNotFoundError) and _e.name == f"openflip.tools.{_stem}":
+            continue
+        from ..utils import print_ts as _print_ts, COLOR_RED as _RED, COLOR_END as _CEND
+        _print_ts(
+            f"{_RED}tools: optional module '{_stem}' is present but failed to "
+            f"import — its tools are UNAVAILABLE this run: {_e}{_CEND}",
+            error=True,
+        )

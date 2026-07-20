@@ -240,16 +240,33 @@ class _ReloadButton(nextcord.ui.Button):
             await interaction.response.send_message("Agent not found.", ephemeral=True)
             return
         agent.reload()
-        # Push the freshly-loaded system message to live conversations.
+        # Push the freshly-loaded system message to live conversations,
+        # tracking failures — a conversation whose reapply raised is still
+        # on the STALE system prompt and must not be reported as reloaded.
+        reapplied = 0
+        failed: list[str] = []
         if view.agent_id in registry.RUNNERS:
-            for conv in registry.RUNNERS[view.agent_id].conversations.values():
+            for key, conv in registry.RUNNERS[view.agent_id].conversations.items():
                 try:
                     conv.reapply_agent()
-                except Exception:
-                    pass
+                    reapplied += 1
+                except Exception as e:
+                    failed.append(str(key))
+                    from .utils import print_ts, COLOR_RED, COLOR_END
+                    print_ts(
+                        f"{COLOR_RED}/agents reload: reapply_agent failed for "
+                        f"conversation {key} — still on the stale system prompt: {e}{COLOR_END}",
+                        error=True, agent=view.agent_id,
+                    )
         await view.refresh(interaction)
+        msg = (
+            f"🔁 Reloaded `{view.agent_id}` from JSON — re-applied to "
+            f"{reapplied}/{reapplied + len(failed)} live conversation(s)."
+        )
+        if failed:
+            msg += f"\n⚠️ Re-apply FAILED for: {', '.join(failed)} (details in log)."
         try:
-            await interaction.followup.send(f"🔁 Reloaded `{view.agent_id}` from JSON.", ephemeral=True)
+            await interaction.followup.send(msg, ephemeral=True)
         except Exception:
             pass
 

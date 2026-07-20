@@ -176,12 +176,27 @@ async def agents_list():
 
 # ---------- agent detail ----------
 
+def _broken_agent_response(agent):
+    """Plain-text 422 for an agent whose agent.json exists but failed to
+    parse (get_agent returns an error-marked dict). Distinct from the 404
+    "no such agent" case — the operator needs the parse error, not
+    "doesn't exist"."""
+    return (
+        f"agent '{agent.get('id', '?')}' has a broken config — {agent.get('error')}\n"
+        f"Fix {agent.get('config_path', 'agent.json')} and reload.",
+        422,
+        {"Content-Type": "text/plain; charset=utf-8"},
+    )
+
+
 @app.route("/agents/<agent_id>")
 @login_required
 async def agent_detail(agent_id):
     agent = await asyncio.to_thread(_data.get_agent, agent_id)
     if not agent:
         abort(404)
+    if agent.get("error"):
+        return _broken_agent_response(agent)
     return await render_template("agent.html", agent=agent)
 
 
@@ -276,6 +291,8 @@ async def conversation_view(agent_id, channel_id):
     agent = await asyncio.to_thread(_data.get_agent, agent_id)
     if not agent:
         abort(404)
+    if agent.get("error"):
+        return _broken_agent_response(agent)
     msgs = await asyncio.to_thread(_data.read_conversation, agent_id, channel_id, 200, 0)
     return await render_template(
         "conversation.html",
@@ -305,6 +322,8 @@ async def interagent_index(agent_id):
     agent = await asyncio.to_thread(_data.get_agent, agent_id)
     if not agent:
         abort(404)
+    if agent.get("error"):
+        return _broken_agent_response(agent)
     links = await asyncio.to_thread(_interagent.find_interagent_links, agent_id)
     return await render_template(
         "interagent_index.html", agent=agent, links=links,
@@ -319,6 +338,10 @@ async def interagent_thread(agent_id, peer_id, focal_channel):
     peer = await asyncio.to_thread(_data.get_agent, peer_id)
     if not focal or not peer:
         abort(404)
+    if focal.get("error"):
+        return _broken_agent_response(focal)
+    if peer.get("error"):
+        return _broken_agent_response(peer)
     peer_channel = await asyncio.to_thread(
         _interagent.find_peer_channel_for, agent_id, peer_id, focal_channel
     )
@@ -343,6 +366,8 @@ async def memory_view(agent_id):
     agent = await asyncio.to_thread(_data.get_agent, agent_id)
     if not agent:
         abort(404)
+    if agent.get("error"):
+        return _broken_agent_response(agent)
     mem = await asyncio.to_thread(_data.get_memory, agent_id)
     return await render_template("memory.html", agent=agent, memory=mem)
 
