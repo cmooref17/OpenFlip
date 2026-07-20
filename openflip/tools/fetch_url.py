@@ -23,6 +23,15 @@ the guard AND the pin entirely.
 For non-privileged callers resolution failure fails CLOSED (no pin → no
 fetch), so every non-privileged connection goes to a guard-vetted address —
 there is no unpinned fallback path.
+
+TLS: certificates are VERIFIED by default (against the real hostname — the
+pinned-IP rewrite passes `server_hostname` so verification and SNI still key
+off the original name). Verification is disabled ONLY for targets that
+resolve to private/loopback/internal addresses (self-signed internal
+services like webapp on localhost — owner/admin-reachable only, since
+the SSRF guard blocks internal targets for everyone else) or for hostnames
+explicitly listed in config.json `insecure_tls_hosts`. Never disable it
+globally: that silently made every external fetch MITM-able.
 """
 from __future__ import annotations
 
@@ -140,6 +149,19 @@ async def _resolve_and_vet_host(host: str) -> tuple[bool, str]:
     return (False, pinned_v4 or pinned)
 
 
+def _insecure_tls_hosts() -> set[str]:
+    """Hostnames exempted from TLS certificate verification via config.json
+    `insecure_tls_hosts` (list of hostnames, matched case-insensitively).
+    For non-internal hosts with self-signed/broken certs that the operator
+    explicitly chooses to trust. Empty/missing → no exemptions."""
+    try:
+        from ..config_global import get_config
+        raw = get_config().get("insecure_tls_hosts") or []
+        return {str(h).strip().lower() for h in raw if h}
+    except Exception:
+        return set()
+
+
 def _caller_is_owner_or_admin() -> bool:
     """Whether the current tool caller is the owner or an admin.
 
@@ -215,6 +237,7 @@ async def fetch_url(url: str) -> ToolResult:
             # SSRF guard: block internal/private targets for non-owner/admin,
             # and pin the connection to the vetted address so aiohttp can't
             # re-resolve the hostname to something the guard never saw.
+            internal = False
             if not privileged:
                 internal, pinned_ip = await _resolve_and_vet_host(host)
                 if internal:
@@ -247,14 +270,30 @@ async def fetch_url(url: str) -> ToolResult:
                 host_hdr = f"[{host}]" if ":" in host else host
                 request_headers["Host"] = host_hdr + (f":{port}" if port else "")
                 if parsed.scheme == "https":
+                    # Virtual hosting + TLS need the real name even though
+                    # the URL carries the pinned IP: server_hostname drives
+                    # both SNI and certificate hostname verification.
                     request_kwargs["server_hostname"] = host
+            elif parsed.scheme == "https":
+                # Privileged callers skip the guard/pin, but the TLS-verify
+                # decision below still needs to know whether the target is
+                # internal (self-signed localhost services must keep working).
+                internal, _ = await _resolve_and_vet_host(host)
+
+            # TLS verification is ON by default. Disabled ONLY for internal/
+            # private/loopback targets (self-signed services like webapp
+            # on localhost — non-privileged callers never reach these, the
+            # guard above blocks them) or hosts explicitly allowlisted in
+            # config.json `insecure_tls_hosts`. An external site with a bad
+            # cert now fails loudly instead of being silently trusted.
+            verify_tls = not (internal or host.lower() in _insecure_tls_hosts())
 
             async with session.get(
                 request_url,
                 headers=request_headers,
                 timeout=aiohttp.ClientTimeout(total=_TIMEOUT),
                 allow_redirects=False,  # manual — so we can guard each hop
-                ssl=False,  # don't trip on self-signed certs (e.g. webapp localhost)
+                ssl=True if verify_tls else False,  # True = verify (aiohttp default context)
                 **request_kwargs,
             ) as resp:
                 # Redirect → resolve the next hop and loop to re-run the guard.
