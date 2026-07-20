@@ -778,12 +778,18 @@ async def _stream_codex_events(resp_content) -> AsyncIterator:
                                        "function_call"
       - response.output_item.done    → completed tool block (item carries
                                        call_id / name / arguments-JSON-string)
-      - response.completed           → usage (response.usage.input_tokens /
+      - response.completed /
+        response.incomplete          → usage (response.usage.input_tokens /
                                        output_tokens / input_tokens_details.
                                        cached_tokens) + stop_reason
       - response.failed / error      → FrameworkErrorEvent
     Everything else (created, in_progress, content_part.*, delta echoes of
     items we finalize on .done) is ignored.
+
+    All four of the above are TERMINAL events. A stream that ends without
+    ever delivering one was cut off in transit and finalizes as a
+    FrameworkErrorEvent(kind="transport") — never as a synthesized clean
+    stop (that would persist a truncated reply as a finished turn).
 
     Block-index convention matches _stream_openai_events: text is block 0;
     tool call k is block k+1. Usage is normalized to the Chat-Completions
@@ -799,6 +805,11 @@ async def _stream_codex_events(resp_content) -> AsyncIterator:
     usage: dict = {}
     stop_reason: str | None = None
     failed_msg: str | None = None
+    # True once a terminal Responses event arrives (response.completed /
+    # response.incomplete / response.failed / error). A stream that ends
+    # WITHOUT one was cut off in transit — it must surface as a transport
+    # error, never be finalized as a deliberate, complete model turn.
+    saw_terminal = False
 
     line_buffer = ""
     try:
@@ -909,7 +920,8 @@ async def _stream_codex_events(resp_content) -> AsyncIterator:
                     )
                     continue
 
-                if etype == "response.completed":
+                if etype in ("response.completed", "response.incomplete"):
+                    saw_terminal = True
                     response = chunk.get("response") or {}
                     u = response.get("usage") or {}
                     in_t = int(u.get("input_tokens", 0) or 0)
@@ -924,11 +936,16 @@ async def _stream_codex_events(resp_content) -> AsyncIterator:
                     }
                     inc_reason = ((response.get("incomplete_details") or {})
                                   .get("reason") or "")
-                    if response.get("status") == "incomplete" and inc_reason == "max_output_tokens":
+                    _incomplete = (etype == "response.incomplete"
+                                   or response.get("status") == "incomplete")
+                    if _incomplete and inc_reason == "max_output_tokens":
                         stop_reason = "max_tokens"
+                    elif _incomplete and inc_reason == "content_filter":
+                        stop_reason = "refusal"
                     continue
 
                 if etype in ("response.failed", "error"):
+                    saw_terminal = True
                     response = chunk.get("response") or {}
                     err = response.get("error") or chunk.get("error") or {}
                     failed_msg = (err.get("message") if isinstance(err, dict) else str(err)) \
@@ -949,14 +966,6 @@ async def _stream_codex_events(resp_content) -> AsyncIterator:
         return
 
     # ── Finalization: text block + terminal events ──
-    if text_acc:
-        yield ContentBlockStopEvent(
-            index=0, completed_block={"type": "text", "text": text_acc},
-        )
-    if stop_reason is None:
-        stop_reason = "tool_use" if any_tool else "end_turn"
-    yield MessageDeltaEvent(stop_reason=stop_reason, usage=dict(usage))
-
     if not sent_message_start:
         yield FrameworkErrorEvent(
             message=(
@@ -966,6 +975,28 @@ async def _stream_codex_events(resp_content) -> AsyncIterator:
             kind="empty_stream",
         )
         return
+    if not saw_terminal:
+        # The connection dropped mid-response (no response.completed /
+        # response.incomplete / response.failed ever arrived). Don't
+        # synthesize a clean stop from whatever partial content we have —
+        # that would persist half a reply to history as a finished turn.
+        # Surface it as a transport error so the framework-error path
+        # (message kept in history, "try again" works) owns it.
+        yield FrameworkErrorEvent(
+            message=(
+                "⚠️ OpenAI (codex) stream ended without a terminal event — "
+                "the response was cut off in transit. Retry in a moment."
+            ),
+            kind="transport",
+        )
+        return
+    if text_acc:
+        yield ContentBlockStopEvent(
+            index=0, completed_block={"type": "text", "text": text_acc},
+        )
+    if stop_reason is None:
+        stop_reason = "tool_use" if any_tool else "end_turn"
+    yield MessageDeltaEvent(stop_reason=stop_reason, usage=dict(usage))
     yield MessageStopEvent()
 
 

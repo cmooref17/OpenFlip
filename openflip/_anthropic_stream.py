@@ -341,6 +341,7 @@ async def stream_sse_events(resp_content) -> "AsyncIterator":  # type: ignore
     saw_message_start = False
     saw_message_stop = False
     content_events_count = 0
+    yielded_error = False  # an error event already surfaced mid-stream
 
     try:
         async for raw_chunk in resp_content:
@@ -360,6 +361,7 @@ async def stream_sse_events(resp_content) -> "AsyncIterator":  # type: ignore
                         try:
                             data = json.loads(data_str)
                         except json.JSONDecodeError:
+                            yielded_error = True
                             yield FrameworkErrorEvent(
                                 message=f"SSE JSON decode error on event {current_event!r}",
                                 kind="json_decode",
@@ -398,23 +400,39 @@ async def stream_sse_events(resp_content) -> "AsyncIterator":  # type: ignore
         )
         return
 
-    # Stream closed cleanly (no transport exception). Detect abnormal
-    # termination: if we got message_start but no message_stop AND no
-    # content events between them, Anthropic accepted the request, opened
-    # the stream, and closed it without sending content. This is the
-    # silent-empty-response failure mode that produced the 21:59:37
-    # incident — multiple agents hit it simultaneously, suggesting
-    # an upstream Anthropic degradation. Surface it instead of swallowing.
-    if saw_message_start and not saw_message_stop and content_events_count == 0:
-        yield FrameworkErrorEvent(
-            message=(
-                "⚠️ Anthropic stream closed after message_start with no "
-                "content and no message_stop. Likely upstream degradation; "
-                "the API returned 200 but produced nothing. Retry in a "
-                "moment or `/reset` if it persists."
-            ),
-            kind="empty_stream",
-        )
+    # Stream closed cleanly (no transport exception) but WITHOUT message_stop:
+    # per the SSE contract every successful stream terminates with
+    # message_stop, so this is an abnormal end (proxy idle-timeout, HTTP/2
+    # GOAWAY, upstream degradation) even when it happens gracefully at an
+    # SSE event boundary with no aiohttp exception. Two variants:
+    #   - zero content events → the silent-empty-response failure mode that
+    #     produced the 21:59:37 incident (API returned 200, sent nothing);
+    #   - partial content → the reply was TRUNCATED in transit. Previously
+    #     this fell through as a clean success and half a reply entered
+    #     history as a finished assistant message; surface it so chat()'s
+    #     transient-retry / partial-salvage path owns it instead.
+    # Skipped when an error event already surfaced mid-stream (don't
+    # overwrite a more specific kind, e.g. a rate_limit's retry_after).
+    if saw_message_start and not saw_message_stop and not yielded_error:
+        if content_events_count == 0:
+            yield FrameworkErrorEvent(
+                message=(
+                    "⚠️ Anthropic stream closed after message_start with no "
+                    "content and no message_stop. Likely upstream degradation; "
+                    "the API returned 200 but produced nothing. Retry in a "
+                    "moment or `/reset` if it persists."
+                ),
+                kind="empty_stream",
+            )
+        else:
+            yield FrameworkErrorEvent(
+                message=(
+                    f"⚠️ Anthropic stream closed mid-response ({content_events_count} "
+                    f"content events but no message_stop) — the reply was "
+                    f"truncated in transit. Retry in a moment."
+                ),
+                kind="incomplete_stream",
+            )
 
 
 async def _yield_for_sse_event(

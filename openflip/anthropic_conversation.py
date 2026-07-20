@@ -1613,6 +1613,11 @@ class AnthropicConversation:
         _TRANSIENT_KINDS = {
             "rate_limit", "overloaded", "timeout", "transport",
             "json_decode", "sse_protocol",
+            # Stream closed without message_stop after partial content —
+            # a truncation in transit, not a model decision. Retryable
+            # (the partial-content cap below bounds it to ONE retry) and
+            # eligible for the pure-text salvage path.
+            "incomplete_stream",
         }
         _MAX_TRANSIENT_RETRIES = 3
         _RETRY_BUDGET_S = 90.0
