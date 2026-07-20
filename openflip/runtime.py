@@ -3919,10 +3919,20 @@ class AgentRunner:
                 # Claude Code parity (queryHelpers.ts isResultSuccessful): a
                 # clean empty end_turn — the model fired nothing and there was
                 # no provider error — is a LEGITIMATE outcome, not a failure.
-                # It happens on drain/no-op turns (a tool ran and the model had
-                # nothing to add). Surfacing a "⚠️ empty response" to the
-                # operator on those turns is noise that has repeatedly read as
-                # "the bot is broken." So: when the ONLY diagnosis is a bare
+                # Since 2026-07-19 the providers no longer stamp that shape as
+                # a framework error (see the empty-reply classification in
+                # anthropic_conversation.py / openai_conversation.py): it
+                # arrives here as a plain empty after the in-loop nudge-and-
+                # retry already gave the model one chance to close with text.
+                # This block is therefore the single classifier for clean
+                # empties, not a mask over a chat()-level warning. It is
+                # still load-bearing for two real shapes: (1) tool turns
+                # whose attachments already posted in caption/text_then_media
+                # modes — _media_satisfied only covers media_only, so without
+                # this the operator would get "⚠️ empty response" right after
+                # receiving the attachment; (2) no-tool turns where the model
+                # chose to say nothing twice (CC parity: the model's call).
+                # So: when the ONLY diagnosis is a bare
                 # empty_assistant_message AND no provider error was captured,
                 # log it quietly and suppress the operator-facing warning.
                 # Every other case (provider errors, text-present-but-not-posted,
