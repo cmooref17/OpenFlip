@@ -26,6 +26,17 @@ class ToolResult:
                                                            # AFTER channel.send so build_model_feedback can
                                                            # include them — lets the model say "again" and
                                                            # call edit_image with the prior image's URL.
+    # Outcome of the user-facing post, filled in by tool_executor after
+    # _post_tool_result. Tri-state:
+    #   True  — the send call(s) succeeded (URL presence is NOT the signal:
+    #           non-Discord transports can succeed without returning a URL).
+    #   False — posting was attempted and FAILED; post_fail_reason says why.
+    #           build_model_feedback then tells the model the user has NOT
+    #           seen the output, so it can't claim "sent it!" over a failure.
+    #   None  — posting wasn't attempted (silent turn / tool error / nothing
+    #           to post).
+    posted_ok: Optional[bool] = None
+    post_fail_reason: Optional[str] = None
 
     @property
     def ok(self) -> bool:

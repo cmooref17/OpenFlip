@@ -288,10 +288,12 @@ async def execute_tool_calls(
                 )
             except Exception:
                 pass
-            posted_urls = await _post_tool_result(
+            posted_ok, posted_urls, post_fail_reason = await _post_tool_result(
                 channel, result, name=name, agent=agent, silent=silent,
                 transport=_transport, session_id=_effective_session_id,
             )
+            result.posted_ok = posted_ok
+            result.post_fail_reason = post_fail_reason or None
             if posted_urls:
                 result.posted_urls = posted_urls
             out.append((name, result))
@@ -344,7 +346,7 @@ async def _post_tool_result(
     silent: bool = False,
     transport=None,
     session_id: str = "",
-) -> list[str]:
+) -> tuple[Optional[bool], list[str], str]:
     """Post the tool's user-facing output to the messaging transport. Attachments
     normally always post; text output respects:
         - silent_to_discord (per-tool flag) — fully suppress text in chat
@@ -354,10 +356,22 @@ async def _post_tool_result(
     The model's view of the result is built separately in runtime via
     build_model_feedback() — this function only handles user-facing posting.
 
-    Returns the CDN/attachment URLs of any attachments actually posted, in order.
-    Caller stashes them on result.posted_urls so build_model_feedback can echo
-    them to the model — without this the model sees only filenames, can't
-    reference prior images, and asks the user to re-share.
+    Returns `(posted_ok, posted_urls, fail_reason)`:
+      - `posted_ok` True  — every send call SUCCEEDED. Success is judged by
+        the send call itself, NEVER by URL presence: non-Discord transports
+        can succeed without returning a URL.
+      - `posted_ok` False — posting was attempted and FAILED (fully or
+        partially); `fail_reason` says why. The user has NOT seen the output.
+      - `posted_ok` None  — posting wasn't attempted (silent turn, tool
+        error, or nothing to post).
+      - `posted_urls` — CDN/attachment URLs of attachments actually posted,
+        in order. Caller stashes them on result.posted_urls so
+        build_model_feedback can echo them (lets the model reference prior
+        images by URL).
+    The caller threads posted_ok/fail_reason onto the ToolResult so feedback
+    can say "posting FAILED — the user has NOT seen them" instead of the old
+    unconditional "The user can see them" (the lie that made an agent say
+    "i already sent it" when nothing posted, 2026-05-29/30).
     """
     if silent:
         # Inter-agent synthetic turn — no human watching this channel for
@@ -370,7 +384,7 @@ async def _post_tool_result(
         # directly through the transport itself (see tools/files.py) and
         # reports honest success/failure. So this generic suppression is
         # correct as-is for every tool that DOES return attachments.
-        return []
+        return (None, [], "")
 
     media_only = (agent.tool_response_mode == "media_only")
     tool = TOOL_REGISTRY.get(name)
@@ -379,7 +393,7 @@ async def _post_tool_result(
     if not result.ok:
         # Tool errors do NOT auto-post to chat. The model sees them via
         # build_model_feedback and decides how to communicate.
-        return []
+        return (None, [], "")
 
     text: Optional[str] = None
     if result.text and not tool_silent and not media_only:
@@ -399,8 +413,17 @@ async def _post_tool_result(
         except Exception:
             pass
 
+    if result.attachments and not attachment_paths:
+        # The tool CLAIMED attachments but none exist on disk — nothing can
+        # post. That's a delivery failure, not a nothing-to-do.
+        print_ts(
+            f"{COLOR_RED}tool result for {name}: attachment file(s) missing on "
+            f"disk — nothing posted{COLOR_END}", error=True,
+        )
+        return (False, [], "attachment file(s) missing on disk")
+
     if not attachment_paths and not text:
-        return []
+        return (None, [], "")
 
     posted_urls: list[str] = []
 
@@ -409,21 +432,33 @@ async def _post_tool_result(
         # Send text first if present and no attachments (clean message).
         # If attachments exist, pass text as caption on the first file.
         if attachment_paths:
+            sent_count = 0
+            last_err = ""
             first = True
             for path in attachment_paths:
                 caption = text if first else ""
                 try:
                     url = await transport.send_file(session_id, path, content=caption or "")
+                    sent_count += 1
                     if url:
                         posted_urls.append(url)
                 except Exception as e:
+                    last_err = str(e)
                     print_ts(f"{COLOR_RED}transport.send_file failed for {name}: {e}{COLOR_END}", error=True)
                 first = False
+            if sent_count == len(attachment_paths):
+                return (True, posted_urls, "")
+            failed = len(attachment_paths) - sent_count
+            return (False, posted_urls,
+                    f"{failed}/{len(attachment_paths)} upload(s) failed: {last_err}")
         elif text:
             try:
                 await transport.send(session_id, text)
+                return (True, [], "")
             except Exception as e:
                 print_ts(f"{COLOR_RED}transport.send failed for {name}: {e}{COLOR_END}", error=True)
+                return (False, [], str(e))
+        return (None, [], "")
     else:
         # Legacy fallback — direct channel.send (Discord-specific).
         try:
@@ -437,12 +472,13 @@ async def _post_tool_result(
                 timeout=60.0,
             )
             posted_urls = [a.url for a in (sent.attachments or [])]
+            return (True, posted_urls, "")
         except asyncio.TimeoutError:
             print_ts(f"{COLOR_RED}Tool result post for {name} timed out after 60s{COLOR_END}", error=True)
+            return (False, [], "upload timed out after 60s")
         except Exception as e:
             print_ts(f"{COLOR_RED}Failed to post tool result for {name}: {e}{COLOR_END}", error=True)
-
-    return posted_urls
+            return (False, [], str(e))
 
 
 def _caller_is_owner_safe() -> bool:
@@ -475,23 +511,48 @@ def _build_model_feedback_raw(name: str, result: ToolResult) -> str:
     """Compose the raw feedback string (pre-redaction).
     Distinct from what Discord saw — for media tools we tell the model
     'image saved' rather than dumping a file path; for text tools we feed
-    the full text back so the model can summarize / answer."""
+    the full text back so the model can summarize / answer.
+
+    Delivery honesty: `result.posted_ok` (set by the executor from
+    _post_tool_result's explicit outcome) drives what we claim about the
+    user having seen the output. False → posting FAILED and the feedback
+    says so; True with no URLs is still success (non-Discord transports
+    return no URL); None → posting wasn't attempted (silent turn etc.).
+    Never infer delivery from URL presence."""
     if not result.ok:
         return f"Tool '{name}' returned an error: {result.error}"
+
+    # Appended to text/model_feedback payloads when the user-facing post
+    # failed — the payload itself is still returned (the model needs the
+    # data), but it must not believe the user saw it.
+    _post_failed_note = ""
+    if result.posted_ok is False:
+        _post_failed_note = (
+            f"\n[POSTING FAILED: {result.post_fail_reason or 'send error'} — "
+            f"the user has NOT seen this tool's output. Don't claim it was "
+            f"delivered; tell the user the post failed.]"
+        )
+
     if result.model_feedback is not None:
         # Even with a custom model_feedback, append posted URLs so the model
         # can reference prior outputs by URL on follow-up turns.
         if result.posted_urls:
             urls = "\n".join(f"[attachment: {u}]" for u in result.posted_urls)
-            return f"{result.model_feedback}\n{urls}"
-        return result.model_feedback
+            return f"{result.model_feedback}\n{urls}{_post_failed_note}"
+        return f"{result.model_feedback}{_post_failed_note}"
     if result.text:
         if result.posted_urls:
             urls = "\n".join(f"[attachment: {u}]" for u in result.posted_urls)
-            return f"{result.text}\n{urls}"
-        return result.text
+            return f"{result.text}\n{urls}{_post_failed_note}"
+        return f"{result.text}{_post_failed_note}"
     if result.attachments:
         names = ", ".join(p.name if hasattr(p, "name") else str(p) for p in result.attachments)
+        if result.posted_ok is False:
+            return (f"Tool '{name}' produced {len(result.attachments)} file(s): {names}, "
+                    f"but posting them to the channel FAILED "
+                    f"({result.post_fail_reason or 'send error'}) — the user has NOT "
+                    f"seen them. Tell the user the post failed instead of claiming "
+                    f"delivery; the file(s) still exist on disk.")
         if result.posted_urls:
             urls = "\n".join(f"[attachment: {u}]" for u in result.posted_urls)
             return (f"Tool '{name}' produced {len(result.attachments)} file(s): {names}. "
@@ -499,5 +560,13 @@ def _build_model_feedback_raw(name: str, result: ToolResult) -> str:
                     f"to follow-up image_url args, or call fetch_discord_message(url) on a CDN "
                     f"URL to re-inject the image into your vision when you actually need to "
                     f"inspect it:\n{urls}")
+        if result.posted_ok is None:
+            # Posting wasn't attempted — silent inter-agent turn. The files
+            # exist on disk but nobody in this channel has seen them.
+            return (f"Tool '{name}' produced {len(result.attachments)} file(s): {names}. "
+                    f"They were NOT posted to the channel (silent turn — no human "
+                    f"audience); the files exist on disk.")
+        # posted_ok True, no URLs: a transport that doesn't return URLs
+        # (e.g. iMessage) — the send succeeded, the user really can see them.
         return f"Tool '{name}' produced {len(result.attachments)} file(s): {names}. The user can see them."
-    return f"Tool '{name}' completed."
+    return f"Tool '{name}' completed.{_post_failed_note}"
