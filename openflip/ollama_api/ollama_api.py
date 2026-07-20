@@ -2,7 +2,6 @@ import asyncio
 import os
 import json
 import inspect
-import re
 from typing import Callable, Sequence, Any, Union, cast
 from pathlib import Path
 from .utils import *
@@ -407,11 +406,13 @@ class AIChatMessage(ChatMessage):
             else:
                 print_ts(f'Failed to find closing </think> or </response> tag.\n"""\n{self.content_text}\n"""', error=True)
 
-        self.content_text = self.content_text.strip() # Remove leading/trailing characters
-        self.content_text = re.sub(r' {2,}', ' ', self.content_text) # Remove double spaces
-
-        while self.content_text.startswith('"') and self.content_text.endswith('"'):
-            self.content_text = self.content_text[1:-1]
+        self.content_text = self.content_text.strip() # Remove leading/trailing whitespace
+        # NOTE: no further output rewriting here. A previous version collapsed
+        # runs of spaces and stripped wrapping double-quotes globally — a
+        # cosmetic patch for one model's tics that corrupted every model's
+        # code blocks, markdown tables, aligned text, and intentionally
+        # quoted replies. If a specific model needs output cleanup, gate it
+        # per-model in config, never at this layer.
 
     @property
     def content_text(self):
