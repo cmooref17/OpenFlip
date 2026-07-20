@@ -557,7 +557,7 @@ nested object. `respond_to_bots`, `memory_enabled`, etc. are top-level.
 | `dream.max_memory_chars` | int | `25000` | Cap on memory text fed to a dream pass. |
 | `proactive.enabled` | bool | `false` | KAIROS. When `true`, `main._sync_kairos_jobs()` creates the tick cron job (live — see §10). |
 | `proactive.interval_minutes` | int | `30` | Tick interval (must be > 0). |
-| `proactive.quiet_hours` | object \| null | `null` | e.g. `{"start":"23:00","end":"08:00","timezone":"US/Mountain"}`. |
+| `proactive.quiet_hours` | object \| null | `null` | e.g. `{"start":"23:00","end":"08:00","timezone":"US/Mountain"}`. Malformed values (bad `HH:MM`, unknown tz, only one bound) are REJECTED at job write/load time by `cron.validate_job`; a stored malformed window warns once per job at fire time and fails open (job fires) — never silently. |
 | `proactive.channel_id` | int | `0` | Channel the tick anchors / posts to. |
 | `allowed_read_paths` | list[string] OR dict | agent dir + system temp dir (fallback) | Dirs the agent may read. `["*"]` = unrestricted. Dict form is transport-keyed (`{"discord": {"users", "all_users"}}`), mirroring tool `auth` = per-user scope — see "Per-user path scope". ⚠️ A transport with no block gets ZERO scopes (silent deny) — incl. CRON turns, which resolve under the transport of the job's target session (`discord`/`imessage`/`internal`); see the cron silent-deny trap note in the cron section. |
 | `allowed_write_paths` | list[string] OR dict | **deny** (no fallback) | Dirs the agent may write. Empty/missing = hard deny — writes need an explicit allow list. `["*"]` = unrestricted. Dict form = transport-keyed per-user scope. |
@@ -581,6 +581,11 @@ gateway restart). Beyond `integrations.*`, `models.*`, and
   `nomic-embed-text`; see §6).
 - `dry_run_tools` — when `true`, EVERY tool call is logged + announced
   instead of executed. If tools seem to "do nothing", check this first.
+- `insecure_tls_hosts` — list of hostnames (case-insensitive) exempted
+  from `fetch_url`'s TLS certificate verification. For non-internal hosts
+  with self-signed/broken certs the operator explicitly trusts.
+  Internal/loopback targets are exempt automatically; everything else
+  verifies.
 - `data_dir` / `tmp_dir` / `output_dir` / `tts_models_dir` — data paths,
   resolved via `utils.resolve_path`.
 
@@ -680,6 +685,15 @@ problem.
   Owner/admins retain full access (no guard, no pin), so the owner can
   still fetch localhost services (webapp, etc.). Public URLs are
   unchanged for everyone.
+  **TLS is verified by default** (against the real hostname — the pinned-IP
+  rewrite passes `server_hostname`, so verification still keys off the
+  original name). An external site with a bad/expired/self-signed cert now
+  fails with a certificate error instead of being silently trusted — that
+  failure is correct; report it, don't retry around it. Verification is
+  skipped ONLY for targets resolving to private/loopback/internal
+  addresses (self-signed local services like webapp keep working;
+  those are owner/admin-only anyway) and for hostnames the operator listed
+  in config.json `insecure_tls_hosts`.
 - **`download_url_to_tmp` (internal helper in `tools/_comfy.py`, not a model
   tool)** — fetches model/user-controlled URLs for
   edit/upscale/animate/audio_separate. Enforces the SAME resolve-once +
@@ -2083,7 +2097,11 @@ If any byte differs, the agent reloads and the next turn picks up:
 - Project-level `CLAUDE.md` edits (it's in the fingerprint too).
 - New files added to `system_files`.
 
-The `/reload` slash command forces it explicitly.
+The `/reload` slash command forces it explicitly. Its report is honest
+about live conversations: "re-applied to N/M live conversation(s)" —
+when M > N the failed conversation keys are listed and those
+conversations are still on the STALE system prompt (details in the log).
+It never claims "conversations re-applied" over a swallowed failure.
 
 ## Restart needed
 
@@ -2481,6 +2499,36 @@ hot-reload via the next message (or `/reload`).
 Source of truth for everything that happened: `journalctl --user -u
 openflip --since "10 minutes ago"`.
 
+## Loud-failure warnings (formerly silent)
+
+Conditions that used to fail silently now log a red error — if you see
+one, it is real and actionable:
+
+- `tools: optional module '<name>' is present but failed to import` — a
+  media/extras tool module has a broken dependency (torch, demucs, …);
+  its tools are missing from the registry this run. A genuinely absent
+  extras module still skips silently.
+- `config.json: owner_id ... not parseable as an int` — the framework is
+  running OWNERLESS (is_owner false everywhere, admin tier gone). Fix
+  config.json.
+- `system file '<path>' EXISTS but could not be read` — the agent loaded
+  WITHOUT that system file (permissions/I/O error); its rules or
+  personality are missing until the file is readable.
+- `cron: job '<id>' has malformed quiet_hours` — the quiet window is NOT
+  applied; the job fires inside it. (New jobs with bad quiet_hours are
+  rejected at write time.)
+- `reload: reapply_agent failed for conversation <key>` — that live
+  conversation is still on the stale system prompt after /reload.
+- Web dashboard: an agent with corrupt agent.json shows as a
+  "⚠ broken agent.json" card (click through for the parse error)
+  instead of vanishing from the list.
+
+Stream truncation is also surfaced rather than swallowed: an Anthropic
+stream that ends without `message_stop` after partial content logs/
+retries as `incomplete_stream` (one retry, then the partial-text salvage
+path); a codex stream with no terminal event surfaces as a transport
+error. Truncated replies no longer enter history as complete messages.
+
 ## "Why didn't your last reply post?"
 
 1. `journalctl --user -u openflip --since "5 minutes ago"` — look for:
@@ -2658,7 +2706,12 @@ current model + provider + usage, `/model <model-name>` switches the agent's mod
 (auto-inferring + flipping the provider, mirroring the slash panel's set+save).
 Owner-only on every transport.
 
-`/status` slash command shows runtime state.
+`/status` slash command shows runtime state. Its "Messages: X in memory /
+Y on disk" line reports the REAL on-disk count: a missing conversation
+file shows `0 (⚠️ no file on disk — persistence may be broken)` and a
+read error shows `? (read failed — see log)` — it never echoes the
+in-memory number as if it were the persisted one, so save() breakage is
+visible right there.
 
 ### Other slash commands (Discord-only, owner-gated)
 
