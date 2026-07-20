@@ -45,6 +45,7 @@ import asyncio
 import json
 import os
 import time
+from contextlib import aclosing
 from typing import Any, AsyncIterator, Callable
 
 import aiohttp
@@ -1222,12 +1223,13 @@ class OpenAIConversation:
         framework_error: FrameworkErrorEvent | None = None
         stop_reason: str | None = None
 
+        _stream = self.chat_stream(
+            tools=tools, think=think,
+            tool_choice=tool_choice,
+            _retry_attempt=_retry_attempt,
+        )
         try:
-            async for event in self.chat_stream(
-                tools=tools, think=think,
-                tool_choice=tool_choice,
-                _retry_attempt=_retry_attempt,
-            ):
+            async for event in _stream:
                 if isinstance(event, FrameworkErrorEvent):
                     framework_error = event
                     continue
@@ -1257,6 +1259,20 @@ class OpenAIConversation:
                 content=f"⚠️ chat() wrapper failed: {_wrapper_e}",
                 is_framework_error=True,
             )
+        finally:
+            # ROOT FIX for the "generator didn't stop after athrow()" residue
+            # — close the stream generator deterministically, in-task, on
+            # every exit path (success, wrapper error, cancellation). See the
+            # matching finally in AnthropicConversation.chat(). aclose() is a
+            # no-op on an already-finished generator.
+            try:
+                await _stream.aclose()
+            except Exception as _close_e:
+                print_ts(
+                    f"{COLOR_YELLOW}chat_stream aclose failed (continuing): "
+                    f"{_close_e}{COLOR_END}",
+                    agent=self.agent.id,
+                )
 
         if framework_error is not None:
             return AIChatMessage(
@@ -1383,8 +1399,12 @@ class OpenAIConversation:
                 kind="auth",
             )
             return
-        async for ev in worker:
-            yield ev
+        # aclosing: if this dispatcher generator is closed while suspended
+        # mid-yield, close the worker generator deterministically too (no
+        # orphaned async-gen left for GC-time finalization).
+        async with aclosing(worker) as _worker:
+            async for ev in _worker:
+                yield ev
 
     def _record_usage(self, final_usage: dict, stream_failed: bool) -> None:
         """Shared post-stream bookkeeping for both auth paths: update
@@ -1601,12 +1621,13 @@ class OpenAIConversation:
                         try:
                             # Recurse into THIS worker, not the dispatcher —
                             # the retry must stay on the same auth path.
-                            async for ev in self._chat_stream_apikey(
+                            async with aclosing(self._chat_stream_apikey(
                                 tools=tools, think=think,
                                 tool_choice=tool_choice,
                                 _retry_attempt=_retry_attempt + 1,
-                            ):
-                                yield ev
+                            )) as _retry_stream:
+                                async for ev in _retry_stream:
+                                    yield ev
                             return
                         finally:
                             self._retry_budget = None
@@ -1624,8 +1645,9 @@ class OpenAIConversation:
                 # Status 200 — translate the SSE stream into StreamEvents.
                 _final_usage: dict = {}
                 _stream_failed = False
+                _translator = _stream_openai_events(resp.content)
                 try:
-                    async for ev in _stream_openai_events(resp.content):
+                    async for ev in _translator:
                         if isinstance(ev, FrameworkErrorEvent):
                             _stream_failed = True
                         elif isinstance(ev, MessageDeltaEvent) and ev.usage:
@@ -1642,6 +1664,16 @@ class OpenAIConversation:
                         kind="transport",
                     )
                 finally:
+                    # Deterministic translator close (no-op when finished) —
+                    # see the athrow-residue note in chat().
+                    try:
+                        await _translator.aclose()
+                    except Exception as _tr_close_e:
+                        print_ts(
+                            f"{COLOR_YELLOW}translator aclose failed (continuing): "
+                            f"{_tr_close_e}{COLOR_END}",
+                            agent=self.agent.id,
+                        )
                     if _final_usage:
                         self._record_usage(_final_usage, _stream_failed)
 
@@ -1796,12 +1828,13 @@ class OpenAIConversation:
                             except CodexAuthError as e:
                                 yield FrameworkErrorEvent(message=f"⚠️ {e}", kind="auth")
                                 return
-                            async for ev in self._chat_stream_codex(
+                            async with aclosing(self._chat_stream_codex(
                                 tools=tools, think=think,
                                 tool_choice=tool_choice,
                                 _retry_attempt=_retry_attempt + 1,
-                            ):
-                                yield ev
+                            )) as _retry_stream:
+                                async for ev in _retry_stream:
+                                    yield ev
                             return
                         yield FrameworkErrorEvent(
                             message=("⚠️ Codex subscription token rejected (401) "
@@ -1836,12 +1869,13 @@ class OpenAIConversation:
                         )
                         self._retry_budget = new_budget
                         try:
-                            async for ev in self._chat_stream_codex(
+                            async with aclosing(self._chat_stream_codex(
                                 tools=tools, think=think,
                                 tool_choice=tool_choice,
                                 _retry_attempt=_retry_attempt + 1,
-                            ):
-                                yield ev
+                            )) as _retry_stream:
+                                async for ev in _retry_stream:
+                                    yield ev
                             return
                         finally:
                             self._retry_budget = None
@@ -1859,8 +1893,9 @@ class OpenAIConversation:
                 # Status 200 — translate the Responses SSE stream.
                 _final_usage: dict = {}
                 _stream_failed = False
+                _translator = _stream_codex_events(resp.content)
                 try:
-                    async for ev in _stream_codex_events(resp.content):
+                    async for ev in _translator:
                         if isinstance(ev, FrameworkErrorEvent):
                             _stream_failed = True
                         elif isinstance(ev, MessageDeltaEvent) and ev.usage:
@@ -1877,6 +1912,16 @@ class OpenAIConversation:
                         kind="transport",
                     )
                 finally:
+                    # Deterministic translator close (no-op when finished) —
+                    # see the athrow-residue note in chat().
+                    try:
+                        await _translator.aclose()
+                    except Exception as _tr_close_e:
+                        print_ts(
+                            f"{COLOR_YELLOW}translator aclose failed (continuing): "
+                            f"{_tr_close_e}{COLOR_END}",
+                            agent=self.agent.id,
+                        )
                     if _final_usage:
                         self._record_usage(_final_usage, _stream_failed)
 

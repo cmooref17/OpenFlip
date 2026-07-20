@@ -3238,18 +3238,28 @@ class AgentRunner:
         except Exception as e:
             print_ts(f"{COLOR_RED}{log_tag}Chat error: {e}{COLOR_END}", agent=agent.id, error=True)
             if auto_post_final_text:
-                # Suppress chat-side dump for known-noisy asyncio cleanup
-                # errors — orphan-generator residue from Python 3.14's
-                # stricter async cancellation. Don't paste into Discord —
-                # user just wants "try again."
+                # Orphan-generator residue ("generator didn't stop after
+                # athrow()", Python 3.14's stricter async-gen finalization)
+                # should no longer occur: both providers' chat() wrappers now
+                # deterministically aclose() their stream generators on every
+                # exit path (including cancellation), and every nested
+                # generator boundary uses aclosing(). If it STILL surfaces,
+                # that's a framework streaming-cleanup bug — say so honestly
+                # instead of the old "Hit a timeout" mislabel, and keep the
+                # full error out of chat (it's already in the log, line
+                # above).
                 emsg = str(e)
-                _NOISY = (
+                _GEN_RESIDUE = (
                     "generator didn't stop after athrow",
                     "generator didn't stop after",
                 )
-                if any(n in emsg for n in _NOISY):
+                if any(n in emsg for n in _GEN_RESIDUE):
                     try:
-                        await _safe_channel_send(channel, "⚠️ Hit a timeout. Try again or shorten the request.")
+                        await _safe_channel_send(
+                            channel,
+                            "⚠️ Internal streaming-cleanup error (framework bug, "
+                            "not your request — it's logged). Try again.",
+                        )
                     except Exception:
                         pass
                 else:

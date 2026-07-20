@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import time
+from contextlib import aclosing
 from typing import Any, Callable, Optional
 
 import aiohttp
@@ -1633,12 +1634,13 @@ class AnthropicConversation:
             framework_error = None
             stop_reason = None
             stop_details = None
+            _stream = self.chat_stream(
+                tools=tools, think=think,
+                tool_choice=tool_choice,
+                _retry_attempt=_retry_attempt,
+            )
             try:
-                async for event in self.chat_stream(
-                    tools=tools, think=think,
-                    tool_choice=tool_choice,
-                    _retry_attempt=_retry_attempt,
-                ):
+                async for event in _stream:
                     if isinstance(event, FrameworkErrorEvent):
                         framework_error = event
                         # Continue iterating to let chat_stream finish its
@@ -1704,6 +1706,26 @@ class AnthropicConversation:
                 )
                 _msg.framework_error_kind = "transport"
                 return _msg
+            finally:
+                # ROOT FIX for the "generator didn't stop after athrow()"
+                # residue (Python 3.14's strict async-generator finalization):
+                # close the stream generator DETERMINISTICALLY, in-task, on
+                # every exit path — success, wrapper error, and cancellation
+                # (runtime's per-round wait_for timeout / /stop hard-
+                # interrupt). Any path that stops consuming while the
+                # generator is suspended at a yield would otherwise leave it
+                # for the GC/event-loop finalizer to athrow into later —
+                # which is where the athrow residue came from. aclose() is a
+                # no-op on an already-finished generator, so the happy path
+                # is unchanged.
+                try:
+                    await _stream.aclose()
+                except Exception as _close_e:
+                    print_ts(
+                        f"{COLOR_YELLOW}chat_stream aclose failed (continuing): "
+                        f"{_close_e}{COLOR_END}",
+                        agent=self.agent.id,
+                    )
 
             if framework_error is None:
                 break  # success — fall through to post-processing
@@ -2230,12 +2252,17 @@ class AnthropicConversation:
                             )
                             refreshed = await _load_oauth_access_token(force_refresh=True)
                             if refreshed and refreshed != access_token:
-                                async for ev in self.chat_stream(
+                                # aclosing: if THIS generator is closed while
+                                # suspended in the inner retry stream, close
+                                # the inner one deterministically too (no
+                                # orphaned async-gen for the GC to athrow).
+                                async with aclosing(self.chat_stream(
                                     tools=tools, think=think,
                                     tool_choice=tool_choice,
                                     _retry_attempt=_retry_attempt + 1,
-                                ):
-                                    yield ev
+                                )) as _retry_stream:
+                                    async for ev in _retry_stream:
+                                        yield ev
                                 return
                         yield FrameworkErrorEvent(
                             message="⚠️ Anthropic OAuth token rejected (401). Try `claude` to re-login.",
@@ -2278,12 +2305,13 @@ class AnthropicConversation:
                             os.remove(self._meta_path())
                         except OSError:
                             pass
-                        async for ev in self.chat_stream(
+                        async with aclosing(self.chat_stream(
                             tools=tools, think=think,
                             tool_choice=tool_choice,
                             _retry_attempt=1,
-                        ):
-                            yield ev
+                        )) as _retry_stream:
+                            async for ev in _retry_stream:
+                                yield ev
                         return
                     # Recovery 2: prompt too long. Halve budget, retry
                     # up to 3 times. Each retry trims more aggressively.
@@ -2301,12 +2329,13 @@ class AnthropicConversation:
                         )
                         self._retry_budget = new_budget
                         try:
-                            async for ev in self.chat_stream(
+                            async with aclosing(self.chat_stream(
                                 tools=tools, think=think,
                                 tool_choice=tool_choice,
                                 _retry_attempt=_retry_attempt + 1,
-                            ):
-                                yield ev
+                            )) as _retry_stream:
+                                async for ev in _retry_stream:
+                                    yield ev
                             return
                         finally:
                             self._retry_budget = None
@@ -2351,8 +2380,9 @@ class AnthropicConversation:
                 # lose partial usage data we already paid for. Caught
                 # in spot-review.
                 _stream_failed = False
+                _sse_stream = stream_sse_events(resp.content)
                 try:
-                    async for ev in stream_sse_events(resp.content):
+                    async for ev in _sse_stream:
                         # Side-effect handling for specific event types,
                         # mirroring what chat() does post-collect.
                         if isinstance(ev, MessageStartEvent):
@@ -2398,6 +2428,17 @@ class AnthropicConversation:
                         kind="transport",
                     )
                 finally:
+                    # Deterministically close the SSE-parser generator first
+                    # (no-op when it already finished) so a chat_stream close
+                    # mid-yield can't orphan it for GC-time finalization.
+                    try:
+                        await _sse_stream.aclose()
+                    except Exception as _sse_close_e:
+                        print_ts(
+                            f"{COLOR_YELLOW}sse stream aclose failed (continuing): "
+                            f"{_sse_close_e}{COLOR_END}",
+                            agent=self.agent.id,
+                        )
                     # Persist partial-or-final usage if we got any. This
                     # also runs on stream failure — we paid for the
                     # tokens, the data has value for /status.
