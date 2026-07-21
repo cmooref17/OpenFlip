@@ -55,7 +55,7 @@ def base(**overrides):
     kw = dict(
         is_chain_terminator=True,
         chain_root_operator=True,
-        final_text="oh — yeah, that's mini being mini... he answered the cheese question",
+        final_text="oh — yeah, that's agent_b being agent_b... he answered the cheese question",
         channel_session_transport="",        # plain nextcord channel (top-level operator DM)
         channel_conversation_id="",
         reply_equivalent_tool_fired=False,
@@ -64,7 +64,7 @@ def base(**overrides):
         any_attachments=False,
         human_softinject_drained=False,
         # Genuine top-level repro: the operator messaged 'agent_a' directly; agent_a
-        # consulted mini and is now relaying the answer. agent_a IS the chain root,
+        # consulted agent_b and is now relaying the answer. agent_a IS the chain root,
         # so root agent id == the agent running this terminator turn.
         this_agent_id="agent_a",
         chain_root_agent_id="agent_a",
@@ -75,7 +75,7 @@ def base(**overrides):
 
 def test_operator_rooted_real_channel_posts():
     print("operator-rooted terminator, real channel, plain text -> POSTS")
-    # The exact repro from log.txt: agent_a relays mini's answer to the operator.
+    # The exact repro from log.txt: agent_a relays agent_b's answer to the operator.
     check("posts to the originating channel", _terminator_text_surfaces(**base()) is True)
     # iMessage operator (real human channel, non-internal transport) also posts.
     check("iMessage operator real channel posts",
@@ -107,7 +107,7 @@ def test_nested_internal_peer_stays_silent():
     check("internal: conversation_id prefix stays silent (transport blank)",
           _terminator_text_surfaces(**base(
               channel_session_transport="",
-              channel_conversation_id="internal:peer-mini")) is False)
+              channel_conversation_id="internal:peer-agent_b")) is False)
 
 
 def test_no_double_post():

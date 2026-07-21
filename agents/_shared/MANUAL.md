@@ -44,7 +44,7 @@ agents/<id>/
 ├── SOUL.md               # Character / persona. Auto-injected by default (first in system_files).
 ├── AGENT.md              # Per-agent extension of _shared/FRAMEWORK.md. Auto-created empty, auto-injected by default. Empty = no-op.
 ├── TOOLS.md              # Per-agent extension of _shared/TOOLS.md. Auto-created empty, auto-injected by default. Empty = no-op.
-├── REMINDER.md           # (optional, legacy) Plain system file — loads ONLY if listed in system_files (agent_a and agent_c do). The per-turn uncached end-of-payload injection mechanic was REMOVED; no special handling remains.
+├── REMINDER.md           # (optional, legacy) Plain system file — loads ONLY if listed in system_files (some agents do). The per-turn uncached end-of-payload injection mechanic was REMOVED; no special handling remains.
 ├── HEARTBEAT.md          # (optional) Prompt loaded when a `heartbeat:true` cron job fires.
 ├── MEMORY.md             # Core memory. NOT auto-loaded — accessed via memory tools.
 ├── conversations/        # Per-channel <conv_id>.jsonl + <conv_id>.meta.json. Auto-managed.
@@ -1831,8 +1831,8 @@ when disabled. Default interval 30 min.
 - Retry-heuristic location — the four in-loop turn-retry heuristics
   (action-promise, peer-prose, empty-reply, and the `promise_without_action`
   stop-hook invocation) were extracted out of `runtime._run_turn` into
-  `openflip/turn_retries.py` (extracted 2026-06-07; see
-  `agents/agent_a/audits/full_audit_2026-06-07.md`). The decision
+  `openflip/turn_retries.py` (extracted 2026-06-07; see the
+  agent's audit log under `agents/<id>/audits/`). The decision
   logic — phrase lists, peer-prose line scan, nudge text, env kill switches
   (`OPENFLIP_DISABLE_ACTION_PROMISE_RETRY` / `_PEER_PROSE_RETRY` /
   `_EMPTY_RETRY`), and the `stop_hooks.evaluate_stop_hooks` wrapper — lives
