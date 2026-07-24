@@ -294,6 +294,85 @@ def _in_quiet_hours(job: dict, now_ms: int) -> bool:
         return False
 
 
+def _cron_due_slot(job: dict, now_ms: int) -> Optional[int]:
+    """For a cron job, return the epoch-ms of the scheduled occurrence that is
+    currently DUE, or None if the job is not due.
+
+    "Due" = the most recent scheduled slot at/just-before `now_ms` is strictly
+    newer than the job's anchor (its last stamped run, or a one-tick window on
+    first run). This replaces the old get_next()-and-compare logic and buys three
+    properties it lacked:
+
+      * Catch-up: in a long-running process, a slot missed because the process
+        was momentarily busy/late (or the runner wasn't ready at boot) is still
+        fired on the next tick — get_prev() surfaces it even when it is minutes
+        or hours in the past.
+      * Grid alignment: the returned value IS the schedule slot, so the caller
+        stamps lastRunMs onto the cron grid rather than the wall-clock fire
+        time. A late / manual / catch-up fire therefore can never drift the
+        anchor off-grid and swallow the FOLLOWING occurrence (the reported bug).
+      * No backlog storm: get_prev() yields exactly ONE slot (the most recent),
+        so at most one fire per tick no matter how many slots were missed —
+        preserving the original "don't replay every occurrence since 1970" intent.
+
+    Returns None (and logs, matching the previous behavior) when the expression
+    is missing/unparseable or croniter isn't installed.
+    """
+    schedule = job.get("schedule") or {}
+    expression = (schedule.get("expression") or "").strip()
+    if not expression:
+        return None
+    try:
+        from croniter import croniter
+    except ImportError:
+        print_ts(
+            f"{COLOR_YELLOW}cron: croniter not installed; job '{job.get('name')}' "
+            f"can't fire. Install with: pip install croniter{COLOR_END}",
+        )
+        return None
+    # Determine the timezone for evaluation. Default UTC.
+    tz = None
+    tz_name = (schedule.get("timezone") or "").strip()
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_name)
+        except Exception as e:
+            print_ts(
+                f"{COLOR_YELLOW}cron: job '{job.get('name')}' has invalid "
+                f"timezone {tz_name!r}: {e}; falling back to UTC{COLOR_END}",
+            )
+            tz = None
+    import datetime as _dt
+    last = int(job.get("lastRunMs", 0) or 0)
+    # First run after install: lastRunMs may be 0. Anchor one tick ago so a job
+    # with no run history only fires a slot that lands inside the current tick
+    # window — not a backlog of every occurrence since 1970.
+    if last <= 0:
+        anchor_ms = now_ms - _TICK_SECONDS * 1000
+    else:
+        anchor_ms = last
+    try:
+        now_dt = _dt.datetime.fromtimestamp(now_ms / 1000.0, tz=tz or _dt.timezone.utc)
+        it = croniter(expression, now_dt)
+        # Most recent scheduled slot at/before now. croniter uses strict-boundary
+        # semantics (an exact hit returns the PRIOR slot), but the 5s tick lands
+        # a few seconds past the boundary, so the current slot is returned; a
+        # tick landing exactly on the boundary is simply caught one tick later.
+        prev_dt = it.get_prev(_dt.datetime)
+        prev_ms = int(prev_dt.timestamp() * 1000)
+    except Exception as e:
+        print_ts(
+            f"{COLOR_YELLOW}cron: job '{job.get('name')}' expression {expression!r} "
+            f"failed to parse: {e}{COLOR_END}",
+        )
+        return None
+    # Due iff the most recent scheduled slot has not yet been consumed (it lies
+    # strictly after the anchor). Equality => already stamped this slot => not
+    # due (blocks a double-fire on the very next tick after firing).
+    return prev_ms if prev_ms > anchor_ms else None
+
+
 def _due(job: dict, now_ms: int) -> bool:
     """Return True if this job is due to run right now.
 
@@ -337,52 +416,9 @@ def _due(job: dict, now_ms: int) -> bool:
             return False
         return now_ms >= run_at_ms
     if kind == "cron":
-        expression = (schedule.get("expression") or "").strip()
-        if not expression:
-            return False
-        try:
-            from croniter import croniter
-        except ImportError:
-            print_ts(
-                f"{COLOR_YELLOW}cron: croniter not installed; job '{job.get('name')}' "
-                f"can't fire. Install with: pip install croniter{COLOR_END}",
-            )
-            return False
-        # Determine the timezone for evaluation. Default UTC.
-        tz = None
-        tz_name = (schedule.get("timezone") or "").strip()
-        if tz_name:
-            try:
-                from zoneinfo import ZoneInfo
-                tz = ZoneInfo(tz_name)
-            except Exception as e:
-                print_ts(
-                    f"{COLOR_YELLOW}cron: job '{job.get('name')}' has invalid "
-                    f"timezone {tz_name!r}: {e}; falling back to UTC{COLOR_END}",
-                )
-                tz = None
-        import datetime as _dt
-        last = int(job.get("lastRunMs", 0) or 0)
-        # First run after install: lastRunMs may be 0. Anchor evaluation at
-        # "the start of the scheduler tick window" (one tick ago) so a job
-        # with no run history fires its first scheduled occurrence, not a
-        # backlog of every occurrence since 1970.
-        if last <= 0:
-            anchor_ms = now_ms - _TICK_SECONDS * 1000
-        else:
-            anchor_ms = last
-        try:
-            anchor_dt = _dt.datetime.fromtimestamp(anchor_ms / 1000.0, tz=tz or _dt.timezone.utc)
-            it = croniter(expression, anchor_dt)
-            next_dt = it.get_next(_dt.datetime)
-            next_ms = int(next_dt.timestamp() * 1000)
-        except Exception as e:
-            print_ts(
-                f"{COLOR_YELLOW}cron: job '{job.get('name')}' expression {expression!r} "
-                f"failed to parse: {e}{COLOR_END}",
-            )
-            return False
-        return now_ms >= next_ms
+        # Catch-up + grid-aligned dueness lives in _cron_due_slot so _tick can
+        # stamp lastRunMs onto the schedule slot (not the wall-clock fire time).
+        return _cron_due_slot(job, now_ms) is not None
     return False
 
 
@@ -630,9 +666,20 @@ async def _tick() -> None:
     now_ms = int(time.time() * 1000)
     for job in jobs:
         if _due(job, now_ms):
+            # Compute the timestamp to record for this fire. For CRON jobs we
+            # stamp the SCHEDULED slot (not the wall-clock fire time) so the
+            # anchor stays on the cron grid: a late / manual / catch-up fire can
+            # no longer drift lastRunMs forward and swallow the next occurrence.
+            # interval/once keep wall-clock now_ms (their dueness is anchored on
+            # elapsed time / absolute run time, not a recurring grid).
+            stamp_ms = now_ms
+            if (job.get("schedule") or {}).get("kind") == "cron":
+                slot = _cron_due_slot(job, now_ms)
+                if slot is not None:
+                    stamp_ms = slot
             # Update timestamp BEFORE running so a long-running job doesn't
             # re-fire if a tick lands mid-run on the next pass.
-            job["lastRunMs"] = now_ms
+            job["lastRunMs"] = stamp_ms
             # Persist the stamp IMMEDIATELY — before awaiting _fire. If _fire
             # (or anything later in the tick) raises, the already-stamped jobs
             # must survive, or every due job re-fires on the next boot/tick
@@ -659,7 +706,7 @@ async def _tick() -> None:
                         target = fj
                         break
                 if target is not None:
-                    target["lastRunMs"] = now_ms
+                    target["lastRunMs"] = stamp_ms
                     _save_jobs(fresh)
                 else:
                     # Job vanished from disk mid-tick (cancelled concurrently,
