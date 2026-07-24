@@ -581,6 +581,12 @@ gateway restart). Beyond `integrations.*`, `models.*`, and
   `nomic-embed-text`; see §6).
 - `dry_run_tools` — when `true`, EVERY tool call is logged + announced
   instead of executed. If tools seem to "do nothing", check this first.
+- `run_command_admin_only` — bool, **defaults to `true`** (admin-gated, the
+  safe default). When `false`, disables `run_command`'s built-in admin check
+  so the tool is governed SOLELY by the per-agent `allowed_tools` ACL in
+  agent.json. Use on deployments where a non-admin identity (e.g. a
+  handle-based transport that can't resolve admin) still needs `run_command`
+  and access is instead scoped by agent.json. Absent/malformed → `true`.
 - `insecure_tls_hosts` — list of hostnames (case-insensitive) exempted
   from `fetch_url`'s TLS certificate verification. For non-internal hosts
   with self-signed/broken certs the operator explicitly trusts.

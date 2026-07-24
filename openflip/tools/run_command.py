@@ -30,7 +30,13 @@ async def run_command(command: str, timeout: int = 30) -> ToolResult:
         timeout: Max seconds to wait before killing the process (default 30, max 120).
     """
     from ..acl import current_caller_is_admin
-    if not current_caller_is_admin():
+    from ..config_global import get_run_command_admin_only
+    # Built-in admin gate is ON by default (safe). Config key
+    # `run_command_admin_only: false` disables it, leaving run_command
+    # governed solely by the per-agent tool ACL in agent.json — for
+    # deployments where a non-admin identity (e.g. a handle transport that
+    # can't resolve admin) still needs the tool.
+    if get_run_command_admin_only() and not current_caller_is_admin():
         return ToolResult.fail("run_command is admin-only.")
 
     command = (command or "").strip()

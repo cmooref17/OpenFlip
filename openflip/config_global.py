@@ -379,6 +379,27 @@ def get_codex_home() -> str:
         return os.path.expanduser(env)
     return os.path.expanduser(os.path.join("~", ".codex"))
 
+def get_run_command_admin_only() -> bool:
+    """Whether the run_command tool requires the caller to be admin.
+
+    Top-level config key `run_command_admin_only` (bool). DEFAULTS TO TRUE
+    (admin-gated) — the safe default. Set to False to disable the built-in
+    admin check so run_command is governed ONLY by the per-agent tool ACL in
+    agent.json (useful on deployments where a non-admin identity — e.g. a
+    handle-based transport that can't resolve admin — still needs the tool,
+    and access is instead scoped by the agent.json `allowed_tools` entry).
+    Absent/malformed → True (fail safe: keep the gate on).
+    """
+    cfg = get_config()
+    val = cfg.get("run_command_admin_only", True)
+    if isinstance(val, bool):
+        return val
+    # tolerate string "false"/"true" in JSON-ish configs; anything unclear → True
+    if isinstance(val, str):
+        return val.strip().lower() not in ("false", "0", "no", "off")
+    return True
+
+
 def get_openai_api_key() -> str:
     """Return the OpenAI API key, or "" if unconfigured.
 
