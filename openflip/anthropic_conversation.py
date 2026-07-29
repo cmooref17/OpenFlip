@@ -1854,6 +1854,14 @@ class AnthropicConversation:
         # turn. A clean end_turn and a missing stop_reason are NOT errors:
         # both return the plain empty response for runtime.py to handle.
         if not response.content and not tool_calls:
+            # Expose the terminal stop_reason on the (empty) message so the
+            # runtime terminal contract can distinguish a genuine empty
+            # end_turn from the missing-stop_reason provider anomaly
+            # (2026-07-29 incident: HTTP 200, usage billed, zero content
+            # blocks, no stop_reason). Set only on the empty shape — empty
+            # assistant messages are never appended to history, so this key
+            # cannot leak into persistence or a later API request body.
+            response.done_reason = stop_reason or ""
             if stop_reason == "refusal":
                 cat = (stop_details or {}).get("category", "unspecified")
                 why = (stop_details or {}).get("explanation", "").strip()
@@ -1889,6 +1897,11 @@ class AnthropicConversation:
                 # handles it (one-shot per turn). Returning a framework
                 # error here short-circuits that path and posts the warning
                 # straight to Discord — the 2026-06-10 regression.
+                # If the retry also comes back empty, the terminal contract
+                # in runtime.py now reads done_reason (set above) and
+                # surfaces this shape LOUDLY as a provider anomaly instead
+                # of suppressing it as a clean empty — the 2026-07-29
+                # incident fix.
                 print_ts(
                     f"{COLOR_YELLOW}empty reply with no stop_reason — "
                     f"deferring to runtime nudge-and-retry{COLOR_END}",

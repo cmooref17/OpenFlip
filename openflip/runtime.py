@@ -22,6 +22,7 @@ from .acl import is_owner
 from .registry import RUNNERS
 from .turn_retries import (
     action_promise_should_retry,
+    classify_empty_turn,
     detect_peer_prose,
     build_peer_prose_nudge,
     empty_retry_nudge,
@@ -2271,6 +2272,13 @@ class AgentRunner:
         # so the operator sees the REAL provider error instead of a misleading
         # "known bug" catch-all. None = no API error captured this turn.
         _captured_framework_error: str | None = None
+        # stop_reason of the LAST assistant attempt this turn (from the
+        # provider's done_reason). The terminal contract uses it to
+        # distinguish a genuine empty end_turn ("end_turn"; ollama "stop")
+        # from the 2026-07-29 provider anomaly: HTTP 200, usage billed,
+        # zero content blocks, NO stop_reason — invisible to every error
+        # branch. "" = missing/unknown.
+        _last_stop_reason = ""
         # Cross-iteration tool-call dedup. A (function_name, sorted-args-json)
         # signature is added here ONLY for calls that succeeded — failed
         # calls stay retry-able. Mirrors Claude Code's `runTools` semantics
@@ -2570,10 +2578,17 @@ class AgentRunner:
                     _tc = getattr(ai_message, "tool_calls", None) or []
                     _ct = (getattr(ai_message, "content_text", None) or
                            getattr(ai_message, "content", "") or "")
-                    _done = ""
-                    _raw = getattr(ai_message, "raw_response", None)
-                    if _raw is not None:
-                        _done = getattr(_raw, "done_reason", "") or ""
+                    # anthropic/openai set done_reason directly on the empty
+                    # message shape; ollama carries it on the raw response.
+                    _done = getattr(ai_message, "done_reason", "") or ""
+                    if not _done:
+                        _raw = getattr(ai_message, "raw_response", None)
+                        if _raw is not None:
+                            _done = getattr(_raw, "done_reason", "") or ""
+                    # Thread the final attempt's stop_reason to the terminal
+                    # contract (2026-07-29 fix): it distinguishes a clean
+                    # "model chose to say nothing" from a provider anomaly.
+                    _last_stop_reason = _done
                     if _tc:
                         print_ts(f"  ← {_prov} replied  tool_calls={[t.function_name for t in _tc]} done={_done}", agent=agent.id)
                     elif _ct.strip():
@@ -3920,81 +3935,77 @@ class AgentRunner:
                 if not _diag_bits:
                     _diag_bits.append("unknown")
                 _diag = ",".join(_diag_bits)
-                # If the turn ended empty because the provider returned an
-                # error (rate limit / overload / auth / 400), surface the
-                # ACTUAL error — never the generic catch-all. Otherwise the
-                # operator sees "known bug" when the real cause is a temporary
-                # 429/529 from Anthropic.
-                if _captured_framework_error:
+                # Classify the no-output turn (extracted to
+                # turn_retries.classify_empty_turn, 2026-07-29 — see its
+                # docstring for the incident history and the full decision
+                # table). The short version:
+                #   provider_error   — an API error was captured; surface it.
+                #   provider_anomaly — empty with MISSING stop_reason (the
+                #                      2026-07-29 incident shape: HTTP 200,
+                #                      usage billed, zero content blocks, no
+                #                      stop_reason — invisible to every error
+                #                      branch). Loud, always.
+                #   notify_minimal   — genuine empty end_turn on a human
+                #                      operator-facing turn with no
+                #                      attachments: minimal notice instead of
+                #                      silence (2026-07-15 re-arm, amended
+                #                      2026-07-29 to drop any_tool_called).
+                #   suppress         — genuine empty end_turn on a
+                #                      silent-by-design dispatch or with
+                #                      attachments already posted.
+                #   loud             — every other no-output shape.
+                _classification = classify_empty_turn(
+                    captured_framework_error=_captured_framework_error,
+                    diag=_diag,
+                    last_stop_reason=_last_stop_reason,
+                    any_attachments_this_turn=any_attachments_this_turn,
+                    auto_post_final_text=auto_post_final_text,
+                    silent=silent,
+                    is_chain_terminator=is_chain_terminator,
+                    originator_agent_id=originator_agent_id,
+                    auto_route_from_peer=auto_route_from_peer,
+                    log_tag=log_tag,
+                )
+                if _classification == "provider_error":
                     _api_err = str(_captured_framework_error).strip()[:1500]
                     _user_msg = (
                         f"⚠️ The model provider returned an error: {_api_err} "
                         f"This is usually a temporary rate limit/overload — try again in a moment."
                     )
                     _log_reason = f"provider_error: {str(_captured_framework_error)[:200]!r}"
+                elif _classification == "provider_anomaly":
+                    _status_hint = (
+                        "status.claude.com"
+                        if getattr(agent, "provider", "") == "anthropic"
+                        else "the provider's status page"
+                    )
+                    _user_msg = (
+                        f"⚠️ The model returned an empty response with no "
+                        f"stop_reason (provider anomaly — likely an outage, "
+                        f"check {_status_hint}). Try again in a moment."
+                    )
+                    _log_reason = (
+                        f"reason={_diag} provider_anomaly=missing_stop_reason "
+                        f"(stop_reason={_last_stop_reason!r})"
+                    )
+                elif _classification == "notify_minimal":
+                    _user_msg = "⚠️ model returned no content — try again"
+                    _log_reason = (
+                        f"reason={_diag} human_turn_clean_empty "
+                        f"(stop_reason={_last_stop_reason!r})"
+                    )
                 else:
                     _user_msg = (
                         f"⚠️ The model returned an empty response (reason: {_diag}). "
                         f"Try `/reset` if it persists."
                     )
                     _log_reason = f"reason={_diag}"
-                # Claude Code parity (queryHelpers.ts isResultSuccessful): a
-                # clean empty end_turn — the model fired nothing and there was
-                # no provider error — is a LEGITIMATE outcome, not a failure.
-                # Since 2026-07-19 the providers no longer stamp that shape as
-                # a framework error (see the empty-reply classification in
-                # anthropic_conversation.py / openai_conversation.py): it
-                # arrives here as a plain empty after the in-loop nudge-and-
-                # retry already gave the model one chance to close with text.
-                # This block is therefore the single classifier for clean
-                # empties, not a mask over a chat()-level warning. It is
-                # still load-bearing for two real shapes: (1) tool turns
-                # whose attachments already posted in caption/text_then_media
-                # modes — _media_satisfied only covers media_only, so without
-                # this the operator would get "⚠️ empty response" right after
-                # receiving the attachment; (2) no-tool turns where the model
-                # chose to say nothing twice (CC parity: the model's call).
-                # So: when the ONLY diagnosis is a bare
-                # empty_assistant_message AND no provider error was captured,
-                # log it quietly and suppress the operator-facing warning.
-                # Every other case (provider errors, text-present-but-not-posted,
-                # tools-called-but-no-reply, no_assistant_message) still surfaces.
-                _clean_empty_end_turn = (
-                    not _captured_framework_error
-                    and _diag == "empty_assistant_message"
-                )
-                # 2026-07-15: the CC-parity suppression above is what turned
-                # the recurring "tool ran, then dead silence" bug into TOTAL
-                # dead air — it ate the last-resort warning too. On a HUMAN-
-                # initiated turn that executed at least one tool and posted
-                # no attachment (attachments post in every mode and count as
-                # output), an empty end is never a drain/no-op: the operator
-                # asked, watched the tool run, and is owed SOMETHING. The
-                # in-loop final-text guarantee normally prevents this shape
-                # from ever reaching here; it still can via MAX_TOOL_TURNS,
-                # a nudge-injection failure, or the kill switch — so re-arm
-                # the warning for exactly that shape. Every silent-by-design
-                # path (peer/cron/synthetic/chain-terminator) fails
-                # operator_facing_turn and keeps the suppression. Kill
-                # switch: OPENFLIP_DISABLE_NO_FINAL_TEXT_RETRY=1 restores
-                # the unconditional suppression.
-                if (_clean_empty_end_turn
-                        and any_tool_called
-                        and not any_attachments_this_turn
-                        and no_final_text_guarantee_enabled()
-                        and operator_facing_turn(
-                            auto_post_final_text=auto_post_final_text,
-                            silent=silent,
-                            is_chain_terminator=is_chain_terminator,
-                            originator_agent_id=originator_agent_id,
-                            auto_route_from_peer=auto_route_from_peer,
-                            log_tag=log_tag,
-                        )):
-                    _clean_empty_end_turn = False
-                if _clean_empty_end_turn:
+                if _classification == "suppress":
                     print_ts(
-                        f"{COLOR_YELLOW}{log_tag}empty end_turn (no output, no error) "
-                        f"— accepted as legitimate, warning suppressed (CC parity){COLOR_END}",
+                        f"{COLOR_YELLOW}{log_tag}empty end_turn "
+                        f"(stop_reason={_last_stop_reason!r}, no error, "
+                        f"non-operator-facing or attachments posted) — accepted "
+                        f"as legitimate, warning suppressed{COLOR_END}",
                         agent=agent.id,
                     )
                 else:

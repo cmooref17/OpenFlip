@@ -1852,7 +1852,9 @@ when disabled. Default interval 30 min.
   `_EMPTY_RETRY`), and the `stop_hooks.evaluate_stop_hooks` wrapper — lives
   there now; `runtime.py` still owns the one-shot flags, the `conv.messages`
   nudge append, the sticky `tool_choice=any` override, and the `continue`.
-  Pure code motion, no behavior change.
+  Pure code motion, no behavior change. (2026-07-29: the terminal-contract
+  empty-turn classifier `classify_empty_turn` also lives there — pinned by
+  `tests/test_empty_turn_classifier.py`.)
 - No self-retrigger — kairos send_message posts as the bot;
   `should_respond()` filters the agent's own id. Must not reset another
   agent's cooldown.
@@ -2575,20 +2577,36 @@ error. Truncated replies no longer enter history as complete messages.
      that dies mid-response after substantial text (and no tool calls)
      is salvaged and posted with a "(response was cut off mid-stream)"
      marker instead of discarding the billed tokens. The
-     genuinely-empty case posts "⚠️ The model returned an empty
-     response (reason: ...). Try `/reset` if it persists." When the
-     in-loop framework-error branch already posted the error to the
-     channel, the terminal contract stays silent (no double-post).
+     genuinely-empty case is classified by stop_reason (2026-07-29,
+     `turn_retries.classify_empty_turn`): an empty reply with NO
+     stop_reason posts "⚠️ The model returned an empty response with
+     no stop_reason (provider anomaly — likely an outage, check
+     status.claude.com). Try again in a moment."; a genuine empty
+     end_turn on a human-facing turn with no attachments posts the
+     minimal "⚠️ model returned no content — try again"; on
+     silent-by-design turns (peer/cron/synthetic/chain-terminator) or
+     when attachments already posted this turn, it stays silent
+     (logged as `empty end_turn ... warning suppressed`). Every other
+     no-output shape posts "⚠️ The model returned an empty response
+     (reason: ...). Try `/reset` if it persists." When the in-loop
+     framework-error branch already posted the error to the channel,
+     the terminal contract stays silent (no double-post).
    - `empty reply with no stop_reason — deferring to runtime
      nudge-and-retry` (anthropic/openai provider). A turn that came
      back with no content, no tool_use, AND no stop_reason is a
-     transient API glitch, not a model decision — it is NOT posted to
-     the channel. The runtime injects a [FRAMEWORK] nudge and retries
-     once (`OPENFLIP_DISABLE_EMPTY_RETRY=1` to disable); only if the
-     retry is also empty does the terminal contract surface the
-     "empty response" message above. A real refusal
-     (`stop_reason=refusal` → "⚠️ Model declined ...") or an empty
-     reply WITH a stop_reason still posts immediately.
+     provider anomaly (observed en masse in the 2026-07-29 Anthropic
+     incident: HTTP 200, usage billed, zero content blocks, no
+     stop_reason — no error status for the retry branches to catch),
+     not a model decision — it is NOT posted to the channel yet. The
+     runtime injects a [FRAMEWORK] nudge and retries once
+     (`OPENFLIP_DISABLE_EMPTY_RETRY=1` to disable); if the retry is
+     also empty, the terminal contract surfaces the LOUD
+     provider-anomaly message above. (Before 2026-07-29 this shape
+     was mis-classified as a legitimate "clean empty" and suppressed
+     — the operator saw pure dead air and couldn't tell a provider
+     outage from a dead bot.) A real refusal (`stop_reason=refusal`
+     → "⚠️ Model declined ...") or an empty reply WITH an abnormal
+     stop_reason (e.g. max_tokens) still posts immediately.
    - `OAuth token unavailable` (refresh failed; see section 13).
    - `MalformedRequestError` (request body failed pre-flight
      validation; Anthropic 400 short-circuited).

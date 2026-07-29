@@ -1326,6 +1326,14 @@ class OpenAIConversation:
         response.raw_response = {"content": ordered_blocks}
 
         if not response.content and not tool_calls:
+            # Expose the terminal stop_reason (finish_reason, normalized to
+            # the anthropic vocabulary) on the (empty) message so the runtime
+            # terminal contract can distinguish a genuine empty end_turn from
+            # the missing-stop_reason provider anomaly (2026-07-29 incident).
+            # Set only on the empty shape — empty assistant messages are
+            # never appended to history, so this key cannot leak into
+            # persistence or a later API request body.
+            response.done_reason = stop_reason or ""
             if stop_reason == "refusal":
                 msg = "⚠️ Model declined (finish_reason=content_filter)."
             elif stop_reason == "end_turn":
@@ -1352,6 +1360,11 @@ class OpenAIConversation:
                 # response so runtime.py's empty-reply nudge-and-retry path
                 # handles it (one-shot per turn) instead of posting a
                 # framework-error warning straight to Discord.
+                # If the retry also comes back empty, the terminal contract
+                # in runtime.py now reads done_reason (set above) and
+                # surfaces this shape LOUDLY as a provider anomaly instead
+                # of suppressing it as a clean empty — the 2026-07-29
+                # incident fix.
                 print_ts(
                     f"{COLOR_YELLOW}empty reply with no finish_reason — "
                     f"deferring to runtime nudge-and-retry{COLOR_END}",
