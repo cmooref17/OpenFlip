@@ -21,6 +21,7 @@ import aiohttp
 
 from ._base import tool, ToolResult
 from ..config_global import get_config
+from ..snapshots import snapshot_file
 from ..utils import load_json, save_json, print_ts, http_session
 
 
@@ -231,6 +232,17 @@ async def update_core_memory(content: str) -> ToolResult:
     _maybe_migrate(agent_dir)
 
     mem_path = _memory_md_path(agent_dir)
+
+    # Snapshot the existing MEMORY.md before overwriting — this tool replaces
+    # the whole file, so a bad consolidation (e.g. a dream pass that reasoned
+    # over a partial view) would otherwise be unrecoverable. snapshot_file()
+    # never raises by contract, but a failed backup must never block the
+    # write, so guard anyway.
+    if os.path.isfile(mem_path):
+        try:
+            snapshot_file(mem_path)
+        except Exception as e:
+            print_ts(f"MEMORY.md snapshot failed (proceeding with write): {e}", error=True)
 
     # Atomic write
     tmp_path = mem_path + ".tmp"

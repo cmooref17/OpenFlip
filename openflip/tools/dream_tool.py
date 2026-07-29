@@ -6,8 +6,9 @@ MEMORY.md (the curated core knowledge) grows unbounded — contradicted facts
 are never pruned, relative dates ("yesterday") rot into ambiguity, and the
 file drifts past any sane size.
 
-This tool does NOT call an LLM itself. Instead it gathers the full memory
-surface (MEMORY.md + every daily log) and hands the agent a 4-phase
+This tool does NOT call an LLM itself. Instead it gathers the memory
+surface (MEMORY.md in full + as many daily logs as fit the payload budget,
+newest kept first — see _MAX_PAYLOAD_CHARS) and hands the agent a 4-phase
 consolidation prompt as the tool result. The AGENT then does the actual
 distillation reasoning and writes the consolidated result back by calling
 `update_core_memory` (see memory.py). This mirrors search_memory's pattern:
@@ -34,6 +35,18 @@ from .memory import _memory_md_path, _memory_dir, _maybe_migrate
 
 # Fallback cap when an agent has no dream config / max_memory_chars set.
 _DEFAULT_MAX_MEMORY_CHARS = 25000
+
+# Budget for the assembled consolidation payload. MUST stay under runtime.py's
+# _TOOL_RESULT_MAX_CHARS (100_000) ingestion cap: that cap truncates tool
+# results from the END, which for this oldest-first payload would silently
+# delete the NEWEST daily logs — exactly the entries the Prune phase needs in
+# order to override stale facts. Windowing here (dropping OLDEST logs, with an
+# explicit note) keeps whatever we send intact through ingestion.
+_MAX_PAYLOAD_CHARS = 90_000
+
+
+class MemoryTooLargeError(Exception):
+    """Raised when even the mandatory parts (MEMORY.md + instructions) exceed the payload budget."""
 
 
 def _get_agent():
@@ -71,27 +84,31 @@ def _gather_memory(agent_dir: str) -> tuple[str, list[tuple[str, str]]]:
 
 
 def _build_consolidation_prompt(agent_dir: str, max_memory_chars: int, today: str) -> str:
-    """Assemble the full memory dump + 4-phase consolidation instructions."""
+    """Assemble the memory dump + 4-phase consolidation instructions.
+
+    The payload is bounded to _MAX_PAYLOAD_CHARS. MEMORY.md and the
+    instructions are always included in full; daily logs are windowed —
+    SELECTED newest-first (so when the budget runs out it is the oldest
+    history that drops, never the recent entries the Prune phase depends on)
+    but still RENDERED oldest-first (preserving the chronological order that
+    lets a later entry contradict an earlier one). The window is contiguous:
+    once a log doesn't fit, everything older is dropped too, and a prominent
+    note states exactly what was omitted.
+
+    Raises MemoryTooLargeError if the mandatory parts alone exceed the budget.
+    """
     core, dailies = _gather_memory(agent_dir)
 
-    parts: list[str] = []
-    parts.append(
+    header = (
         f"DREAM — memory consolidation. Today is {today} (absolute). Use this "
         f"date to resolve any relative references ('yesterday', 'last week', "
         f"'a few days ago') into absolute YYYY-MM-DD dates BEFORE you write."
     )
-
-    parts.append("=== CURRENT CORE MEMORY (MEMORY.md) ===")
-    parts.append(core.strip() if core.strip() else "(empty — no core memory yet)")
-
-    if dailies:
-        parts.append("=== DAILY LOGS (oldest first) ===")
-        for label, content in dailies:
-            parts.append(f"--- {label} ---\n{content.strip()}")
-    else:
-        parts.append("=== DAILY LOGS ===\n(none)")
-
-    parts.append(
+    core_section = (
+        "=== CURRENT CORE MEMORY (MEMORY.md) ===\n\n"
+        + (core.strip() if core.strip() else "(empty — no core memory yet)")
+    )
+    task_section = (
         "=== YOUR TASK ===\n"
         "Consolidate the above into a single, clean MEMORY.md. Work through "
         "four phases:\n"
@@ -111,6 +128,60 @@ def _build_consolidation_prompt(agent_dir: str, max_memory_chars: int, today: st
         "perform the consolidation and write it back."
     )
 
+    # Mandatory chars: header + core + task, plus slack for the "\n\n"
+    # joiners, the daily-logs section header, and the (variable-length)
+    # omission note. 1000 chars generously covers all of those.
+    fixed_chars = len(header) + len(core_section) + len(task_section) + 1000
+    if fixed_chars > _MAX_PAYLOAD_CHARS:
+        raise MemoryTooLargeError(
+            f"Core memory is too large to consolidate in one pass: MEMORY.md "
+            f"({len(core):,} chars) plus instructions totals ~{fixed_chars:,} chars, "
+            f"over the {_MAX_PAYLOAD_CHARS:,}-char dream payload budget. Ask the "
+            f"operator to raise the budget or split/trim MEMORY.md before dreaming."
+        )
+
+    # Window the daily logs: walk NEWEST-first, keep a contiguous run of the
+    # most recent logs that fits the remaining budget. included_start is the
+    # index (in the oldest-first `dailies` list) of the first log kept.
+    blocks = [f"--- {label} ---\n{content.strip()}" for label, content in dailies]
+    budget = _MAX_PAYLOAD_CHARS - fixed_chars
+    included_start = len(dailies)
+    for i in range(len(blocks) - 1, -1, -1):
+        cost = len(blocks[i]) + 2  # +2 for the "\n\n" joiner
+        if cost > budget:
+            break
+        budget -= cost
+        included_start = i
+
+    parts: list[str] = [header, core_section]
+
+    if included_start > 0 and dailies:
+        omitted = dailies[:included_start]
+        omitted_chars = sum(len(b) for b in blocks[:included_start])
+        note = (
+            f"!!! PARTIAL VIEW — {len(omitted)} older daily log(s) were OMITTED to "
+            f"fit the payload budget: {omitted[0][0]} through {omitted[-1][0]} "
+            f"({omitted_chars:,} chars not shown)."
+        )
+        if included_start < len(dailies):
+            note += f" The logs below start at {dailies[included_start][0]}."
+        note += (
+            " Be CONSERVATIVE in the Prune phase: only delete a core-memory fact "
+            "if a log shown below explicitly contradicts it — absence from the "
+            "visible logs is NOT evidence it is stale, since its origin may lie "
+            "in the omitted range."
+        )
+        parts.append(note)
+
+    if not dailies:
+        parts.append("=== DAILY LOGS ===\n(none)")
+    elif included_start >= len(dailies):
+        parts.append("=== DAILY LOGS ===\n(all omitted — even the newest log exceeds the remaining budget; see note above)")
+    else:
+        parts.append("=== DAILY LOGS (oldest first) ===")
+        parts.extend(blocks[included_start:])
+
+    parts.append(task_section)
     return "\n\n".join(parts)
 
 
@@ -134,7 +205,10 @@ async def dream() -> ToolResult:
         max_chars = _DEFAULT_MAX_MEMORY_CHARS
 
     today = time.strftime("%Y-%m-%d")
-    payload = _build_consolidation_prompt(agent_dir, max_chars, today)
+    try:
+        payload = _build_consolidation_prompt(agent_dir, max_chars, today)
+    except MemoryTooLargeError as e:
+        return ToolResult.fail(str(e))
 
     try:
         from .. import events_log as _events_log

@@ -638,7 +638,9 @@ problem.
   embedding index. Auto-injected when `memory_enabled: true`.
 - **`update_core_memory(content: str)`** — overwrite `MEMORY.md` with
   `content`. Read the file first; you are responsible for preserving
-  what should stay.
+  what should stay. The existing file is snapshotted to `.snapshots/`
+  before the overwrite, so a bad rewrite is recoverable via
+  `restore_snapshot`.
 - **`search_memory(query: str)`** — cosine-similarity search across
   `MEMORY.md` + daily logs using the embedding model in `config.json`.
   Top-5 results above a 0.3 threshold.
@@ -649,6 +651,12 @@ problem.
   MEMORY.md + recent daily logs, rewrites core memory via
   `update_core_memory`). Same pass the `/dream` command and auto-dream
   fire (see §10). Registered like any tool; usually owner-gated.
+  The payload is capped at ~90k chars (under the framework's 100k
+  tool-result ingestion cap): MEMORY.md is always included in full;
+  daily logs are windowed newest-kept-first (oldest drop) but rendered
+  oldest-first, with an explicit note when older logs were omitted.
+  If MEMORY.md alone exceeds the budget the tool fails instead of
+  returning a payload that would be truncated.
 
 ## Files (path-ACL gated)
 
@@ -1865,6 +1873,13 @@ a `/dream`-equivalent SILENT synthetic turn — reusing the existing
 `update_core_memory()` and stops. Manual `/dream` is unchanged and
 ignores `dream.enabled`.
 
+The consolidation payload is windowed to ~90k chars so it survives the
+100k tool-result ingestion cap intact: MEMORY.md always rides in full,
+daily logs keep the NEWEST that fit (oldest are dropped, rendered
+oldest-first, with a PARTIAL VIEW note naming the omitted date range so
+the pass prunes conservatively). `update_core_memory` snapshots the old
+MEMORY.md first, so a bad dream is reversible via `restore_snapshot`.
+
 ### Enabling (per-agent, default OFF)
 
 In `agent.json`:
@@ -2479,6 +2494,9 @@ update_core_memory("""
 
 Read first (`read_memory()`), edit the string, write the whole file
 back. There is no partial-update tool — the whole file is replaced.
+The previous MEMORY.md is snapshotted before the overwrite; a bad
+rewrite can be undone with
+`restore_snapshot("agents/<id>/MEMORY.md", index=0)`.
 
 ## Restore a conversation from backup
 
