@@ -30,7 +30,14 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from types import SimpleNamespace
+
+# The file tool's universal read fallback keys off tempfile.gettempdir(), which
+# is /tmp on POSIX but /var/folders/... on macOS. Probe with a path UNDER that
+# dir so the "universal temp read fallback" assertions are correct on every
+# platform (a hardcoded "/tmp/f" would resolve outside gettempdir() on macOS).
+TMP_PROBE = os.path.join(tempfile.gettempdir(), "f")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -202,7 +209,7 @@ def test_b_dict_resolution():
     ag3 = mk_agent(owner_unlisted_no_all, ["*"])
     _set_speaker(OWNER_ID)
     check("owner with empty resolution does NOT inherit another user's scope", not allowed(ag3, "/u/f", "read"))
-    check("owner with empty resolution still gets the universal /tmp read fallback", allowed(ag3, "/tmp/f", "read"))
+    check("owner with empty resolution still gets the universal temp-dir read fallback", allowed(ag3, TMP_PROBE, "read"))
 
 
 def test_c_denied_overrides_all():
@@ -288,7 +295,7 @@ def test_transport_keyed_routing():
     check("transport with no block: denied outside fallback (read)", not allowed(ag2, "/disc/scope/f", "read"))
     check("transport with no block: denied at the all_users path too", not allowed(ag2, "/disc/base/f", "read"))
     check("transport with no block: write denied (no block, no fallback)", not allowed(ag2, "/disc/scope/f", "write"))
-    check("transport with no block: read still gets universal /tmp fallback", allowed(ag2, "/tmp/f", "read"))
+    check("transport with no block: read still gets universal temp-dir fallback", allowed(ag2, TMP_PROBE, "read"))
 
 
 if __name__ == "__main__":

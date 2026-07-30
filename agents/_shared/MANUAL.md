@@ -648,15 +648,20 @@ problem.
   date (`"2026-05-21"`) reads that day's log.
 - **`list_memory_files()`** — list daily logs with dates and sizes.
 - **`dream()`** — run the 4-phase memory-consolidation pass NOW (reads
-  MEMORY.md + recent daily logs, rewrites core memory via
-  `update_core_memory`). Same pass the `/dream` command and auto-dream
-  fire (see §10). Registered like any tool; usually owner-gated.
-  The payload is capped at ~90k chars (under the framework's 100k
-  tool-result ingestion cap): MEMORY.md is always included in full;
-  daily logs are windowed newest-kept-first (oldest drop) but rendered
-  oldest-first, with an explicit note when older logs were omitted.
-  If MEMORY.md alone exceeds the budget the tool fails instead of
-  returning a payload that would be truncated.
+  MEMORY.md + daily logs, rewrites core memory via `update_core_memory`).
+  Same pass the `/dream` command and auto-dream fire (see §10).
+  Registered like any tool; usually owner-gated.
+  It writes the FULL corpus (MEMORY.md + ALL daily logs, nothing
+  dropped) to a per-agent spill file in the system temp dir and returns:
+  a compact INDEX (per-file char counts, date range, total), the spill
+  file's ABSOLUTE path, and the 4-phase instructions. Read slices of the
+  corpus with `read_file(path=<spill path>)` (or individual logs via
+  `read_memory("YYYY-MM-DD")`). A bounded inline PREVIEW of the newest
+  logs is still included so a small memory needs no extra read — when the
+  preview omits or tail-truncates older logs, the note points at the
+  spill file (relocated, never lost). MemoryTooLargeError still fires
+  only for a genuinely absurd MEMORY.md, and its message points at the
+  spill file so you can consolidate from there.
 
 ## Files (path-ACL gated)
 
@@ -1875,12 +1880,15 @@ a `/dream`-equivalent SILENT synthetic turn — reusing the existing
 `update_core_memory()` and stops. Manual `/dream` is unchanged and
 ignores `dream.enabled`.
 
-The consolidation payload is windowed to ~90k chars so it survives the
-100k tool-result ingestion cap intact: MEMORY.md always rides in full,
-daily logs keep the NEWEST that fit (oldest are dropped, rendered
-oldest-first, with a PARTIAL VIEW note naming the omitted date range so
-the pass prunes conservatively). `update_core_memory` snapshots the old
-MEMORY.md first, so a bad dream is reversible via `restore_snapshot`.
+The tool spills the FULL corpus (MEMORY.md + ALL daily logs, nothing
+dropped) to a per-agent file in the system temp dir and returns a compact
+index + that file's absolute path; the agent reads slices with
+`read_file`. The tool result itself stays under the 100k ingestion cap by
+inlining MEMORY.md in full plus a bounded PREVIEW of the newest logs
+(older ones tail-truncated or omitted from the preview, with a note
+pointing at the spill file — relocated, never lost) so the pass prunes
+conservatively. `update_core_memory` snapshots the old MEMORY.md first,
+so a bad dream is reversible via `restore_snapshot`.
 
 ### Enabling (per-agent, default OFF)
 
