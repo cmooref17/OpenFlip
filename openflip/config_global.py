@@ -510,6 +510,32 @@ def get_compaction_trigger(model_name: str, provider: str = "") -> int:
     return max(trigger, 50_000)
 
 
+def get_per_context_sessions() -> bool:
+    """Feature flag: route headless-agent work and interval-cron jobs into
+    per-context sessions (per-operator / per-cron) instead of one shared
+    eternal internal thread, and start each recurring cron run on a fresh
+    session (previous run archived). Opt-in: config.json top-level
+    `"per_context_sessions": true`. Off = pre-2026-08 behavior, unchanged.
+
+    Why: shared append-forever working threads are re-read in full on every
+    API call. internal:google reached 8.5MB (~570k tokens PER CALL) and a
+    routine 6:30 audit consumed an entire 5-hour usage block in 29 minutes
+    (2026-08-21 and 2026-08-24 operator lockouts)."""
+    return bool(get_config().get("per_context_sessions", False))
+
+
+def get_operator_label(speaker_id) -> str:
+    """Short filesystem-safe label for an operator, used in per-context
+    session names (internal:<agent>-<label>). Optional mapping in config.json:
+    `"operator_labels": {"<speaker_id>": "cmoore"}`. Falls back to op<id> —
+    stable and unique, just less readable."""
+    labels = get_config().get("operator_labels") or {}
+    lbl = str(labels.get(str(speaker_id), "")).strip()
+    if lbl and all(c.isalnum() or c in "-_." for c in lbl):
+        return lbl
+    return f"op{speaker_id}"
+
+
 # Valid Anthropic `output_config.effort` reasoning-depth levels. The field is
 # Anthropic-only and entirely optional: anything not in this tuple (wrong type,
 # junk string, or absent) resolves to None, which means the request omits

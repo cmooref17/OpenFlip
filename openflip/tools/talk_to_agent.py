@@ -362,15 +362,62 @@ async def talk_to_agent(agent_id: str, message: str, channel_id: int = 0, sessio
         # the Session built above is dispatched directly.
         pass
     elif target_is_headless and not target_channel_id:
-        # Headless target: no Discord/iMessage channel of its own. The target
-        # runs every turn in its single internal channel (by design — don't
-        # fragment a headless worker's context into per-peer conversations);
-        # run_synthetic_turn's headless branch ignores this id and builds that
-        # channel. This non-zero sentinel only satisfies the "no channel"
-        # guard below + logging. The target's reply auto-routes BACK to us
-        # (the originator) as a chain-terminator turn.
-        from ..transports.null import make_internal_session
-        target_channel_id = int(make_internal_session(agent_id).transport_id)
+        # Headless target: no Discord/iMessage channel of its own.
+        #
+        # Default (flag off): the target runs every turn in its single internal
+        # channel. This non-zero sentinel only satisfies the "no channel" guard
+        # below + logging; run_synthetic_turn's headless branch builds the
+        # channel. The target's reply auto-routes BACK to us (the originator)
+        # as a chain-terminator turn.
+        #
+        # per_context_sessions (config flag): ONE shared thread for every
+        # caller and task means each call re-reads all of it, forever —
+        # internal:google hit 8.5MB / ~570k tokens PER CALL and locked the
+        # operator out of his own usage limit (2026-08-21/24). With the flag
+        # on, key the recipient's working conversation by the chain's root
+        # context instead:
+        #   human-rooted chain -> internal:<agent>-<operator-label>
+        #     (also gives per-operator isolation: different humans' relayed
+        #      work never shares context)
+        #   cron-rooted chain  -> internal:<agent>-<slug of caller's cron session>
+        #   anything else      -> internal:<agent>-peer-<sender>
+        # Same explicit-Session mechanism as the peer branch below; a new
+        # conversation id auto-creates its file on first use.
+        from ..config_global import get_per_context_sessions
+        if get_per_context_sessions():
+            import re as _re
+            _vis = (_caller_visibility or "").strip()
+            if _vis in ("", "operator_channel") and originating_speaker_id:
+                from ..config_global import get_operator_label
+                _ctx_suffix = get_operator_label(originating_speaker_id)
+            elif _vis in ("cron", "kairos"):
+                _caller_conv = str(getattr(_caller_session, "conversation_id", "") or "")
+                if _caller_conv.startswith("cron:"):
+                    _ctx_suffix = "cron-" + _caller_conv.split(":", 1)[1]
+                else:
+                    _ctx_suffix = f"cron-{sender_id}"
+            else:
+                _ctx_suffix = f"peer-{sender_id}"
+            _ctx_suffix = _re.sub(r"[^A-Za-z0-9._-]+", "-", _ctx_suffix).strip("-") or "misc"
+            _ctx_conv_id = f"internal:{agent_id}-{_ctx_suffix}"
+            from ..session import Session as _Session
+            _explicit_session = _Session(
+                transport="internal",
+                # Non-numeric transport_id: hashed to a per-process-stable int
+                # for in-memory keys (same pattern as the peer branch below).
+                # The on-disk file is keyed by conversation_id.
+                transport_id=f"{agent_id}-{_ctx_suffix}",
+                conversation_id=_ctx_conv_id,
+                speaker_id=originating_speaker_id,
+                speaker_role_ids=[],
+                is_owner=False,
+                is_dm=True,
+                display_name=f"ctx:{_ctx_conv_id}",
+                handle="",
+            )
+        else:
+            from ..transports.null import make_internal_session
+            target_channel_id = int(make_internal_session(agent_id).transport_id)
     elif not target_channel_id:
         # DEFAULT (no session_id, no channel_id). Two routing modes, split on
         # whether a HUMAN/OWNER is at the root of this dispatch chain.

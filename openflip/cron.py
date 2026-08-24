@@ -627,6 +627,58 @@ async def _fire(job: dict) -> None:
         else f"channel={session_target}"
     )
 
+    # Fresh-session-per-run (config "per_context_sessions"): a recurring job's
+    # cron:* conversation otherwise accumulates every past run and each fire
+    # re-reads all of it (the 6:30 audit thread reached 301 entries / ~250k
+    # tokens per call, 2026-08). Archive the previous run's file (+ meta
+    # sidecar, so a stale compaction block isn't restored into the fresh
+    # session) and evict the in-memory object so this fire starts clean.
+    # Scope-guarded to cron:* ids — human/chat threads are never touched.
+    # A file modified in the last 30 min is left alone: an in-flight chain
+    # from a recent fire may still be appending to it.
+    try:
+        from .config_global import get_per_context_sessions as _pcs
+        if (
+            _pcs()
+            and isinstance(session_target, _Session)
+            and str(session_target.conversation_id).startswith("cron:")
+        ):
+            import glob as _glob
+            import time as _time
+            from ._conversation_io import conversation_path as _conv_path
+            _conv_id = str(session_target.conversation_id)
+            _cpath = _conv_path(_agent_dir(agent_id), _conv_id)
+            if (
+                os.path.isfile(_cpath)
+                and os.path.getsize(_cpath) > 0
+                and (_time.time() - os.path.getmtime(_cpath)) > 1800
+            ):
+                _ts = int(_time.time())
+                os.replace(_cpath, f"{_cpath}.archived-{_ts}")
+                _meta = _cpath[: -len(".jsonl")] + ".meta.json" if _cpath.endswith(".jsonl") else _cpath + ".meta.json"
+                if os.path.isfile(_meta):
+                    os.replace(_meta, f"{_meta}.archived-{_ts}")
+                # Retention: keep the 5 newest archives per session.
+                for _old in sorted(_glob.glob(f"{_cpath}.archived-*"))[:-5]:
+                    try:
+                        os.remove(_old)
+                    except OSError:
+                        pass
+                for _k, _c in list(getattr(runner, "conversations", {}).items()):
+                    if getattr(_c, "conversation_id", None) == _conv_id:
+                        runner.conversations.pop(_k, None)
+                print_ts(
+                    f"cron: archived previous run's session for "
+                    f"'{job.get('name')}' ({_conv_id})",
+                    agent=agent_id,
+                )
+    except Exception as _e:
+        # Never let session hygiene block the job itself.
+        print_ts(
+            f"{COLOR_YELLOW}cron: fresh-session archive skipped ({_e}){COLOR_END}",
+            agent=agent_id,
+        )
+
     print_ts(
         f"{COLOR_GREEN}cron: firing '{job.get('name')}' → agent={agent_id} "
         f"{route} mode={mode} speaker={creator_id or 'owner-default'}{COLOR_END}",
