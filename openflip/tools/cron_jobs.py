@@ -277,7 +277,28 @@ async def add_cron_job(
     # the current session's prefixed id so the job fires back into THIS
     # conversation instead of the agent's default-transport channel. channelId
     # stays stored for back-compat (see cron._resolve_session_target).
-    resolved_session_id = (session_id or "").strip() or _current_session_conversation_id()
+    resolved_session_id = (session_id or "").strip()
+    if not resolved_session_id:
+        from ..config_global import get_per_context_sessions
+        if get_per_context_sessions() and schedule.get("kind") == "interval":
+            # Interval jobs are pollers. Inheriting the creating chat thread
+            # makes every poll re-send that thread's entire history — the
+            # 2026-08-21 purge watchdog fired every 15 min on an 805-message
+            # iMessage conversation (~500k tokens per poll) and helped lock
+            # the operator out of his own usage limit. Default them to a
+            # dedicated cron:<slug> session instead; the job can still
+            # send_message into any human thread when it has something to say.
+            import re as _re
+            _slug = _re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:48] or job_id[:8]
+            resolved_session_id = f"cron:{_slug}"
+            from ..utils import print_ts as _pts
+            _pts(
+                f"cron job '{name}': interval job defaulted to dedicated "
+                f"session {resolved_session_id} (pass session_id explicitly to override)",
+                agent=agent_id,
+            )
+        else:
+            resolved_session_id = _current_session_conversation_id()
     job = {
         "id": job_id,
         "agentId": agent_id,
