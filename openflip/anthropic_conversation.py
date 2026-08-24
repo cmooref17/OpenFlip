@@ -25,7 +25,7 @@ from .agent import Agent
 from .utils import print_ts, COLOR_YELLOW, COLOR_RED, COLOR_END, load_json, save_json
 from . import _conversation_io as _cio
 from . import _request_validator
-from .config_global import get_compaction_trigger, get_effort, get_max_tokens, get_model_context_window, _VALID_EFFORT_LEVELS
+from .config_global import get_compaction_trigger, get_effort, get_internal_compaction_trigger, get_max_tokens, get_model_context_window, _VALID_EFFORT_LEVELS
 
 
 # Compaction trigger (input_tokens) sent on a MANUAL /compact. Anthropic's
@@ -1916,6 +1916,21 @@ class AnthropicConversation:
 
         return response
 
+    def _effective_compaction_trigger(self) -> int:
+        """Per-conversation compaction trigger. Internal working sessions
+        (internal:*/cron:* conversation ids) compact at the low internal
+        trigger (config `internal_compaction_trigger`, default 150k) so agent
+        scratch threads stay small — on a 1M-context model the per-model
+        trigger let internal:google reach ~570k tokens re-read on every call
+        (2026-08 lockouts). Every other conversation keeps the per-model
+        trigger unchanged."""
+        _model_trigger = get_compaction_trigger(self.agent.model, "anthropic")
+        if str(self.conversation_id or "").startswith(("internal:", "cron:")):
+            _internal = get_internal_compaction_trigger()
+            if _internal > 0:
+                return min(_model_trigger, _internal)
+        return _model_trigger
+
     def _auto_compact_due(self) -> bool:
         """True if the last measured `total_input` already exceeds this
         model's compaction trigger. Single source of truth for the
@@ -1926,7 +1941,7 @@ class AnthropicConversation:
         if not isinstance(self.last_usage, dict):
             return False
         _last_total = int(self.last_usage.get("total_input") or 0)
-        _cap = get_compaction_trigger(self.agent.model, "anthropic")
+        _cap = self._effective_compaction_trigger()
         return _last_total > _cap > 0
 
     def will_compact_this_turn(self) -> bool:
@@ -2005,7 +2020,7 @@ class AnthropicConversation:
         # estimating, so we do not over-trigger.
         if not self.force_compact_next and self._auto_compact_due():
             _last_total = int(self.last_usage.get("total_input") or 0)
-            _cap = get_compaction_trigger(self.agent.model, "anthropic")
+            _cap = self._effective_compaction_trigger()
             self.force_compact_next = True
             print_ts(
                 f"{COLOR_YELLOW}auto-compact: last total_input {_last_total:,} > "
@@ -2106,7 +2121,7 @@ class AnthropicConversation:
         if self.force_compact_next:
             _compact_trigger = (
                 _MANUAL_COMPACT_TRIGGER if self.force_compact_trigger_override
-                else get_compaction_trigger(self.agent.model, "anthropic")
+                else self._effective_compaction_trigger()
             )
             body["context_management"] = {
                 "edits": [{

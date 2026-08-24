@@ -536,6 +536,25 @@ def get_operator_label(speaker_id) -> str:
     return f"op{speaker_id}"
 
 
+def get_internal_compaction_trigger() -> int:
+    """Compaction trigger for INTERNAL working sessions (conversation ids
+    prefixed internal:/cron:). These are agent scratch threads no human reads;
+    on a 1M-context model the per-model trigger (~window - 20k) lets them grow
+    to 500k+-token contexts re-read on every call before compaction ever fires
+    (2026-08 operator lockouts). Config key `internal_compaction_trigger`:
+    default 150k, floored at Anthropic's 50k minimum; 0/negative disables the
+    override (internal sessions then use the per-model trigger). Human-facing
+    threads are unaffected either way."""
+    val = get_config().get("internal_compaction_trigger", 150_000)
+    try:
+        val = int(val)
+    except (TypeError, ValueError):
+        val = 150_000
+    if val <= 0:
+        return 0
+    return max(val, 50_000)
+
+
 # Valid Anthropic `output_config.effort` reasoning-depth levels. The field is
 # Anthropic-only and entirely optional: anything not in this tuple (wrong type,
 # junk string, or absent) resolves to None, which means the request omits
