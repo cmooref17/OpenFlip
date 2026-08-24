@@ -165,6 +165,43 @@ def migrate_legacy_to_jsonl(
     return True
 
 
+def backup_conversation_file(jsonl_path: str, backup_tag: str, *, keep: int = 5) -> Optional[str]:
+    """Copy the JSONL to `<jsonl>.<backup_tag>_<unix_ts>.bak.jsonl` and sweep
+    older backups with the same tag down to `keep`. Returns the backup path,
+    or None when the source doesn't exist or the copy failed — the CALLER
+    decides whether a missing backup is fatal (/reset proceeds with the wipe;
+    /undo aborts rather than rewrite history with no safety net).
+    """
+    if not os.path.exists(jsonl_path):
+        return None
+    backup = None
+    try:
+        import shutil
+        ts = int(time.time())
+        backup = f"{jsonl_path}.{backup_tag}_{ts}.bak.jsonl"
+        shutil.copy2(jsonl_path, backup)
+        print_ts(f"backed up conversation to {backup} before {backup_tag}")
+    except Exception as _bk_err:
+        print_ts(f"WARNING: pre-{backup_tag} backup failed for {jsonl_path}: {_bk_err}")
+        return None
+    # Retention sweep — keep only the `keep` most-recent backups for this tag
+    # per channel. Without this, backups accumulate forever. Matches the
+    # pattern in anthropic_conversation.py for compaction backups.
+    try:
+        import glob as _glob
+        _all_bak = sorted(_glob.glob(f"{jsonl_path}.{backup_tag}_*.bak.jsonl"))
+        if len(_all_bak) > keep:
+            for _stale in _all_bak[:-keep]:
+                try:
+                    os.remove(_stale)
+                    print_ts(f"pruned stale {backup_tag} backup: {os.path.basename(_stale)}")
+                except OSError:
+                    pass
+    except Exception as _retain_e:
+        print_ts(f"WARNING: {backup_tag} backup retention sweep failed: {_retain_e}")
+    return backup
+
+
 def delete_conversation_files(
     agent_dir: str,
     conversation_id: str,
@@ -177,34 +214,13 @@ def delete_conversation_files(
     If `backup_tag` is set (e.g. "pre_reset"), the JSONL is copied to
     `<jsonl>.<backup_tag>_<unix_ts>.bak.jsonl` BEFORE deletion so the
     history can be recovered. Backups are NOT made for extra_paths or
-    the legacy `.json` — only the canonical JSONL.
+    the legacy `.json` — only the canonical JSONL. A failed backup does
+    NOT abort the delete (the operator asked for a wipe; the backup is
+    best-effort here, unlike /undo where it gates the rewrite).
     """
     jsonl = conversation_path(agent_dir, conversation_id)
-    if backup_tag and os.path.exists(jsonl):
-        try:
-            import shutil
-            ts = int(time.time())
-            backup = f"{jsonl}.{backup_tag}_{ts}.bak.jsonl"
-            shutil.copy2(jsonl, backup)
-            print_ts(f"backed up conversation to {backup} before {backup_tag}")
-        except Exception as _bk_err:
-            print_ts(f"WARNING: pre-{backup_tag} backup failed for {jsonl}: {_bk_err}")
-        # Retention sweep — keep only the 5 most-recent backups for this tag
-        # per channel. Without this, backups accumulate forever. Matches the
-        # pattern in anthropic_conversation.py for compaction backups.
-        try:
-            import glob as _glob
-            _backup_keep = 5
-            _all_bak = sorted(_glob.glob(f"{jsonl}.{backup_tag}_*.bak.jsonl"))
-            if len(_all_bak) > _backup_keep:
-                for _stale in _all_bak[:-_backup_keep]:
-                    try:
-                        os.remove(_stale)
-                        print_ts(f"pruned stale {backup_tag} backup: {os.path.basename(_stale)}")
-                    except OSError:
-                        pass
-        except Exception as _retain_e:
-            print_ts(f"WARNING: {backup_tag} backup retention sweep failed: {_retain_e}")
+    if backup_tag:
+        backup_conversation_file(jsonl, backup_tag)
     paths = [jsonl, legacy_path(agent_dir, conversation_id)]
     if extra_paths:
         paths.extend(extra_paths)
@@ -213,3 +229,101 @@ def delete_conversation_files(
             os.remove(p)
         except FileNotFoundError:
             pass
+
+
+# Every framework-injected user-role message (mid-turn soft-inject wrapper in
+# runtime._drain_pending_injects, turn_retries/stop_hooks nudges, the
+# post-compaction / turn-failed / aborted-pre-send notes) starts with this
+# prefix. Real turn-starting messages (build_user_prompt output, cron/dream
+# prompts) never do — with ONE known exception, documented below.
+_FRAMEWORK_MSG_PREFIX = "[FRAMEWORK]"
+
+
+def find_undo_cut_index(msgs: list[dict]) -> int:
+    """Index of the user message that STARTED the most recent turn, or -1.
+
+    Walks backward past assistant/tool messages AND past framework-injected
+    user messages (the "[FRAMEWORK]"-prefixed wrappers above) — those belong
+    to the turn they annotate, so /undo removes them with it. The first real
+    user message found is the turn start.
+
+    Known blind spot: /compact's synthetic ack turn STARTS with a
+    "[FRAMEWORK]:" user message (commands.compact_cmd), so an /undo issued
+    right after a manual /compact cuts past that turn into the one before
+    it. The operator-visible preview + pre_undo backup make that
+    recoverable; do NOT try to enumerate individual wrapper texts here to
+    "fix" it — that list would drift as nudges are added.
+    """
+    for i in range(len(msgs) - 1, -1, -1):
+        m = msgs[i]
+        if m.get("role") != "user":
+            continue
+        if str(m.get("content", "")).lstrip().startswith(_FRAMEWORK_MSG_PREFIX):
+            continue
+        return i
+    return -1
+
+
+def undo_last_turn(conv, *, log_agent_id: Optional[str] = None) -> Optional[tuple[int, str, str]]:
+    """Remove the most recent turn from `conv` — disk AND memory — as if it
+    never happened. Duck-typed over the three conversation classes (they
+    share `_conversation_path()`, `messages`, `_persisted_count`), so there
+    is exactly ONE implementation and the siblings can't drift.
+
+    Sequence: read the full JSONL (disk is authoritative — the ollama
+    provider head-trims its in-memory list, so never rewrite disk from
+    memory), cut at find_undo_cut_index, back up as
+    `.pre_undo_<ts>.bak.jsonl`, atomically rewrite the kept head (original
+    `ts` stamps preserved), then drop the same number of trailing
+    non-system messages from memory and re-sync `_persisted_count` to the
+    at-rest invariant (== in-memory non-system count, all persisted).
+
+    Caller MUST ensure no turn is in flight on this conversation
+    (AgentRunner.undo_last_turn's guard) — a mid-flight turn re-saves its
+    own view of history at end-of-turn and would resurrect the removed tail.
+
+    Returns (removed_count, preview_of_cut_message, backup_basename);
+    None when there is nothing to undo. Raises RuntimeError if the backup
+    could not be written (no safety net → no rewrite).
+    """
+    path = conv._conversation_path()
+    msgs = read_all_messages(path)
+    cut = find_undo_cut_index(msgs)
+    if cut < 0:
+        return None
+
+    backup = backup_conversation_file(path, "pre_undo")
+    if backup is None:
+        raise RuntimeError("pre-undo backup failed — refusing to rewrite history without one")
+
+    kept = msgs[:cut]
+    removed = len(msgs) - cut
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for m in kept:
+            f.write(json.dumps(m, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+    def _role(m):
+        return m.get("role") if hasattr(m, "get") else getattr(m, "role", None)
+
+    # At rest, memory tail == disk tail, so dropping `removed` trailing
+    # non-system messages mirrors the disk cut. The guards (empty list /
+    # system at tail) only fire if that invariant is somehow broken —
+    # better to under-drop than to eat the system message.
+    to_drop = removed
+    while to_drop > 0 and conv.messages and _role(conv.messages[-1]) != "system":
+        conv.messages.pop()
+        to_drop -= 1
+    conv._persisted_count = sum(1 for m in conv.messages if _role(m) != "system")
+
+    raw = " ".join(str(msgs[cut].get("content", "")).split())
+    preview = raw[:120] + ("…" if len(raw) > 120 else "")
+    print_ts(
+        f"undo: removed last turn — {removed} message(s) from disk index {cut}; "
+        f"backup {os.path.basename(backup)}",
+        agent=log_agent_id,
+    )
+    return removed, preview, os.path.basename(backup)

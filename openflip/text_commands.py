@@ -31,6 +31,7 @@ from .utils import print_ts, save_json, COLOR_YELLOW, COLOR_END
 # whitespace-delimited token.
 _TEXT_COMMANDS = {
     "/reset",
+    "/undo",
     "/compact",
     "/uncompact",
     "/effort",
@@ -128,6 +129,15 @@ async def handle_text_command(
 
     if head == "/reset":
         await _do_reset(runner, conv_key, channel, transport, session_id)
+        return True
+
+    if head == "/undo":
+        # Owner-only: /undo rewrites persisted history (removes the last
+        # turn from disk + memory). Same gating as /uncompact below.
+        if not is_owner(speaker_id, transport=tname, handle=handle):
+            await _send(transport, session_id, channel, "Owner only.")
+            return True
+        await _do_undo(runner, conv_key, channel, transport, session_id)
         return True
 
     if head == "/compact":
@@ -245,6 +255,15 @@ async def _do_reset(runner, ch_id, channel, transport, session_id) -> None:
                     "⚠️ /reset: could not resolve conversation id for this channel.")
         return
     await _send(transport, session_id, channel, "Conversation reset.")
+
+
+async def _do_undo(runner, ch_id, channel, transport, session_id) -> None:
+    # The full guard+cut+backup+rewrite sequence lives in ONE place:
+    # AgentRunner.undo_last_turn, shared with the slash /undo — same
+    # no-drift rule as _do_reset above. Never inline an undo body here.
+    conv_id = _conversation_id_for_channel(channel, ch_id)
+    _ok, msg = runner.undo_last_turn(ch_id, fallback_conv_id=conv_id)
+    await _send(transport, session_id, channel, msg)
 
 
 async def _do_compact(runner, ch_id, channel, transport, session_id) -> None:

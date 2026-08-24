@@ -721,6 +721,58 @@ class AgentRunner:
         self._pending_inject.pop(conv_key, None)
         return ok
 
+    def undo_last_turn(self, conv_key: int | str, fallback_conv_id: str = "") -> tuple[bool, str]:
+        """Remove the most recent turn (the turn-starting user message plus
+        everything after it — assistant reply, tool messages, soft-injected
+        follow-ups, framework notes) from this conversation, memory and disk,
+        as if it never happened. The ONE implementation behind both the slash
+        /undo (commands.undo_cmd) and the text-prefix /undo
+        (text_commands._do_undo) — same no-drift rule as reset_conversation
+        above. The cut/backup/rewrite core lives in
+        _conversation_io.undo_last_turn (shared across all three providers).
+
+        Unlike /reset this REFUSES while a turn is in flight instead of
+        interrupting it: mid-turn, the turn's messages aren't persisted yet
+        (save runs at end-of-turn), so an undo would target the PREVIOUS
+        turn and then have the live turn's save append on top of the rewrite.
+        /stop → /undo composes cleanly by hand instead. This method is fully
+        synchronous (no awaits), so nothing interleaves on the event loop
+        between the in-flight guard and the rewrite.
+
+        Returns (ok, operator-facing message). Both paths send the message
+        as-is, so keep it self-explanatory.
+        """
+        active = self._active_turns.get(conv_key)
+        if active is not None and not active.done():
+            return (False, "A turn is in flight in this conversation — `/stop` it first (or wait for it to finish), then `/undo`.")
+        conv = self.conversations.get(conv_key)
+        if conv is None:
+            if not fallback_conv_id:
+                return (False, "⚠️ /undo: could not resolve conversation id for this channel.")
+            try:
+                conv = self.get_conversation(conv_key, fallback_conv_id)
+            except Exception as e:
+                return (False, f"⚠️ /undo: could not load this channel's conversation: {e}")
+        from . import _conversation_io as _cio_undo
+        try:
+            result = _cio_undo.undo_last_turn(conv, log_agent_id=self.agent.id)
+        except Exception as e:
+            print_ts(f"{COLOR_YELLOW}/undo failed: {e}{COLOR_END}", agent=self.agent.id)
+            return (False, f"⚠️ /undo failed: {e}")
+        if result is None:
+            return (False, "Nothing to undo — no turn found in this conversation's history.")
+        removed, preview, backup_name = result
+        msg = (
+            f"↩️ Undid the last turn — removed {removed} message(s), starting from: “{preview}”\n"
+            f"History backup: `{backup_name}`"
+        )
+        if getattr(conv, "_compaction_block", None):
+            msg += (
+                "\n⚠️ This conversation carries a compaction summary. If the undone content "
+                "was already compacted into it, `/uncompact` (or `/reset`) is the only full purge."
+            )
+        return (True, msg)
+
     def _drain_pending_injects(self, channel_id: int | str, conv) -> int:
         """Soft-inject drain. `channel_id` is a conversation key (int or
         the forwarded primary conversation_id (e.g. "imessage:+1555") — see conv_key). Pops everything in _pending_inject[channel_id]
