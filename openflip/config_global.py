@@ -640,3 +640,19 @@ def get_max_tokens(model_name: str, provider: str = "") -> int:
         if 0 < override <= _MAX_TOKENS_CEILING:
             return override
     return _DEFAULT_MAX_TOKENS
+
+
+def get_background_chain_budget_seconds() -> int:
+    """Wall-clock budget for BACKGROUND inter-agent chains (root visibility
+    cron / kairos / silent_agent_chain). talk_to_agent refuses further
+    dispatch once the chain is older than this, so runaway agent-to-agent
+    loops die by the clock instead of by the operator's usage limit
+    (2026-08-25: post-audit chatter consumed half a 5-hour block). Config key
+    `background_chain_budget_seconds`, default 900 (15 min); 0 disables.
+    Operator-rooted chats are never clock-limited."""
+    val = get_config().get("background_chain_budget_seconds", 900)
+    try:
+        val = int(val)
+    except (TypeError, ValueError):
+        val = 900
+    return max(val, 0)
