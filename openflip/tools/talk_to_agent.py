@@ -205,7 +205,7 @@ async def talk_to_agent(agent_id: str, message: str, channel_id: int = 0, sessio
             ("internal:peer-<your_id>"), never a human-facing conversation.
     """
     from ..registry import RUNNERS
-    from ..tool_executor import CURRENT_AGENT, CURRENT_CHANNEL_ID, CURRENT_SPEAKER_ID, CURRENT_TURN_DEPTH, CURRENT_SESSION, CURRENT_TURN_VISIBILITY, CURRENT_CHAIN_ROOT_AGENT
+    from ..tool_executor import CURRENT_AGENT, CURRENT_CHANNEL_ID, CURRENT_SPEAKER_ID, CURRENT_TURN_DEPTH, CURRENT_SESSION, CURRENT_TURN_VISIBILITY, CURRENT_CHAIN_ROOT_AGENT, CURRENT_CHAIN_STARTED
 
     sender = CURRENT_AGENT.get(None)
     sender_id = sender.id if sender else "unknown"
@@ -232,6 +232,26 @@ async def talk_to_agent(agent_id: str, message: str, channel_id: int = 0, sessio
     # after audit flagged it as too permissive.
     current_depth = CURRENT_TURN_DEPTH.get(0)
     MAX_DEPTH = 20
+
+    # Background-chain time budget (2026-08-25): cron/kairos/silent-rooted
+    # chains die by wall clock. talk_to_agent dispatches are fire-and-forget
+    # tasks the cron's own timeout does not bound — an audit chain outlived
+    # its 5-minute timeout by 30+ minutes and drained the operator's session
+    # block. Operator-rooted chats are never clock-limited.
+    import time as _time_budget
+    _chain_started = float(CURRENT_CHAIN_STARTED.get(0.0) or 0.0) or _time_budget.time()
+    _vis_now = (CURRENT_TURN_VISIBILITY.get("") or "").strip()
+    if _vis_now in ("cron", "kairos", "silent_agent_chain"):
+        from ..config_global import get_background_chain_budget_seconds
+        _budget_s = get_background_chain_budget_seconds()
+        _age_s = int(_time_budget.time() - _chain_started)
+        if _budget_s > 0 and _age_s > _budget_s:
+            return ToolResult.fail(
+                f"Background chain time budget exhausted ({_age_s}s elapsed > {_budget_s}s budget). "
+                "This chain is rooted in a scheduled/background turn and has run past its wall-clock "
+                "budget. Wrap up NOW: one save_memory note if something genuinely needs recording, "
+                "then end_chain. Do not re-dispatch or work around this limit."
+            )
     if current_depth >= MAX_DEPTH:
         return ToolResult.fail(
             f"talk_to_agent depth cap reached ({current_depth} >= {MAX_DEPTH}). "
@@ -596,6 +616,8 @@ async def talk_to_agent(agent_id: str, message: str, channel_id: int = 0, sessio
                 # For plain Discord channels the int path above is used and
                 # behavior is unchanged.
                 originator_session=_caller_session,
+                # Chain wall clock threads hop-to-hop; see CURRENT_CHAIN_STARTED.
+                chain_started=_chain_started,
             )
         )
     except Exception as e:

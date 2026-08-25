@@ -39,6 +39,13 @@ CURRENT_TURN_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar("curren
 # whether the original requester is a human awaiting output or an
 # agent/scheduler that just needs the failure logged.
 CURRENT_TURN_VISIBILITY: contextvars.ContextVar[str] = contextvars.ContextVar("current_turn_visibility", default="")
+# Wall-clock start (epoch seconds) of the inter-agent CHAIN this turn belongs
+# to. Stamped by run_synthetic_turn on the first hop, threaded hop-to-hop by
+# talk_to_agent's chain_started kwarg. 0.0 = no chain context (fresh human
+# turn). Read by talk_to_agent's background-chain time budget (2026-08-25: an
+# audit-rooted chain outlived its cron timeout by 30+ minutes and drained the
+# operator's session block — chains must die by the clock).
+CURRENT_CHAIN_STARTED: contextvars.ContextVar[float] = contextvars.ContextVar("current_chain_started", default=0.0)
 # Chain-ROOT-AGENT identity for the CURRENT turn: the agent the human DIRECTLY
 # addressed at the head of this inter-agent chain. Set in runtime _run_turn from
 # the queued item's chain_root_agent_id. talk_to_agent stamps it with the

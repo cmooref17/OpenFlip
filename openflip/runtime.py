@@ -1504,6 +1504,7 @@ class AgentRunner:
         originator_channel_id: int = 0,
         originator_session: Optional[Session] = None,
         chain_root_agent_id: str = "",
+        chain_started: float = 0.0,
         force_tool_choice: dict | None = None,
     ) -> None:
         """Fire a turn for this agent without an inbound Discord message.
@@ -1624,6 +1625,7 @@ class AgentRunner:
             # (and every deeper hop's) chain-terminator surfacing predicate can
             # tell the genuine top-level operator terminator from a nested one.
             "chain_root_agent_id": chain_root_agent_id or "",
+            "chain_started": float(chain_started or 0.0),
             "force_tool_choice": force_tool_choice,
         })
 
@@ -1848,6 +1850,7 @@ class AgentRunner:
         originator_channel_id: int = 0,
         originator_session: Optional[Session] = None,
         chain_root_agent_id: str = "",
+        chain_started: float = 0.0,
         force_tool_choice: dict | None = None,
     ) -> None:
         """Shared agent loop — calls the model, runs tools, feeds results back,
@@ -1934,8 +1937,15 @@ class AgentRunner:
                     f"{user_text}"
                 )
 
-        from .tool_executor import CURRENT_TURN_DEPTH, CURRENT_SPEAKER_ID, CURRENT_CHANNEL_ID, CURRENT_SESSION
+        from .tool_executor import CURRENT_TURN_DEPTH, CURRENT_SPEAKER_ID, CURRENT_CHANNEL_ID, CURRENT_SESSION, CURRENT_CHAIN_STARTED
         CURRENT_TURN_DEPTH.set(int(depth))
+        # Chain wall clock: first hop stamps now, deeper hops inherit the value
+        # threaded through talk_to_agent. Fresh human turns leave it 0.0 (never
+        # clock-limited). See tool_executor.CURRENT_CHAIN_STARTED.
+        import time as _time_chain
+        CURRENT_CHAIN_STARTED.set(
+            float(chain_started) if chain_started else (_time_chain.time() if depth else 0.0)
+        )
         # Phase 1 of discord-decouple: set CURRENT_SESSION so tools that prefer
         # Session-based routing (send_message, talk_to_agent, fetch_discord_message)
         # see the transport-agnostic wrapper. For synthetic turns where we don't
@@ -2341,10 +2351,17 @@ class AgentRunner:
         # Add the user's message once at the start of the turn. Per-speaker
         # access notes ride on the user message (not the system prompt) to
         # keep the cached system prefix byte-stable across speaker rotations.
+        # The wall-clock stamp rides here for the same caching reason: agents
+        # have no other source for the current date (2026-08-25: two agents
+        # burned half a session block arguing about the calendar), and putting
+        # a timestamp in the system prompt would invalidate the cached prefix
+        # on every request. ~15 tokens, appended at the context tail only.
+        import datetime as _dt_clock
+        _clock_stamp = _dt_clock.datetime.now().astimezone().strftime("[%Y-%m-%d %H:%M %Z %A] ")
         if user_preamble:
-            framed_user = f"{user_preamble}\n\n---\n\n{user_text}"
+            framed_user = f"{_clock_stamp}{user_preamble}\n\n---\n\n{user_text}"
         else:
-            framed_user = user_text
+            framed_user = f"{_clock_stamp}{user_text}"
         conv.messages.append(ChatMessage('user', framed_user))
 
         async def _restore_system():
