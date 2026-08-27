@@ -286,6 +286,15 @@ class AgentRunner:
         # `_on_turn_done` done-callback, plus a dispatch-time chase in
         # `_inbound_worker` for the pre-first-step-cancel race (B2).
         self._active_turns: dict[int | str, asyncio.Task] = {}
+        # One live turn per conversation FILE (2026-08-27): keyed by session
+        # conversation_id. Closes the interleaving hole where synthetic chains
+        # reach one conversation through channels whose ids don't match the
+        # _active_turns slot key (audit run 2026-08-26: alternating tails
+        # invalidated the prompt cache past the common prefix 28x, ~$58).
+        self._conv_turn_locks: dict[str, asyncio.Lock] = {}
+        # Post-rate-limit cooldown gate for SYNTHETIC turns only (2026-08-27
+        # retry storm: queued agent chains hammered a 429'd org for 40 min).
+        self._rate_limited_until: float = 0.0
         # Per-channel soft-inject buffer. Holds operator messages typed
         # mid-turn that haven't been delivered to the model yet. Drained
         # inside _run_turn (after each tool-result append + at post-loop
@@ -1030,12 +1039,36 @@ class AgentRunner:
             # a prev_task, so they never block each other.
             if prev_task is not None and not prev_task.done():
                 await asyncio.wait({prev_task})
+            # Conversation-file lock key: the session's conversation_id when
+            # one is attached (internal:/cron: synthetic turns), else "" and
+            # only the _active_turns channel slot serializes, as before.
+            _ch_obj = kwargs.get("channel")
+            _sess_obj = getattr(_ch_obj, "_session", None)
+            if _sess_obj is None:
+                _inb_obj = kwargs.get("inbound")
+                _sess_obj = getattr(_inb_obj, "session", None) if _inb_obj is not None else None
+            _lock_key = (getattr(_sess_obj, "conversation_id", "") or "") if _sess_obj is not None else ""
+            # Post-429 cooldown: synthetic turns sleep out the window instead
+            # of hammering a rate-limited org. Human turns are never delayed.
+            import time as _t429
+            _cool = self._rate_limited_until - _t429.time()
+            if _cool > 0 and kwargs.get("log_tag") == "[synthetic] ":
+                print_ts(
+                    f"{COLOR_YELLOW}rate-limit cooldown: synthetic turn waiting {int(_cool)}s{COLOR_END}",
+                    agent=self.agent.id,
+                )
+                await asyncio.sleep(min(_cool, 600))
+            _conv_lock = None
+            if _lock_key:
+                _conv_lock = self._conv_turn_locks.setdefault(_lock_key, asyncio.Lock())
             # Global concurrency backstop across all channels (per-channel
             # serial already bounds it to #active-channels). `async with`
             # releases the permit on every exit path — including cancel — so
             # there's no try/finally release to leak through. Kept INSIDE the
             # prev_task wait so same-channel ordering is unchanged.
-            async with self._turn_semaphore:
+            import contextlib as _ctxlib
+            async with (_conv_lock if _conv_lock is not None else _ctxlib.nullcontext()):
+              async with self._turn_semaphore:
                 # Hung on the task object so the worker's `_on_turn_done`
                 # callback and dispatch-time B2 chase can see it. Flipped the
                 # instant before `_run_turn`: a supervisor cancelled while still
@@ -2620,6 +2653,9 @@ class AgentRunner:
                                 agent=agent.id,
                             )
                         else:
+                            if _err_kind == "rate_limit":
+                                import time as _t429b
+                                self._rate_limited_until = _t429b.time() + 300.0
                             print_ts(
                                 f"{COLOR_YELLOW}  framework error (transient: {_err_kind or 'unknown'}) — "
                                 f"user message kept in history{COLOR_END}",
