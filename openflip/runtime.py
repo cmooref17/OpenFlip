@@ -3130,7 +3130,11 @@ class AgentRunner:
                         if len(feedback) > _TOOL_RESULT_MAX_CHARS:
                             _orig_chars = len(feedback)
                             feedback = (
-                                feedback[:_TOOL_RESULT_MAX_CHARS]
+                                f"⚠️ [FRAMEWORK: TRUNCATED — you are seeing only the first "
+                                f"{_TOOL_RESULT_MAX_CHARS:,} of {_orig_chars:,} characters "
+                                f"(~{_orig_chars // 4:,} tokens). The rest is NOT below. Do not "
+                                f"assume you read the whole result.]\n\n"
+                                + feedback[:_TOOL_RESULT_MAX_CHARS]
                                 + f"\n\n[FRAMEWORK: tool result truncated — original was "
                                 f"{_orig_chars:,} characters (~{_orig_chars // 4:,} tokens), over "
                                 f"the {_TOOL_RESULT_MAX_CHARS:,}-char ingestion cap. Only the "
