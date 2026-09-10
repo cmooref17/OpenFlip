@@ -111,7 +111,7 @@ Depth cap `MAX_DEPTH=20`. A fresh user turn resets the depth counter.
 
 ## Memory
 
-Five tools: `save_memory` (append to today's daily log), `update_core_memory` (replace MEMORY.md — read it first, write the full updated version), `search_memory` (semantic search across core + daily logs), `read_memory` (MEMORY.md or a daily log by date), `list_memory_files`. Exact parameters are in the tool schemas you already receive — when to use which tier is in FRAMEWORK.md's Memory section.
+Six tools: `save_memory` (append to today's daily log), `update_core_memory` (replace MEMORY.md — read it first, write the full updated version), `search_memory` (semantic search across core + daily logs), `read_memory` (MEMORY.md or a daily log by date), `list_memory_files`, `reindex_memory` (rebuild the search index from on-disk memory files after an out-of-band edit). Exact parameters are in the tool schemas you already receive — when to use which tier is in FRAMEWORK.md's Memory section.
 
 ## Files
 

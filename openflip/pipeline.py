@@ -384,7 +384,7 @@ def should_respond(agent: Agent, inbound: InboundMessage, bot_user_id: int) -> b
     return False
 
 
-MEMORY_TOOL_NAMES = {"save_memory", "update_core_memory", "search_memory", "read_memory", "list_memory_files"}
+MEMORY_TOOL_NAMES = {"save_memory", "update_core_memory", "search_memory", "read_memory", "list_memory_files", "reindex_memory"}
 
 
 def build_api_tool_funcs(agent: Agent, *, transport: str = "discord", tool_grants: list[str] | None = None, tool_allowlist: list[str] | None = None) -> list:

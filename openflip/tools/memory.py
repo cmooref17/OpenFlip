@@ -101,6 +101,33 @@ def _remove_source_entries(index: dict, source: str) -> None:
     index["entries"] = [e for e in index.get("entries", []) if e.get("source") != source]
 
 
+def _chunk_paragraphs(content: str) -> list[str]:
+    """Split content into stripped, non-empty paragraph chunks (blank-line separated)."""
+    return [p.strip() for p in content.split("\n\n") if p.strip()]
+
+
+_DAILY_BULLET_RE = re.compile(r"^- \[\d{2}:\d{2}\] ")
+_DAILY_HEADER_RE = re.compile(r"^# \d{4}-\d{2}-\d{2}\s*$")
+
+
+def _chunk_daily_log(content: str) -> list[str]:
+    """Chunk a daily log the way save_memory's indexed form looks: one chunk
+    per timestamped bullet with the `- [HH:MM] ` prefix stripped (so hashes
+    match the chunks save_memory indexed). Non-bullet lines — hand-edited
+    prose — fall back to paragraph chunks so they stay searchable; the
+    `# YYYY-MM-DD` header line is skipped."""
+    chunks: list[str] = []
+    residual: list[str] = []
+    for line in content.splitlines():
+        m = _DAILY_BULLET_RE.match(line)
+        if m:
+            chunks.append(line[m.end():])
+        elif not _DAILY_HEADER_RE.match(line):
+            residual.append(line)
+    chunks.extend(_chunk_paragraphs("\n".join(residual)))
+    return [c for c in chunks if c.strip()]
+
+
 # ── Migration ─────────────────────────────────────────────────────────────
 
 def _maybe_migrate(agent_dir: str) -> None:
@@ -272,7 +299,7 @@ async def update_core_memory(content: str) -> ToolResult:
     _remove_source_entries(index, "MEMORY.md")
 
     if content.strip():
-        paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+        paragraphs = _chunk_paragraphs(content)
 
         indexed = 0
         reused = 0
@@ -320,6 +347,120 @@ async def update_core_memory(content: str) -> ToolResult:
     except Exception:
         pass
     return ToolResult(model_feedback="Core memory cleared.")
+
+
+@tool
+async def reindex_memory() -> ToolResult:
+    """Rebuild your memory search index from the files on disk (MEMORY.md + all daily logs). Use after a memory file was edited outside the memory tools (file tools, the operator, another process) so search_memory matches the files again. Unchanged chunks keep their existing embeddings.
+    """
+    agent_dir = _get_agent_dir()
+    _maybe_migrate(agent_dir)
+
+    index_path = _index_path(agent_dir)
+    index = load_json(index_path, default={"version": 2, "entries": []})
+    index.setdefault("version", 2)
+
+    # Reuse embeddings for unchanged chunks across ALL sources (generalizes
+    # update_core_memory's old_by_hash reuse). Daily entries don't store a
+    # hash, so hash their chunk text here to match.
+    old_by_hash: dict[str, dict] = {}
+    for prev in index.get("entries", []):
+        chunk = prev.get("chunk")
+        if not chunk or not prev.get("embedding"):
+            continue
+        h = prev.get("hash") or hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+        old_by_hash[h] = prev
+
+    # Build the complete new entries list in memory first — index.json is only
+    # replaced after every chunk has an embedding, so an Ollama failure leaves
+    # the existing index stale but consistent rather than partially rebuilt.
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    new_entries: list[dict] = []
+    pending: list[dict] = []
+    reused = 0
+    sources = 0
+
+    def _stage(entry: dict, chash: str) -> None:
+        nonlocal reused
+        prev = old_by_hash.get(chash)
+        if prev is not None:
+            entry["embedding"] = prev["embedding"]
+            entry["timestamp"] = prev.get("timestamp", entry["timestamp"])
+            reused += 1
+        else:
+            pending.append(entry)
+        new_entries.append(entry)
+
+    mem_path = _memory_md_path(agent_dir)
+    if os.path.isfile(mem_path):
+        try:
+            with open(mem_path, "r", encoding="utf-8") as f:
+                core_chunks = _chunk_paragraphs(f.read())
+        except OSError as e:
+            return ToolResult.fail(f"Reindex aborted (existing index untouched): failed to read MEMORY.md: {e}")
+        if core_chunks:
+            sources += 1
+        for i, chunk in enumerate(core_chunks):
+            chash = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+            _stage({
+                "source": "MEMORY.md",
+                "chunk": chunk,
+                "chunk_index": i,
+                "embedding": None,
+                "hash": chash,
+                "timestamp": now,
+            }, chash)
+
+    mem_dir = _memory_dir(agent_dir)
+    daily_names = []
+    if os.path.isdir(mem_dir):
+        daily_names = sorted(
+            f for f in os.listdir(mem_dir)
+            if f.endswith(".md") and _DATE_RE.match(f.removesuffix(".md"))
+        )
+    for fname in daily_names:
+        try:
+            with open(os.path.join(mem_dir, fname), "r", encoding="utf-8") as f:
+                daily_chunks = _chunk_daily_log(f.read())
+        except OSError as e:
+            return ToolResult.fail(f"Reindex aborted (existing index untouched): failed to read {fname}: {e}")
+        if daily_chunks:
+            sources += 1
+        for chunk in daily_chunks:
+            _stage({
+                "source": fname,
+                "chunk": chunk,
+                "embedding": None,
+                "timestamp": now,
+            }, hashlib.sha256(chunk.encode("utf-8")).hexdigest())
+
+    embedded = 0
+    for entry in pending:
+        try:
+            entry["embedding"] = await _get_embedding(entry["chunk"])
+        except Exception as e:
+            return ToolResult.fail(f"Reindex aborted (existing index untouched): embedding failed for a chunk from {entry['source']}: {e}")
+        embedded += 1
+
+    index["entries"] = new_entries
+    save_json(index_path, index)
+
+    try:
+        from .. import events_log as _events_log
+        from ..tool_executor import CURRENT_AGENT
+        _aid = (CURRENT_AGENT.get(None).id if CURRENT_AGENT.get(None) else "")
+        _events_log.log_event(
+            _aid, "memory_write",
+            target="reindex", entries=len(new_entries),
+            reused=reused, embedded=embedded, sources=sources,
+        )
+    except Exception:
+        pass
+
+    return ToolResult(model_feedback=(
+        f"Memory index rebuilt: {len(new_entries)} entries across {sources} source file(s) "
+        f"({reused} embeddings reused from cache, {embedded} freshly embedded)."
+    ))
 
 
 @tool
