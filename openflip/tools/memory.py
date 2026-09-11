@@ -101,9 +101,32 @@ def _remove_source_entries(index: dict, source: str) -> None:
     index["entries"] = [e for e in index.get("entries", []) if e.get("source") != source]
 
 
+_MAX_CHUNK_CHARS = 2000
+
+def _split_oversized(chunk: str) -> list[str]:
+    """Split a chunk into <= _MAX_CHUNK_CHARS pieces at whitespace boundaries.
+    Guards the embedding model's context window (nomic-embed-text ~8192 tokens);
+    2000 chars stays safely under even in worst-case ~1 token/char content."""
+    chunk = chunk.strip()
+    if len(chunk) <= _MAX_CHUNK_CHARS:
+        return [chunk] if chunk else []
+    pieces = []
+    while len(chunk) > _MAX_CHUNK_CHARS:
+        cut = chunk.rfind(" ", 0, _MAX_CHUNK_CHARS)
+        if cut <= 0:
+            cut = _MAX_CHUNK_CHARS  # no whitespace: hard slice
+        piece = chunk[:cut].strip()
+        if piece:
+            pieces.append(piece)
+        chunk = chunk[cut:].strip()
+    if chunk:
+        pieces.append(chunk)
+    return pieces
+
+
 def _chunk_paragraphs(content: str) -> list[str]:
     """Split content into stripped, non-empty paragraph chunks (blank-line separated)."""
-    return [p.strip() for p in content.split("\n\n") if p.strip()]
+    return [piece for p in content.split("\n\n") if p.strip() for piece in _split_oversized(p.strip())]
 
 
 _DAILY_BULLET_RE = re.compile(r"^- \[\d{2}:\d{2}\] ")
@@ -125,7 +148,7 @@ def _chunk_daily_log(content: str) -> list[str]:
         elif not _DAILY_HEADER_RE.match(line):
             residual.append(line)
     chunks.extend(_chunk_paragraphs("\n".join(residual)))
-    return [c for c in chunks if c.strip()]
+    return [piece for c in chunks if c.strip() for piece in _split_oversized(c)]
 
 
 # ── Migration ─────────────────────────────────────────────────────────────
