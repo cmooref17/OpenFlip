@@ -161,9 +161,15 @@ async def execute_tool_calls(
     discord_message=None,
     silent: bool = False,
     interrupt_check: Callable[[], bool] | None = None,
+    memory_enabled: bool | None = None,
 ) -> list[tuple[str, ToolResult]]:
     """
-    Run each tool call from the AI response. Posts files / text to Discord
+    Run each tool call from the AI response.
+
+    `memory_enabled` — effective memory switch for THIS conversation
+    (session override > agent.memory_enabled). None = agent.memory_enabled,
+    unchanged legacy behavior. False disables the memory-tool ACL bypass so a
+    session with memory off can't write memory even if the model tries. Posts files / text to Discord
     (subject to silent_to_discord + media_only). Returns a list of
     (tool_name, ToolResult) for the agent loop to feed back to the model
     as `role=tool` messages on the next turn.
@@ -222,9 +228,11 @@ async def execute_tool_calls(
         name = tc.function_name
         args = tc.args or {}
 
-        # Memory tools bypass ACL when memory_enabled is on.
+        # Memory tools bypass ACL when memory is on for this conversation
+        # (session override > agent.memory_enabled).
         from .pipeline import MEMORY_TOOL_NAMES
-        _memory_bypass = agent.memory_enabled and name in MEMORY_TOOL_NAMES
+        _mem_on = agent.memory_enabled if memory_enabled is None else bool(memory_enabled)
+        _memory_bypass = _mem_on and name in MEMORY_TOOL_NAMES
         if name not in callable_tool_names and not _memory_bypass:
             print_ts(f"{COLOR_YELLOW}Blocked tool call '{name}' (not in current ACL).{COLOR_END}", agent=agent.id)
             if not media_only and not silent:

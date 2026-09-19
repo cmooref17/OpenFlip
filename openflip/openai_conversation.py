@@ -54,6 +54,7 @@ from .agent import Agent
 from .utils import print_ts, COLOR_YELLOW, COLOR_RED, COLOR_END, load_json, save_json
 from . import _conversation_io as _cio
 from ._codex_auth import CodexAuthError, borrow_codex_key, codex_creds_exist
+from .session_overrides import SessionOverridesMixin
 from .config_global import (
     get_config,
     get_effort,
@@ -1001,7 +1002,7 @@ async def _stream_codex_events(resp_content) -> AsyncIterator:
     yield MessageStopEvent()
 
 
-class OpenAIConversation:
+class OpenAIConversation(SessionOverridesMixin):
     """OpenAI-direct provider used when agent.provider == 'openai'.
 
     Auth precedence per turn: Codex subscription OAuth (Responses API at
@@ -1010,9 +1011,15 @@ class OpenAIConversation:
     yield the same StreamEvent taxonomy.
     """
 
+    _provider_name = "openai"
+
     def __init__(self, conversation_id: str, agent: Agent):
         self.conversation_id = conversation_id
         self.agent = agent
+        # Session overrides (model / context_window / max_tokens / effort /
+        # memory) + the per-turn model override hook (external ingress). See
+        # session_overrides.py. Loaded from the meta sidecar in load().
+        self._init_overrides()
         self.model = self._normalize_model(agent.model)
         self.system_message = agent.system_message
         self.messages: list[ChatMessage] = []
@@ -1026,9 +1033,10 @@ class OpenAIConversation:
         # this. Same key shape as the other providers' last_usage.
         self.last_usage: dict | None = None
         # NOTE deliberately ABSENT attributes (vs AnthropicConversation):
-        # force_compact_next / compacted_this_turn / effort_override.
-        # /compact and /effort gate on hasattr() and correctly report
-        # "Anthropic-only"; runtime reads them via getattr(..., False).
+        # force_compact_next / compacted_this_turn. /compact gates on
+        # hasattr() and correctly reports "Anthropic-only"; runtime reads them
+        # via getattr(..., False). `effort_override` IS present (mixin
+        # property backed by overrides["effort"]) so /effort works here too.
 
     @staticmethod
     def _normalize_model(model_str: str) -> str:
@@ -1061,6 +1069,10 @@ class OpenAIConversation:
         payload: dict = {}
         if self.last_usage is not None:
             payload["last_usage"] = self.last_usage
+        # Session overrides — written only when any is set (see mixin).
+        _ov = self.overrides_meta_payload()
+        if _ov:
+            payload["overrides"] = _ov
         if not payload:
             try:
                 if os.path.isfile(self._meta_path()):
@@ -1080,6 +1092,7 @@ class OpenAIConversation:
         stored_usage = meta.get("last_usage")
         if isinstance(stored_usage, dict):
             self.last_usage = stored_usage
+        self.load_overrides_from_meta(meta)
         if not msgs:
             return
         for entry in msgs:
@@ -1113,23 +1126,53 @@ class OpenAIConversation:
         self.last_usage = None
 
     def reapply_agent(self):
-        self.model = self._normalize_model(self.agent.model)
+        self.model = self._normalize_model(self._effective_raw_model())
         self.system_message = self.agent.system_message
 
+    def _resync_model(self) -> None:
+        """Every-turn model resync: per-turn override > session override >
+        agent.model (so `/model`, `/session set model`, and the external
+        ingress' per-turn model all take effect on the next request)."""
+        self.model = self._normalize_model(self._effective_raw_model())
+
     def _max_output_tokens(self) -> int | None:
-        """Optional per-model completion cap → `max_completion_tokens`.
+        """Optional completion cap → `max_completion_tokens` /
+        `max_output_tokens`: session `max_tokens` override, else the
+        EFFECTIVE model's `models.<bare>.max_output_tokens` in config.json.
 
         Omitted entirely when unset — OpenAI then allows up to the model's
         own maximum, which is the safe default across models with very
-        different caps. Configure `models.<bare>.max_output_tokens` in
-        config.json to bound it.
+        different caps.
         """
-        bare = self.model
+        ov = self.overrides.get("max_tokens")
+        if isinstance(ov, int) and ov > 0:
+            return ov
+        bare = self._normalize_model(self._effective_raw_model())
         entry = ((get_config().get("models") or {}).get(bare)) or {}
         val = entry.get("max_output_tokens")
         if isinstance(val, int) and val > 0:
             return val
         return None
+
+    def effective_max_tokens(self) -> int | None:
+        """Alias for the /session show report."""
+        return self._max_output_tokens()
+
+    def _chat_effort(self) -> str | None:
+        """`reasoning_effort` for Chat Completions: session override (xhigh
+        is codex-only → high), else the effective model's config knob."""
+        ov = self.overrides.get("effort")
+        if isinstance(ov, str) and ov:
+            return "high" if ov == "xhigh" else ov
+        return get_effort(self._effective_raw_model(), "openai")
+
+    def _codex_effort_level(self) -> str | None:
+        """`reasoning.effort` for the codex path: session override (minimal
+        isn't in the codex vocabulary → low), else the config knob."""
+        ov = self.overrides.get("effort")
+        if isinstance(ov, str) and ov:
+            return "low" if ov == "minimal" else ov
+        return _codex_effort(self._effective_raw_model())
 
     def _trim_to_fit_window(self) -> int:
         """Pre-flight LOCAL TRIM: drop oldest messages until estimated input
@@ -1150,7 +1193,7 @@ class OpenAIConversation:
         `_retry_budget` (set by the 400 context-overflow retry path) wins
         over the normal `window - 10k` budget.
         """
-        window = get_model_context_window(self.agent.model, "openai")
+        window = self.effective_context_window()
         if not window:
             return 0
         budget = self._retry_budget if self._retry_budget else (window - 10_000)
@@ -1535,6 +1578,7 @@ class OpenAIConversation:
         # REMINDER.md per-turn injection removed (2026-07-06, operator
         # decision) — standing guidance lives in the cached system files.
 
+        self._resync_model()
         body: dict[str, Any] = {
             "model": self.model,
             "messages": api_messages,
@@ -1549,7 +1593,7 @@ class OpenAIConversation:
         # Per-model reasoning-effort knob → OpenAI reasoning_effort. Only set
         # this in config for reasoning-capable models (o-series / gpt-5
         # family); the API 400s on models that don't accept the parameter.
-        _effort = get_effort(self.agent.model, "openai")
+        _effort = self._chat_effort()
         if _effort:
             body["reasoning_effort"] = _effort
 
@@ -1623,7 +1667,7 @@ class OpenAIConversation:
                              or "maximum context length" in _lower
                              or "context window" in _lower)
                     ):
-                        window = get_model_context_window(self.agent.model, "openai")
+                        window = self.effective_context_window()
                         new_budget = max(window // (2 ** (_retry_attempt + 1)), 8_000)
                         print_ts(
                             f"{COLOR_YELLOW}context overflow — retry "
@@ -1764,6 +1808,7 @@ class OpenAIConversation:
         # REMINDER.md per-turn injection removed (2026-07-06, operator
         # decision) — standing guidance lives in the cached system files.
 
+        self._resync_model()
         body: dict[str, Any] = {
             "model": self.model,
             "input": input_items,
@@ -1777,7 +1822,7 @@ class OpenAIConversation:
         _max_out = self._max_output_tokens()
         if _max_out:
             body["max_output_tokens"] = _max_out
-        _effort = _codex_effort(self.agent.model)
+        _effort = self._codex_effort_level()
         if _effort:
             body["reasoning"] = {"effort": _effort}
 
@@ -1873,7 +1918,7 @@ class OpenAIConversation:
                              or "maximum context length" in _lower
                              or "context window" in _lower)
                     ):
-                        window = get_model_context_window(self.agent.model, "openai")
+                        window = self.effective_context_window()
                         new_budget = max(window // (2 ** (_retry_attempt + 1)), 8_000)
                         print_ts(
                             f"{COLOR_YELLOW}context overflow — retry "

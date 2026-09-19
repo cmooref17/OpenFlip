@@ -177,6 +177,42 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
             ephemeral=True,
         )
 
+    @bot.slash_command(name="session", description="(owner) Show or change THIS conversation's session overrides — model, context, effort, memory…")
+    async def session_cmd(
+        interaction: nextcord.Interaction,
+        action: str = nextcord.SlashOption(
+            choices=["show", "set", "unset", "clear"], default="show", required=False,
+            description="show (default) · set <key> <value> · unset <key> · clear (all)"),
+        key: str = nextcord.SlashOption(
+            choices=["model", "context_window", "compaction_trigger", "max_tokens", "effort", "memory", "options"],
+            default="", required=False,
+            description="Setting to change (which keys apply depends on the provider — see show)"),
+        value: str = nextcord.SlashOption(
+            default="", required=False,
+            description="New value, e.g. claude-sonnet-4-6 · 200k · xhigh · off · temperature=0.7 num_predict=512"),
+    ):
+        # Owner-only: session overrides change the request body (model,
+        # context window, compaction, output cap, effort, memory) and hence
+        # billing, for THIS conversation. Mirrors /effort's gating. The body
+        # is shared with the text-prefix mirror (session_overrides.
+        # session_command_text) so the two surfaces can't drift.
+        if not await _owner_check(interaction): return
+        from .session_overrides import session_command_text
+        _conv_key = _conv_key_for_interaction(runner, interaction)
+        conv = runner.conversations.get(_conv_key)
+        if conv is None:
+            # Not loaded this process-run (cold start / first touch): load
+            # from disk under the same key the runtime would use, so a
+            # persisted override is visible and settable before any turn.
+            _ch_id = int(getattr(interaction.channel, "id", 0) or 0)
+            _conv_id = _conv_key if isinstance(_conv_key, str) else f"discord:{_ch_id}"
+            try:
+                conv = runner.get_conversation(_conv_key, _conv_id)
+            except Exception as _e:
+                print_ts(f"/session: conversation preload failed: {_e}", error=True, agent=runner.agent.id)
+        text = session_command_text(conv, action, key, value)
+        await interaction.response.send_message(text, ephemeral=True)
+
     @bot.slash_command(name="uncompact", description="Undo the last compaction in this channel (restore full history).")
     async def uncompact_cmd(interaction: nextcord.Interaction):
         # Recover from an unwanted compaction:
@@ -328,10 +364,24 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
 
         _st_key = _conv_key_for_interaction(runner, interaction)
         conv = runner.conversations.get(_st_key)
+        # Effective (session-aware) model + window for THIS conversation;
+        # agent defaults when no conversation is loaded in memory.
+        _eff_model = agent.model
         window = get_model_context_window(agent.model, agent.provider)
+        if conv is not None and hasattr(conv, "effective_context_window"):
+            try:
+                _eff_model = conv._effective_raw_model()
+                window = conv.effective_context_window()
+            except Exception:
+                pass
 
         lines = [f"**{agent.display_name}**"]
-        lines.append(f"• Model: `{agent.model}`")
+        if _eff_model != agent.model:
+            lines.append(f"• Model: `{_eff_model}` (session override — agent default `{agent.model}`)")
+        else:
+            lines.append(f"• Model: `{agent.model}`")
+        if conv is not None and getattr(conv, "overrides", None):
+            lines.append(f"• Session overrides: {', '.join(f'`{k}`' for k in conv.overrides)} (see `/session`)")
 
         # Context usage. Both anthropic and ollama populate `last_usage` on
         # the conversation after each turn; we display it uniformly. If

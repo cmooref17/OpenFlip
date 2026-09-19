@@ -26,6 +26,7 @@ from .utils import print_ts, COLOR_YELLOW, COLOR_RED, COLOR_END, load_json, save
 from . import _conversation_io as _cio
 from . import _request_validator
 from .config_global import get_compaction_trigger, get_effort, get_internal_compaction_trigger, get_max_tokens, get_model_context_window, _VALID_EFFORT_LEVELS
+from .session_overrides import SessionOverridesMixin, compaction_trigger_for_window
 
 
 # Compaction trigger (input_tokens) sent on a MANUAL /compact. Anthropic's
@@ -942,16 +943,22 @@ def _inject_pending_image_attachments(api_messages: list[dict], pending: list[di
     return len(image_blocks)
 
 
-class AnthropicConversation:
+class AnthropicConversation(SessionOverridesMixin):
     """Anthropic-direct provider used when agent.provider == 'anthropic'.
 
     Uses direct HTTP to /v1/messages with OAuth bearer auth. Requests route
     through the owner's Claude Code subscription.
     """
 
+    _provider_name = "anthropic"
+
     def __init__(self, conversation_id: str, agent: Agent):
         self.conversation_id = conversation_id
         self.agent = agent
+        # Session overrides (model / context_window / compaction_trigger /
+        # max_tokens / effort / memory) + the per-turn model override hook.
+        # See session_overrides.py for precedence. Loaded from meta in load().
+        self._init_overrides()
         self.model = self._normalize_model(agent.model)
         self.system_message = agent.system_message
         self.messages: list[ChatMessage] = []
@@ -992,12 +999,8 @@ class AnthropicConversation:
         # conversation was a silent no-op. Auto/retry compaction leaves this
         # False and keeps the real trigger. Consumed alongside force_compact_next.
         self.force_compact_trigger_override: bool = False
-        # Session-level reasoning-effort override for THIS conversation. When
-        # set to a valid level (low/medium/high/xhigh/max) it WINS over the
-        # per-model config knob (see _effort_level precedence). None = no
-        # override, fall back to the model default. Owner-set via /effort,
-        # persisted in meta.json so it survives restarts.
-        self.effort_override: str | None = None
+        # NOTE: `effort_override` is a property on SessionOverridesMixin now
+        # (backed by overrides["effort"]) — /effort keeps working unchanged.
         # Reset-epoch guard, set by runtime._run_turn at turn start (a closure
         # capturing the runner's conv epoch for this turn — the SAME check
         # _save_conv enforces). Returns False once /reset bumped the epoch
@@ -1009,32 +1012,11 @@ class AnthropicConversation:
         # before.
         self._persist_guard = None
 
-        # Per-turn model override (raw, pre-normalize form — e.g.
-        # "anthropic/claude-..."). Set by a transport that wants THIS turn to
-        # run on a caller-chosen model without mutating the agent's persistent
-        # config. None = use self.agent.model as usual. The every-turn resync
-        # (and reapply_agent) honor this via _effective_raw_model(); the
-        # external transport clears it in a finally after the turn so it never
-        # leaks into a subsequent turn. Only the model id is overridden —
-        # reasoning-effort, 1M-context and compaction stay keyed to agent.model.
-        self._model_override: str | None = None
-
-    def set_model_override(self, raw_model: str | None) -> None:
-        """Override the model used for the NEXT turn only (per-turn).
-
-        `raw_model` is the raw, un-normalized model string as it would appear
-        in agent.json (provider prefix / `-1m` suffix allowed — _normalize_model
-        strips them). Pass None to clear. The override is consumed by the
-        every-turn resync in chat_stream and by reapply_agent; the caller is
-        responsible for clearing it (typically in a `finally`) so it does not
-        bleed into later turns on the same conversation.
-        """
-        self._model_override = raw_model or None
-
-    def _effective_raw_model(self) -> str:
-        """Raw model string for THIS turn: the per-turn override if set,
-        otherwise the agent's configured model."""
-        return self._model_override or self.agent.model
+        # Per-turn model override + session overrides: see SessionOverridesMixin
+        # (set_model_override / _effective_raw_model / effective_*). Every
+        # model-derived lookup below (1M header, effort, context window,
+        # compaction trigger, max_tokens) keys on _effective_raw_model(), so a
+        # per-turn or per-session model brings its own window/trigger/cap.
 
     @staticmethod
     def _normalize_model(model_str: str) -> str:
@@ -1052,11 +1034,21 @@ class AnthropicConversation:
         return m
 
     def _wants_1m_context(self) -> bool:
-        """True if the configured model name had the `-1m` suffix, meaning
-        we need to add `context-1m-2025-08-07` to the anthropic-beta header.
+        """True if the EFFECTIVE model name (per-turn > session > agent) has
+        the `-1m` suffix, meaning we need to add `context-1m-2025-08-07` to
+        the anthropic-beta header. A session pinned to a 200k model on a 1M
+        agent therefore runs without the beta header.
         """
-        raw = self.agent.model or ""
+        raw = self._effective_raw_model() or ""
         return raw.endswith("-1m")
+
+    def effective_max_tokens(self) -> int:
+        """Request `max_tokens`: session override, else the effective model's
+        config.json `models.<bare>.max_tokens`, else the 64k default."""
+        ov = self.overrides.get("max_tokens")
+        if isinstance(ov, int) and ov > 0:
+            return ov
+        return get_max_tokens(self._effective_raw_model(), "anthropic")
 
     def _effort_level(self) -> str | None:
         """Return the effective reasoning-effort level for this turn, or None.
@@ -1074,14 +1066,12 @@ class AnthropicConversation:
         lives next to compaction_trigger in config.json's models block. The
         session override is conversation-scoped, layered on top.
 
-        Pass agent.model (raw, with the `-1m` suffix), not self.model: the
-        config.json key is the full `claude-opus-4-8-1m` and get_effort's
-        bare-name resolution keys on it exactly like get_compaction_trigger.
+        The model config is looked up with the EFFECTIVE raw model (per-turn
+        > session > agent, `-1m` suffix intact): the config.json key is the
+        full `claude-opus-4-8-1m` and get_effort's bare-name resolution keys
+        on it exactly like get_compaction_trigger.
         """
-        override = self.effort_override
-        if isinstance(override, str) and override.strip().lower() in _VALID_EFFORT_LEVELS:
-            return override.strip().lower()
-        return get_effort(self.agent.model, "anthropic")
+        return self.effective_effort()
 
     def _agent_dir(self) -> str:
         return os.path.dirname(self.agent.path)
@@ -1253,11 +1243,14 @@ class AnthropicConversation:
             }
         if self.last_usage is not None:
             payload["last_usage"] = self.last_usage
-        # Session effort override — written ONLY when set, so meta stays
-        # byte-identical for conversations that never touched /effort.
-        if isinstance(self.effort_override, str) and \
-                self.effort_override.strip().lower() in _VALID_EFFORT_LEVELS:
-            payload["effort_override"] = self.effort_override.strip().lower()
+        # Session overrides (model / context_window / compaction_trigger /
+        # max_tokens / effort / memory) — written ONLY when any is set, so meta
+        # stays byte-identical for conversations that never touched /session
+        # or /effort. Replaces the legacy top-level `effort_override` key
+        # (still read on load, never written).
+        _ov = self.overrides_meta_payload()
+        if _ov:
+            payload["overrides"] = _ov
         if not payload:
             # Nothing to persist. If a meta file already exists, it may hold a
             # now-cleared key (e.g. /effort default zeroed the only field that
@@ -1291,10 +1284,8 @@ class AnthropicConversation:
             # Validate it has the keys /status expects, but tolerate
             # missing ones — old meta files won't have all fields.
             self.last_usage = stored_usage
-        stored_effort = meta.get("effort_override")
-        if isinstance(stored_effort, str) and stored_effort.strip().lower() in _VALID_EFFORT_LEVELS:
-            self.effort_override = stored_effort.strip().lower()
-        # else: bad/missing → leave self.effort_override at its __init__ None.
+        # Session overrides block (+ legacy `effort_override` migration).
+        self.load_overrides_from_meta(meta)
         if not msgs:
             return
         for entry in msgs:
@@ -1349,12 +1340,11 @@ class AnthropicConversation:
         Anthropic's alternation rule. 'tool' role demotes to 'user' in
         the converter so it's safe.
         """
-        # IMPORTANT: pass agent.model (raw, with `-1m` suffix), not self.model
-        # which has been normalized. get_model_context_window keys on the raw
-        # name — `claude-opus-4-7-1m` is the 1M entry, `claude-opus-4-7` is the
-        # 200k entry. Using the normalized name here would silently set budget
-        # to 190k for 1M-beta agents and trigger aggressive head-trimming.
-        window = get_model_context_window(self.agent.model, "anthropic")
+        # Effective window: session override, else the EFFECTIVE raw model's
+        # config entry (raw name with `-1m` suffix intact — `claude-opus-4-7-1m`
+        # is the 1M entry, `claude-opus-4-7` the 200k one; the normalized
+        # self.model would silently pick the 200k budget on 1M agents).
+        window = self.effective_context_window()
         if not window:
             return 0
         # _retry_budget is set on retry after a "prompt too long" 400 — it
@@ -1916,6 +1906,10 @@ class AnthropicConversation:
 
         return response
 
+    def effective_compaction_trigger(self) -> int:
+        """Public alias used by /session show (mixin report)."""
+        return self._effective_compaction_trigger()
+
     def _effective_compaction_trigger(self) -> int:
         """Per-conversation compaction trigger. Internal working sessions
         (internal:*/cron:* conversation ids) compact at the low internal
@@ -1924,7 +1918,17 @@ class AnthropicConversation:
         trigger let internal:google reach ~570k tokens re-read on every call
         (2026-08 lockouts). Every other conversation keeps the per-model
         trigger unchanged."""
-        _model_trigger = get_compaction_trigger(self.agent.model, "anthropic")
+        # Session override > trigger derived from a session context_window
+        # (window - reserve, so pinning a session to 200k on a 1M agent
+        # actually compacts near 200k) > the EFFECTIVE model's config trigger.
+        _ov = self.overrides.get("compaction_trigger")
+        _ov_window = self.overrides.get("context_window")
+        if isinstance(_ov, int) and _ov > 0:
+            _model_trigger = _ov
+        elif isinstance(_ov_window, int) and _ov_window > 0:
+            _model_trigger = compaction_trigger_for_window(_ov_window)
+        else:
+            _model_trigger = get_compaction_trigger(self._effective_raw_model(), "anthropic")
         if str(self.conversation_id or "").startswith(("internal:", "cron:")):
             _internal = get_internal_compaction_trigger()
             if _internal > 0:
@@ -2096,11 +2100,10 @@ class AnthropicConversation:
         self.model = self._normalize_model(self._effective_raw_model())
         body = {
             "model": self.model,
-            # Per-model output token cap → config.json models.<bare>.max_tokens.
-            # Pass agent.model raw (with any `-1m` suffix); get_max_tokens does
-            # the bare-name normalization, exactly like get_effort /
-            # get_compaction_trigger. Falls back to 64000 when unset/invalid.
-            "max_tokens": get_max_tokens(self.agent.model, "anthropic"),
+            # Output token cap: session override > the EFFECTIVE model's
+            # config.json models.<bare>.max_tokens > 64000. See
+            # effective_max_tokens.
+            "max_tokens": self.effective_max_tokens(),
             "messages": api_messages,
             "stream": True,
         }
@@ -2348,7 +2351,7 @@ class AnthropicConversation:
                         and _retry_attempt < 3
                         and "prompt is too long" in text.lower()
                     ):
-                        window = get_model_context_window(self.agent.model, "anthropic")
+                        window = self.effective_context_window()
                         new_budget = max(window // (2 ** (_retry_attempt + 1)), 50_000)
                         print_ts(
                             f"{COLOR_YELLOW}prompt too long — retry "

@@ -15,24 +15,35 @@ import time
 # repo + Mac deployment work without a separate install.
 from .ollama_api import Conversation as _BaseConversation, Options
 from .agent import Agent
-from .utils import print_ts, COLOR_YELLOW, COLOR_END
+from .utils import print_ts, COLOR_YELLOW, COLOR_END, load_json, save_json
 from . import _conversation_io as _cio
 from .config_global import get_model_context_window
+from .session_overrides import SessionOverridesMixin
 
 
-def _ollama_options_with_context(agent: Agent) -> dict:
-    """Merge agent.ollama_options with the model's configured context window.
+def _ollama_options_with_context(agent: Agent, conv: "DiscordConversation | None" = None) -> dict:
+    """Merge agent.ollama_options with the effective context window and any
+    session option overrides.
 
-    config.json's `models.<name>.context_window` is the single source of
-    truth for context size. If the agent already set num_ctx in its
-    ollama_options, that wins (per-agent override). Otherwise we inject
-    the model's configured window.
+    Layering (last wins): agent.ollama_options → num_ctx from a session
+    `context_window` override, else (when the agent didn't set num_ctx) the
+    EFFECTIVE model's config.json `models.<name>.context_window` → session
+    `options` overrides (`/session set options …`). `conv` is None only at
+    construction time, before the conversation's overrides are loaded.
     """
     opts = dict(agent.ollama_options or {})
-    if "num_ctx" not in opts:
-        cw = get_model_context_window(agent.model, "ollama")
+    overrides = getattr(conv, "overrides", None) or {}
+    model = conv._effective_raw_model() if conv is not None else agent.model
+    ov_cw = overrides.get("context_window")
+    if isinstance(ov_cw, int) and ov_cw > 0:
+        opts["num_ctx"] = ov_cw
+    elif "num_ctx" not in opts:
+        cw = get_model_context_window(model, "ollama")
         if cw and cw > 0:
             opts["num_ctx"] = cw
+    ov_opts = overrides.get("options")
+    if isinstance(ov_opts, dict):
+        opts.update(ov_opts)
     return opts
 
 
@@ -47,7 +58,9 @@ def _msg_content(m):
     return m.get("content", "") if hasattr(m, "get") else getattr(m, "content", "")
 
 
-class DiscordConversation(_BaseConversation):
+class DiscordConversation(SessionOverridesMixin, _BaseConversation):
+    _provider_name = "ollama"
+
     def __init__(self, conversation_id: str, agent: Agent):
         super().__init__(
             conversation_id=conversation_id,
@@ -56,6 +69,10 @@ class DiscordConversation(_BaseConversation):
             options=Options(_ollama_options_with_context(agent)),
         )
         self.agent = agent
+        # Session overrides (model / context_window / options / memory) +
+        # the per-turn model override hook. Loaded from the meta sidecar in
+        # load(); applied to self.model / self.options at every chat().
+        self._init_overrides()
         self._persisted_count = 0
         # Latest per-turn token usage from ollama_api response. Populated
         # after every chat() call. /status reads this; field names match
@@ -75,6 +92,11 @@ class DiscordConversation(_BaseConversation):
         # mechanism and must run on every request. See _trim_to_fit_window
         # below for the matching estimator/target divergences. Intentional —
         # do not "align" this to the anthropic gate.
+        # Every-turn resync so `/model`, `/session set model|options|
+        # context_window` and the ingress per-turn model take effect on the
+        # next request without a restart (mirrors the anthropic resync).
+        self.model = self._effective_raw_model()
+        self.options = Options(_ollama_options_with_context(self.agent, self))
         dropped = self._trim_to_fit_window()
         if dropped:
             print_ts(
@@ -101,12 +123,37 @@ class DiscordConversation(_BaseConversation):
     def _conversation_path(self) -> str:
         return _cio.conversation_path(self._agent_dir(), self.conversation_id)
 
+    def _meta_path(self) -> str:
+        """Sidecar JSON next to the .jsonl. For this provider it holds ONLY the
+        session overrides block (no compaction / usage state) and is written
+        only when an override is set — untouched conversations have no meta
+        file, exactly as before. Cleared by clear_history."""
+        return os.path.join(
+            self._agent_dir(), "conversations", f"{_cio.fs_encode(self.conversation_id)}.meta.json"
+        )
+
+    def _save_meta(self):
+        payload: dict = {}
+        _ov = self.overrides_meta_payload()
+        if _ov:
+            payload["overrides"] = _ov
+        if not payload:
+            try:
+                if os.path.isfile(self._meta_path()):
+                    save_json(self._meta_path(), payload)
+            except OSError:
+                pass
+            return
+        save_json(self._meta_path(), payload)
+
     def load(self):
         """Load conversation history from disk into memory."""
         _cio.migrate_legacy_to_jsonl(
             self._agent_dir(), self.conversation_id,
             log_agent_id=self.agent.id,
         )
+        meta = load_json(self._meta_path(), default={}) or {}
+        self.load_overrides_from_meta(meta)
         msgs = _cio.read_all_messages(self._conversation_path())
         if not msgs:
             return
@@ -165,7 +212,7 @@ class DiscordConversation(_BaseConversation):
              (anthropic). Justified there because Anthropic has server-side
              compaction; we have none. See the call-site comment above.
         """
-        window = get_model_context_window(self.model, "ollama")
+        window = self.effective_context_window()
         if not window:
             return 0
         budget = window - 10_000
@@ -203,15 +250,19 @@ class DiscordConversation(_BaseConversation):
         return dropped
 
     def clear_history(self):
-        """Delete the on-disk conversation file."""
-        _cio.delete_conversation_files(self._agent_dir(), self.conversation_id, backup_tag="pre_reset")
+        """Delete the on-disk conversation file (and the overrides sidecar)."""
+        _cio.delete_conversation_files(
+            self._agent_dir(), self.conversation_id,
+            extra_paths=[self._meta_path()],
+            backup_tag="pre_reset",
+        )
         self._persisted_count = 0
 
     def reapply_agent(self):
         """Re-pull the system message + model + options from the agent (e.g. after reload)."""
-        self.model = self.agent.model
+        self.model = self._effective_raw_model()
         self.system_message = self.agent.system_message
-        self.options = Options(_ollama_options_with_context(self.agent))
+        self.options = Options(_ollama_options_with_context(self.agent, self))
         if self.messages and self.messages[0].role == 'system':
             self.messages[0]['content'] = self.system_message
         else:

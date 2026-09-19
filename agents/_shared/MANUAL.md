@@ -194,9 +194,10 @@ them), not in any agent.json.
 - Reasoning **`effort`** is NOT an agent.json field — it's a model
   capability, so it lives per-model in `config.json` under
   `models.<id>.effort`, right next to `compaction_trigger`. A
-  per-conversation override can be set with `/effort` (owner-only,
-  Anthropic-only), which wins over the model config. See "What's
-  the current model / context window?" below.
+  per-conversation override can be set with `/effort` or `/session set
+  effort <level>` (owner-only, Anthropic + OpenAI), which wins over the
+  model config. See "What's the current model / context window?" and
+  "`/session` — per-conversation overrides" below.
 
 ### The "openai" provider — setup + what's supported
 
@@ -275,10 +276,13 @@ NOT supported (deliberate differences — these commands answer
   (oldest messages dropped once the estimated input nears the window),
   like the ollama provider. Nothing is summarized — trimmed history
   stays on disk but leaves the model's context.
-- **No `/effort` session override** — only the per-model
-  `models.<id>.effort` config knob (see below; vocabulary differs by
-  auth path — api-key: `minimal`/`low`/`medium`/`high`; subscription:
-  `low`/`medium`/`high`/`xhigh`).
+- **`/effort` / `/session set effort` work here too** (vocabulary is the
+  union `minimal`/`low`/`medium`/`high`/`xhigh`; the api-key path maps
+  `xhigh`→`high`, the subscription path maps `minimal`→`low`). Without an
+  override, the per-model `models.<id>.effort` config knob applies.
+- **No `compaction_trigger` session key** (no server-side compaction);
+  `/session` offers `model`, `context_window`, `max_tokens`, `effort`,
+  `memory` for this provider.
 - **No explicit prompt-cache control** — OpenAI caches prompt prefixes
   automatically; cache reads show up in `/status` and the ledger as
   `cache_read` tokens, and `cache_creation` is always 0.
@@ -1271,7 +1275,8 @@ at runtime, no restart/SIGHUP needed). Shape:
       "allow_model_choice": false,
       "allowed_models": [],
       "rate_limit": 20,
-      "allowed_tools": ["web_search", "generate_image"]
+      "allowed_tools": ["web_search", "generate_image"],
+      "session_overrides": {"memory": false, "context_window": 200000}
     }
   }
 }
@@ -1284,9 +1289,29 @@ name — every turn on this token lands in conversation `external:<session>`,
 never anything from the request body), `default_model` (**required**),
 `allow_model_choice` (bool, default false), `allowed_models` (list, only
 meaningful when `allow_model_choice` is true), `rate_limit` (req/min, default
-20), `allowed_tools` (optional per-token tool ceiling — see below). Missing/
-empty/unparseable token file → **every** request 401 (fail closed). Tokens are
-compared in constant time; a token <32 chars is ignored.
+20), `allowed_tools` (optional per-token tool ceiling — see below),
+`session_overrides` (optional — see below). Missing/empty/unparseable token
+file → **every** request 401 (fail closed). Tokens are compared in constant
+time; a token <32 chars is ignored.
+
+**Per-token `session_overrides` (session seed).** Optional JSON object of
+per-conversation settings applied to the token's `external:<session>`
+conversation on every request — the same keys and validation as `/session set`
+(`model`, `context_window`, `compaction_trigger`, `max_tokens`, `effort`,
+`memory`, and `options` for ollama agents; see "`/session` — per-conversation
+overrides"). Invalid entries are logged and skipped, valid ones are stored in
+the conversation's `.meta.json`, so `/session show` on that conversation
+agrees with the token file and an edit to the token takes effect on the next
+request (removing a key from the token does NOT unset an already-persisted
+override — use `/session unset` or `/session clear` for that). The token's
+`default_model` remains a **per-turn** override and still wins over a
+`session_overrides.model` for the model id; because every model-derived
+lookup follows the effective model, a token pinned to `claude-sonnet-4-6`
+already runs at that model's 200k window / trigger / effort without needing
+`context_window` in the seed. `"memory": false` is the way to give a token a
+conversation that can never write to the agent's memory (the memory tools are
+hidden from and blocked for that conversation, regardless of
+`memory_enabled` and `allowed_tools`).
 
 **Per-token `allowed_tools` (restrictive intersection).** Optional. When
 present it NARROWS the agent's `auth.external` ACL ceiling for this token — it
@@ -1320,8 +1345,11 @@ resolution: if `allow_model_choice` is true **and** `model` is sent, it must be
 in `allowed_models` (else **400** with `{"error": "...", "allowed": [...]}`);
 otherwise the token's `default_model` is used. The chosen model applies to
 **that turn only** (per-turn override on the conversation — `set_model_override`
-in `anthropic_conversation.py`), never mutating the agent's persistent config.
-Any `session`/`agent` field in the body is ignored.
+on `SessionOverridesMixin`, honored by all three providers), never mutating the
+agent's persistent config — and the turn's context window, 1M-beta header,
+compaction trigger, `max_tokens` and effort all follow that per-turn model
+(see the precedence list under "`/session`"). Any `session`/`agent` field in
+the body is ignored.
 
 **Response.** `200 {"reply": "<full agent text>"}`. The whole reply is captured
 (multi-chunk included). Error codes: **400** malformed/empty body or
@@ -2251,10 +2279,11 @@ non-content errors and does NOT append them to conversation history
   a valid value (`low`/`medium`/`high`/`xhigh`/`max`); otherwise the key
   is absent and the API uses its default (`high`). Resolved by
   `AnthropicConversation._effort_level` with precedence **session override
-  (`/effort`, persisted in `.meta.json`) > per-model `config.json`
-  `models.<id>.effort` (via `config_global.get_effort`) > absent**. Set in
+  (`/effort` or `/session set effort`, persisted in `.meta.json` under
+  `overrides`) > per-model `config.json` `models.<id>.effort` for the
+  EFFECTIVE model (via `config_global.get_effort`) > absent**. Set in
   both the streaming and `_chat_legacy` body builders. See `effort` and
-  `/effort` under "What's the current model / context window?".
+  `/session` under "What's the current model / context window?".
 
 ---
 
@@ -2732,26 +2761,77 @@ bare model id — the `-1m` suffix is part of the key, so a 1m-context model key
   WINS over this model config, which in turn wins over the API default. So the
   effective level is `session override > models.<id>.effort > "high"`.
 
-### `/effort` — per-conversation override (owner-only, Anthropic-only)
+### `/session` — per-conversation overrides (owner-only, all providers)
 
-`/effort <level>` sets a session-level effort override for THIS conversation
-that beats the model config above. Choices: `low`/`medium`/`high`/`xhigh`/`max`,
-plus `default` to CLEAR the override and fall back to the model config. The
-override persists per-conversation in the `.meta.json` sidecar (key
-`effort_override`, written only when set — meta stays byte-identical for
-conversations that never touched `/effort`), so it survives restarts. It takes
-effect on the next real turn (no synthetic turn fired). Same model-gating
-caveat applies: don't set `xhigh`/`max` on a model that doesn't support it.
+Every conversation can carry its own settings layer. Precedence for each
+setting (highest wins):
+
+1. **per-turn override** — external ingress token `default_model` / body
+   `model` (model id only);
+2. **session override** — `/session set …`, `/effort`, or an ingress token's
+   `session_overrides` block; persisted in the conversation's `.meta.json`
+   under `"overrides"` (written only when any key is set — meta stays
+   byte-identical for conversations that never touched `/session`);
+3. **per-model config** — `config.json` `models.<bare>.{context_window,
+   compaction_trigger, max_tokens, effort}` looked up with the **effective**
+   model, so a session pinned to a different model automatically gets that
+   model's window / trigger / cap / effort (and, on Anthropic, its `-1m`
+   header only if the effective model name carries the suffix);
+4. **agent.json** — `model`, `ollama_options`, `memory_enabled`;
+5. provider default.
+
+Keys by provider: anthropic `model`, `context_window`, `compaction_trigger`,
+`max_tokens`, `effort`, `memory`; openai `model`, `context_window`,
+`max_tokens`, `effort`, `memory`; ollama `model`, `context_window`,
+`options`, `memory`.
+
+- `/session` (or `/session show`) — every setting with its effective value
+  and which layer it came from.
+- `/session set <key> <value>` — e.g. `/session set model claude-sonnet-4-6`,
+  `/session set context_window 200k`, `/session set effort xhigh`,
+  `/session set memory off`, `/session set options temperature=0.7
+  num_predict=512` (ollama; several `k=v` pairs, merged over
+  `agent.ollama_options`). Ints accept `200k` / `1m` shorthand. A session
+  `model` must belong to the agent's provider (histories aren't compatible
+  across providers — use `/model` to switch provider). On Anthropic a session
+  `context_window` without an explicit `compaction_trigger` derives its
+  trigger as `window - compaction_reserve_tokens` (floored at 50k), so a 200k
+  session on a 1M agent really compacts near 200k.
+- `/session unset <key>` / `/session clear` — drop one / all overrides.
+- `memory off` hides the memory tools from the model AND blocks them at
+  dispatch for that conversation, regardless of `memory_enabled` or ACL
+  entries naming them; `memory on` works the other way on an agent whose
+  `memory_enabled` is false.
+
+Changes take effect on the next real turn (no synthetic turn fired). Owner-only
+on every transport: the Discord slash `/session action key value` and the
+cross-transport text-prefix `/session …` share one implementation
+(`session_overrides.session_command_text`). `/status` shows the effective
+model (flagging a session override) and the effective window. `/reset`
+deletes the sidecar with the history, so overrides don't survive a reset.
+
+### `/effort` — per-conversation override (owner-only, Anthropic + OpenAI)
+
+`/effort <level>` is the short form of `/session set effort <level>` — a
+session-level effort override for THIS conversation that beats the model
+config above. Choices: `low`/`medium`/`high`/`xhigh`/`max` (OpenAI:
+`minimal`/`low`/`medium`/`high`/`xhigh`), plus `default` to CLEAR the override
+and fall back to the model config. The override persists per-conversation in
+the `.meta.json` sidecar (`overrides.effort`; a pre-2026-09 top-level
+`effort_override` key is still read and migrated on load, never written), so it
+survives restarts. It takes effect on the next real turn (no synthetic turn
+fired). Same model-gating caveat applies: don't set `xhigh`/`max` on a model
+that doesn't support it.
 
 Available as both the Discord slash command and a cross-transport text-prefix
 mirror (iMessage + any non-Discord transport), alongside `/reset`, `/compact`,
-`/uncompact`, `/model` (alias `/models`), `/dream`, `/status`, `/reload`,
-`/restart`, `/help`. The text arg is optional: bare `/effort` shows the current
-override + usage; `/effort <level>` sets it. `/effort` is owner-only and
-Anthropic-only on every transport. Text-mirror gating in general: `/effort`,
-`/model`, `/models`, `/dream`, `/uncompact`, `/reload`, `/restart` are
-owner-only; `/reset`, `/compact`, `/status`, `/help` are ungated (see "Owner
-vs admin" in §3).
+`/uncompact`, `/session`, `/model` (alias `/models`), `/dream`, `/status`,
+`/reload`, `/restart`, `/help`. The text arg is optional: bare `/effort` shows
+the current override + usage; `/effort <level>` sets it. `/effort` is
+owner-only on every transport (Ollama agents report it as unavailable).
+Text-mirror gating in general: `/effort`, `/session`, `/model`, `/models`,
+`/dream`, `/uncompact`, `/reload`, `/restart` are owner-only; `/reset`,
+`/compact`, `/status`, `/help` are ungated (see "Owner vs admin" in §3).
 
 `/model` is also a cross-transport text-prefix mirror (the Discord slash `/model`
 opens an interactive panel that can't render off-Discord): bare `/model` shows the

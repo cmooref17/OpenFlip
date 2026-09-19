@@ -387,6 +387,15 @@ def should_respond(agent: Agent, inbound: InboundMessage, bot_user_id: int) -> b
 MEMORY_TOOL_NAMES = {"save_memory", "update_core_memory", "search_memory", "read_memory", "list_memory_files", "reindex_memory"}
 
 
+def strip_memory_tools(funcs: list) -> list:
+    """Drop the memory tools from a tool-func list. Used when a conversation's
+    session override turns memory off (`/session set memory off`, or an
+    ingress token's `session_overrides`): the model must neither see nor be
+    able to dispatch them for that conversation, regardless of the agent's
+    `memory_enabled` and of ACL entries naming them. Order preserved."""
+    return [f for f in funcs if getattr(f, "__name__", "") not in MEMORY_TOOL_NAMES]
+
+
 def build_api_tool_funcs(agent: Agent, *, transport: str = "discord", tool_grants: list[str] | None = None, tool_allowlist: list[str] | None = None) -> list:
     """Agent-stable tool list sent to the model API (NOT per-speaker).
 

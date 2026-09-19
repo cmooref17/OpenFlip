@@ -13,7 +13,7 @@ from .conversation import DiscordConversation
 from .anthropic_conversation import AnthropicConversation, MalformedRequestError
 from .openai_conversation import OpenAIConversation
 from .providers import make_conversation, chat_message_class
-from .pipeline import build_user_prompt, should_respond, build_visible_tools, build_api_tool_funcs, extract_image_attachments, build_inbound_from_discord
+from .pipeline import build_user_prompt, should_respond, build_visible_tools, build_api_tool_funcs, extract_image_attachments, build_inbound_from_discord, strip_memory_tools
 from .session import InboundMessage, Session
 from .tool_executor import execute_tool_calls, build_model_feedback
 from .tools import TOOL_REGISTRY
@@ -2167,6 +2167,19 @@ class AgentRunner:
         # native to _conv_id itself so is_forwarded is False (safe — keys native).
         _native_full = f"{_tr}:{_tid}" if _tr else (_conv_id or str(_native_ch))
         conv = self.get_conversation(channel.id, conversation_id=_conv_id, native_key=_native_full)
+        # Session memory switch (`/session set memory off`, or an ingress
+        # token's session_overrides). When off for THIS conversation, strip
+        # the memory tools from BOTH lists — the model neither sees them
+        # (api_tool_funcs) nor can dispatch them (callable_funcs) — and tell
+        # the executor so its memory ACL bypass stays off too. Only ever
+        # narrows: agent.memory_enabled still governs injection above.
+        try:
+            _mem_enabled = bool(conv.effective_memory_enabled())
+        except Exception:
+            _mem_enabled = bool(agent.memory_enabled)
+        if not _mem_enabled:
+            callable_funcs = strip_memory_tools(callable_funcs)
+            api_tool_funcs = strip_memory_tools(api_tool_funcs)
         # Conversation key for every _pending_inject/_active_turns access in
         # this turn. For identity-linked (forwarded) conversations this is the
         # PRIMARY conversation_id string (shared across transports); otherwise
@@ -3073,6 +3086,7 @@ class AgentRunner:
                             (lambda: bool(self._pending_inject.get(_ch_id_ic)))
                             if _ch_id_ic else None
                         ),
+                        memory_enabled=_mem_enabled,
                     )
 
                     # Promote SUCCESSFUL call sigs into called_signatures so

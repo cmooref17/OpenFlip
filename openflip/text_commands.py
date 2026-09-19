@@ -35,6 +35,7 @@ _TEXT_COMMANDS = {
     "/compact",
     "/uncompact",
     "/effort",
+    "/session",
     "/model",
     "/models",
     "/dream",
@@ -159,6 +160,18 @@ async def handle_text_command(
             await _send(transport, session_id, channel, "Owner only.")
             return True
         await _do_effort(runner, conv_key, arg, channel, transport, session_id)
+        return True
+
+    if head == "/session":
+        # Owner-only: /session sets per-conversation overrides (model,
+        # context window, compaction trigger, output cap, effort, memory,
+        # ollama options) that change the request body + billing for THIS
+        # conversation only. Same gating as /effort; body shared with the
+        # slash command via session_overrides.session_command_text.
+        if not is_owner(speaker_id, transport=tname, handle=handle):
+            await _send(transport, session_id, channel, "Owner only.")
+            return True
+        await _do_session(runner, conv_key, arg, channel, transport, session_id)
         return True
 
     if head in ("/model", "/models"):
@@ -382,6 +395,13 @@ async def _do_effort(runner, ch_id, arg, channel, transport, session_id) -> None
     )
 
 
+async def _do_session(runner, ch_id, arg, channel, transport, session_id) -> None:
+    from .session_overrides import session_command_text, parse_session_args
+    conv = runner.conversations.get(ch_id)
+    action, key, value = parse_session_args(arg)
+    await _send(transport, session_id, channel, session_command_text(conv, action, key, value))
+
+
 async def _do_model(runner, arg, channel, transport, session_id) -> None:
     # Text mirror of the slash /model panel (agent_ui.open_model_panel). That
     # panel renders dropdowns/buttons that only exist on Discord; this gives any
@@ -480,9 +500,23 @@ async def _do_status(runner, ch_id, channel, transport, session_id) -> None:
     from .config_global import get_model_context_window
     agent = runner.agent
     conv = runner.conversations.get(ch_id)
+    # Effective (session-aware) model + window for THIS conversation; fall
+    # back to the agent defaults when no conversation is loaded.
+    _eff_model = agent.model
     window = get_model_context_window(agent.model, agent.provider)
+    if conv is not None and hasattr(conv, "effective_context_window"):
+        try:
+            _eff_model = conv._effective_raw_model()
+            window = conv.effective_context_window()
+        except Exception:
+            pass
     lines = [f"**{agent.display_name}**"]
-    lines.append(f"• Model: `{agent.model}`")
+    if _eff_model != agent.model:
+        lines.append(f"• Model: `{_eff_model}` (session override — agent default `{agent.model}`)")
+    else:
+        lines.append(f"• Model: `{agent.model}`")
+    if conv is not None and getattr(conv, "overrides", None):
+        lines.append(f"• Session overrides: {', '.join(f'`{k}`' for k in conv.overrides)} (see `/session`)")
     usage = getattr(conv, "last_usage", None) if conv else None
     if usage:
         total = usage["total_input"]

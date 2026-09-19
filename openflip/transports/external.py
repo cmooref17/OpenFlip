@@ -46,6 +46,7 @@ import contextlib
 import hashlib
 import hmac
 import json
+import re
 import os
 import ssl
 import time
@@ -63,6 +64,10 @@ if TYPE_CHECKING:
 # Hard cap on request body size. aiohttp enforces this at read time and raises
 # HTTPRequestEntityTooLarge, which we translate to a clean 413 JSON response.
 _MAX_BODY_BYTES = 16 * 1024
+# Caller-chosen session names (tokens with allow_session_choice). Same
+# charset family as web.app._TRIGGER_SESSION_ID_RE, shorter cap; ':' is
+# excluded so the id can never smuggle a transport prefix.
+_SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 
 
 class ExternalTransport:
@@ -252,6 +257,51 @@ class ExternalTransport:
         )
         return []
 
+    @staticmethod
+    def _session_choice_prefix(entry: dict) -> Optional[str]:
+        """The namespace prefix a token may choose sessions under, or None when
+        the token has no session choice. Requires BOTH `allow_session_choice:
+        true` and a non-empty `session_prefix` — a token that opts in without
+        a prefix would be able to name (and delete) any external session, so
+        it fails closed to the fixed-session behavior."""
+        if not entry.get("allow_session_choice"):
+            return None
+        prefix = entry.get("session_prefix")
+        if not isinstance(prefix, str) or not prefix.strip():
+            return None
+        prefix = prefix.strip()
+        if not _SESSION_NAME_RE.match(prefix):
+            return None
+        return prefix
+
+    def _resolve_session_name(self, entry: dict, requested: Any) -> tuple[Optional[str], Optional[str]]:
+        """Pick the conversation this request lands in. Returns (name, error).
+
+        Default (no `session` in the body, or the token has no session choice)
+        is the token's operator-assigned fixed `session` — every turn on the
+        token lands in one conversation, exactly as before. A token with
+        `allow_session_choice` + `session_prefix` may name a session in the
+        body, but ONLY under its prefix (`mtg-` → `mtg-flip-3f2a…`), matching
+        the strict charset the trigger endpoint uses; anything else is a 400,
+        never a silent fallback. The prefix is the security boundary: a game
+        token can create/use/delete `mtg-*` sessions and nothing else."""
+        fixed = entry.get("session")
+        if requested is None or requested == "":
+            if not isinstance(fixed, str) or not fixed.strip():
+                return None, "server misconfigured"
+            return fixed.strip(), None
+        prefix = self._session_choice_prefix(entry)
+        if prefix is None:
+            return None, "this token has a fixed session; 'session' is not allowed"
+        if not isinstance(requested, str):
+            return None, "'session' must be a string"
+        name = requested.strip()
+        if not _SESSION_NAME_RE.match(name):
+            return None, "'session' must be 1-80 chars of [A-Za-z0-9_.-]"
+        if not name.startswith(prefix):
+            return None, f"'session' must start with '{prefix}'"
+        return name, None
+
     def _check_rate_limit(self, token_key: str, limit_per_min: int) -> bool:
         """Sliding-window rate limit. True if the request is allowed."""
         now = time.time()
@@ -285,25 +335,9 @@ class ExternalTransport:
         except Exception:
             pass
 
-        # Auth — Bearer token, fail closed. Reload table if the file changed.
-        self._load_tokens()
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
-            return web.json_response({"error": "missing bearer token"}, status=401)
-        provided = auth[7:].strip()
-        if not provided:
-            return web.json_response({"error": "missing bearer token"}, status=401)
-        entry = self._match_token(provided)
-        if entry is None:
-            return web.json_response({"error": "invalid token"}, status=401)
-
-        # Per-token rate limit. Key by a hash of the token (never store/echo it).
-        token_key = hashlib.sha256(provided.encode("utf-8")).hexdigest()
-        rate_limit = int(entry.get("rate_limit", 20) or 20)
-        if not self._check_rate_limit(token_key, rate_limit):
-            return web.json_response(
-                {"error": f"rate limit exceeded ({rate_limit}/min)"}, status=429,
-            )
+        entry, err = self._authenticate(request)
+        if err is not None:
+            return err
 
         # Body — read raw bytes (16 KiB cap) and parse JSON ourselves so a
         # wrong/absent Content-Type still works; only malformed JSON is a 400.
@@ -358,17 +392,20 @@ class ExternalTransport:
             # allow_model_choice false → silently ignore the requested model and
             # use default_model (the token's pinned policy wins).
 
-        # Session is keyed by the OPERATOR-assigned name on the token, never by
-        # anything in the body. All turns on this token land in one conversation.
-        session_name = entry.get("session")
-        if not isinstance(session_name, str) or not session_name.strip():
+        # Session: the OPERATOR-assigned fixed name on the token, unless the
+        # token opted into session choice — then the body may name one under
+        # the token's prefix (see _resolve_session_name; fail-closed 400 on
+        # anything outside it).
+        session_name, sess_err = self._resolve_session_name(entry, body.get("session"))
+        if sess_err == "server misconfigured":
             print_ts(
                 f"{COLOR_RED}ExternalTransport: token for {agent_id} has no "
                 f"'session' name; rejecting.{COLOR_END}",
                 agent=agent_id, error=True,
             )
             return web.json_response({"error": "server misconfigured"}, status=500)
-        session_name = session_name.strip()
+        if sess_err:
+            return web.json_response({"error": sess_err}, status=400)
 
         # Per-token tool ceiling (RESTRICTIVE intersection — see
         # Session.tool_allowlist). This NARROWS the agent's `auth.external` ACL
@@ -401,6 +438,23 @@ class ExternalTransport:
 
         # Serialize same-session requests so concurrent callers on one token
         # don't interleave into the same conversation's turn.
+        # Optional per-token `session_overrides` block: seeds the token's
+        # conversation with session-level settings (model / context_window /
+        # compaction_trigger / max_tokens / effort / memory / options —
+        # validated per provider in session_overrides.normalize_override).
+        # Operator config, never anything from the request body. Applied on
+        # every request so an edit to the token file takes effect on the next
+        # turn; persisted in the conversation's meta so /session show agrees.
+        session_overrides = entry.get("session_overrides")
+        if session_overrides is not None and not isinstance(session_overrides, dict):
+            print_ts(
+                f"{COLOR_YELLOW}ExternalTransport: token for {agent_id} has a "
+                f"non-object 'session_overrides' ({type(session_overrides).__name__}); "
+                f"ignoring it.{COLOR_END}",
+                agent=agent_id,
+            )
+            session_overrides = None
+
         lock = self._session_locks.setdefault(session_name, asyncio.Lock())
         async with lock:
             return await self._dispatch_and_capture(
@@ -408,11 +462,77 @@ class ExternalTransport:
                 session_name=session_name,
                 chosen_model=chosen_model,
                 agent_id=agent_id,
+                session_overrides=session_overrides,
             )
+
+    def _authenticate(self, request: web.Request) -> tuple[Optional[dict], Optional[web.Response]]:
+        """Bearer auth + per-token rate limit shared by every route. Returns
+        (token entry, None) or (None, error response). Fail closed."""
+        self._load_tokens()
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return None, web.json_response({"error": "missing bearer token"}, status=401)
+        provided = auth[7:].strip()
+        if not provided:
+            return None, web.json_response({"error": "missing bearer token"}, status=401)
+        entry = self._match_token(provided)
+        if entry is None:
+            return None, web.json_response({"error": "invalid token"}, status=401)
+        # Per-token rate limit. Key by a hash of the token (never store/echo it).
+        token_key = hashlib.sha256(provided.encode("utf-8")).hexdigest()
+        rate_limit = int(entry.get("rate_limit", 20) or 20)
+        if not self._check_rate_limit(token_key, rate_limit):
+            return None, web.json_response(
+                {"error": f"rate limit exceeded ({rate_limit}/min)"}, status=429,
+            )
+        return entry, None
+
+    async def _handle_delete_session(self, request: web.Request) -> web.Response:
+        """DELETE /<agent_id>/sessions/<name> — archive + remove one conversation.
+
+        Only tokens with session choice may call this, and only for names under
+        their own prefix — so a game token can end its own `mtg-*` games and
+        can't touch the fixed sessions or anyone else's namespace. Runs the
+        SAME race-safe reset the /reset command uses (epoch bump → interrupt →
+        drop queued → pre_reset backup → delete), so a turn in flight on the
+        session is abandoned rather than resurrecting the history afterwards.
+        The backup (`.pre_reset_<ts>.bak.jsonl`, 5 kept) is the archive."""
+        if not self._runner:
+            return web.json_response({"error": "transport not initialized"}, status=500)
+        agent_id = self._runner.agent.id
+        if request.match_info.get("agent_id", "") != agent_id:
+            return web.json_response({"error": "not found"}, status=404)
+        entry, err = self._authenticate(request)
+        if err is not None:
+            return err
+        name = (request.match_info.get("name") or "").strip()
+        prefix = self._session_choice_prefix(entry)
+        if prefix is None:
+            return web.json_response({"error": "this token cannot manage sessions"}, status=403)
+        if not _SESSION_NAME_RE.match(name) or not name.startswith(prefix):
+            return web.json_response({"error": f"session name must match [A-Za-z0-9_.-] and start with '{prefix}'"}, status=400)
+        conv_key = abs(hash(name)) % (2**31)
+        conv_id = f"external:{name}"
+        # Serialize with any in-flight request on this session so we never
+        # delete underneath a turn that is mid-dispatch.
+        lock = self._session_locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            try:
+                ok = self._runner.reset_conversation(conv_key, fallback_conv_id=conv_id)
+            except Exception as e:
+                print_ts(
+                    f"{COLOR_RED}ExternalTransport: session delete failed for "
+                    f"{conv_id}: {e}{COLOR_END}", agent=agent_id, error=True,
+                )
+                return web.json_response({"error": "internal error"}, status=500)
+        self._session_locks.pop(name, None)
+        print_ts(f"ExternalTransport: archived + deleted session {conv_id}", agent=agent_id)
+        return web.json_response({"deleted": name, "ok": bool(ok)})
 
     async def _dispatch_and_capture(
         self, *, inbound: InboundMessage, session_name: str,
         chosen_model: str, agent_id: str,
+        session_overrides: Optional[dict] = None,
     ) -> web.Response:
         """Run one turn and capture its full final text.
 
@@ -438,6 +558,22 @@ class ExternalTransport:
         override_set = False
         try:
             conv = runner.get_conversation(conv_key, conversation_id=conv_id)
+            # Session-level seed from the token (persisted) BEFORE the
+            # per-turn model override, which still wins for the model id.
+            if session_overrides and hasattr(conv, "apply_overrides"):
+                _changed, _errs = conv.apply_overrides(session_overrides)
+                for _err in _errs:
+                    print_ts(
+                        f"{COLOR_YELLOW}ExternalTransport: session_overrides for "
+                        f"{agent_id}/{session_name}: {_err}{COLOR_END}",
+                        agent=agent_id,
+                    )
+                if _changed:
+                    print_ts(
+                        f"ExternalTransport: applied session_overrides to "
+                        f"{conv_id}: {conv.overrides}",
+                        agent=agent_id,
+                    )
             if hasattr(conv, "set_model_override"):
                 conv.set_model_override(chosen_model)
                 override_set = True
@@ -687,6 +823,9 @@ class ExternalTransport:
         # is REQUIRED: a static path populates no match_info, so the handler's
         # agent-id check would read "" and 404 every request.
         self._app.router.add_post("/{agent_id}", self._handle_request)
+        # Session management for tokens with `allow_session_choice` (the MTG
+        # game token ends a finished game's conversation this way).
+        self._app.router.add_delete("/{agent_id}/sessions/{name}", self._handle_delete_session)
 
         self._app_runner = web.AppRunner(self._app)
         await self._app_runner.setup()
