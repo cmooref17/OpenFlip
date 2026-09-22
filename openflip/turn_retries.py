@@ -17,16 +17,6 @@ import os
 from typing import Callable, Optional
 
 
-# Phrases that read like an action-commitment ("lemme look", "imma do it",
-# etc.). If the assistant emits one of these with NO accompanying tool_use we
-# retry the turn forcing tool_choice=any so the model must emit a tool.
-_PROMISE_PHRASES = (
-    "lemme ", "imma ", "lookin ", "peek at", "peek it",
-    "let me ", "i'll do", "i'll look", "one sec",
-    "hold on", "checkin ", "workin on",
-)
-
-
 # Nudge injected before retrying an empty (no text, no tool_use) reply so the
 # API call has different input. A bare retry would send the same body and get
 # the same empty back.
@@ -38,20 +28,6 @@ _EMPTY_RETRY_NUDGE = (
     "your normal voice. If you need another tool "
     "call, fire it. Do not stay silent."
 )
-
-
-def action_promise_should_retry(text: str, already_used: bool) -> bool:
-    """Action-promise retry: True when `text` reads like an action-commitment
-    ("lemme look", "imma do it", etc.) but no tool_use accompanied it, so the
-    turn should retry forcing tool_choice=any. Cap at 1 retry per turn
-    (`already_used`). Kill switch: OPENFLIP_DISABLE_ACTION_PROMISE_RETRY=1.
-    """
-    if os.environ.get("OPENFLIP_DISABLE_ACTION_PROMISE_RETRY") == "1":
-        return False
-    if already_used:
-        return False
-    lowered = text.lower()
-    return any(p in lowered for p in _PROMISE_PHRASES)
 
 
 def detect_peer_prose(
