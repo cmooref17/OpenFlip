@@ -2817,18 +2817,24 @@ deletes the sidecar with the history, so overrides don't survive a reset.
 session-level effort override for THIS conversation that beats the model
 config above. Choices: `low`/`medium`/`high`/`xhigh`/`max` (OpenAI:
 `minimal`/`low`/`medium`/`high`/`xhigh`), plus `default` to CLEAR the override
-and fall back to the model config. The override persists per-conversation in
-the `.meta.json` sidecar (`overrides.effort`; a pre-2026-09 top-level
-`effort_override` key is still read and migrated on load, never written), so it
-survives restarts. It takes effect on the next real turn (no synthetic turn
-fired). Same model-gating caveat applies: don't set `xhigh`/`max` on a model
-that doesn't support it.
+and fall back to the model config. The `level` argument is OPTIONAL: a bare
+`/effort` (Discord slash) opens an interactive panel — same style as `/model` —
+showing the current effective effort and its **source** (this conversation's
+override, the per-model `config.json` default, or none/API default), with a
+picker to change it in place. `/effort <level>` still sets (or clears, with
+`default`) the override directly without the panel. The override persists
+per-conversation in the `.meta.json` sidecar (`overrides.effort`; a pre-2026-09
+top-level `effort_override` key is still read and migrated on load, never
+written), so it survives restarts. It takes effect on the next real turn (no
+synthetic turn fired). Same model-gating caveat applies: don't set
+`xhigh`/`max` on a model that doesn't support it.
 
 Available as both the Discord slash command and a cross-transport text-prefix
 mirror (iMessage + any non-Discord transport), alongside `/reset`, `/compact`,
 `/uncompact`, `/session`, `/model` (alias `/models`), `/dream`, `/status`,
-`/reload`, `/restart`, `/help`. The text arg is optional: bare `/effort` shows
-the current override + usage; `/effort <level>` sets it. `/effort` is
+`/reload`, `/restart`, `/help`. On the text mirror the arg is optional too, but
+there's no panel off-Discord: bare `/effort` shows the current override + usage;
+`/effort <level>` sets it. `/effort` is
 owner-only on every transport (Ollama agents report it as unavailable).
 Text-mirror gating in general: `/effort`, `/session`, `/model`, `/models`,
 `/dream`, `/uncompact`, `/reload`, `/restart` are owner-only; `/reset`,

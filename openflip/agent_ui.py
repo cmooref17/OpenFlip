@@ -614,3 +614,126 @@ async def open_options_panel(interaction: nextcord.Interaction, *, runner_agent_
     view = OptionsView(owner_id=interaction.user.id, agent_id=runner_agent_id)
     await interaction.response.send_message(embed=_build_options_embed(view.agent_id), view=view, ephemeral=True)
     view.message = await interaction.original_message()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# /effort panel
+# ──────────────────────────────────────────────────────────────────────
+#
+# Unlike /model and /options (which operate on an agent, switchable via the
+# shared _AgentPicker), /effort operates on ONE conversation — the channel the
+# command was run in — because the effort override is per-conversation session
+# state, not an agent trait. So this panel takes a live conv object, has no
+# agent picker, and re-renders that same conv in place.
+
+_EFFORT_LEVELS = ["default", "low", "medium", "high", "xhigh", "max"]
+
+
+def _build_effort_embed(conv, agent) -> nextcord.Embed:
+    from .config_global import get_effort
+    e = nextcord.Embed(title="🧠 Reasoning Effort", color=0x5865F2)
+    dname = getattr(agent, "display_name", None) or getattr(agent, "id", "?")
+    aid = getattr(agent, "id", "?")
+    e.description = f"**{dname}** (`{aid}`) — THIS conversation"
+    model = conv._effective_raw_model()
+    provider = getattr(conv, "_provider_name", "") or ""
+    override = conv.effort_override
+    model_default = get_effort(model, provider)
+    effective = conv.effective_effort()
+    if override:
+        source = "this conversation (override)"
+    elif model_default:
+        source = "model default (config.json)"
+    else:
+        source = "none (API default)"
+    e.add_field(name="Effective model", value=f"`{model}`", inline=True)
+    e.add_field(name="Current effort", value=f"`{effective or 'none (API default)'}`", inline=True)
+    e.add_field(name="Source", value=source, inline=False)
+    if override:
+        # When an override is active, surface what it's beating so the operator
+        # knows what `default` would fall back to.
+        e.add_field(name="Model default", value=f"`{model_default or 'none (API default)'}`", inline=True)
+    e.set_footer(text="Pick a level below. 'default' clears the override and falls back to the model config. Takes effect on the next message.")
+    return e
+
+
+class _EffortPicker(nextcord.ui.StringSelect):
+    def __init__(self, current: Optional[str]):
+        # `current` is the active override (None when there is none). With no
+        # override the effective effort comes from the model config, and picking
+        # "default" is what keeps that state — so mark "default" as selected.
+        marked = current or "default"
+        opts = []
+        for lvl in _EFFORT_LEVELS:
+            if lvl == "default":
+                desc = "Clear override → fall back to model config"
+            else:
+                desc = f"Set effort to {lvl} for this conversation"
+            opts.append(nextcord.SelectOption(
+                label=lvl, value=lvl, description=desc,
+                default=(lvl == marked),
+            ))
+        super().__init__(
+            placeholder="Pick an effort level…",
+            options=opts, min_values=1, max_values=1, row=0,
+        )
+
+    async def callback(self, interaction: nextcord.Interaction):
+        view: "EffortView" = self.view
+        level = self.values[0]
+        conv = view.conv
+        # Mirror the slash command's set: "default" clears the override, any
+        # other level sets it. The setter validates against the provider's
+        # levels and drops silently on an invalid one.
+        conv.effort_override = None if level == "default" else level
+        try:
+            conv._save_meta()
+        except Exception:
+            pass
+        await view.refresh(interaction)
+
+
+class EffortView(nextcord.ui.View):
+    def __init__(self, owner_id: int, *, conv, agent):
+        super().__init__(timeout=_VIEW_TIMEOUT_S)
+        self.owner_id = owner_id
+        self.conv = conv
+        self.agent = agent
+        self.message: Optional[nextcord.Message] = None
+        self._build_components()
+
+    def _build_components(self):
+        self.clear_items()
+        self.add_item(_EffortPicker(self.conv.effort_override))
+        self.add_item(_CloseButton())
+
+    async def interaction_check(self, interaction: nextcord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This panel belongs to someone else.", ephemeral=True)
+            return False
+        return True
+
+    async def refresh(self, interaction: nextcord.Interaction):
+        self._build_components()
+        await interaction.response.edit_message(embed=_build_effort_embed(self.conv, self.agent), view=self)
+
+    async def on_timeout(self):
+        for c in self.children:
+            try: c.disabled = True
+            except Exception: pass
+        if self.message:
+            try: await self.message.edit(view=self)
+            except Exception: pass
+
+    def close_message(self) -> str:
+        eff = self.conv.effective_effort()
+        return f"ℹ️ Effort for THIS conversation: `{eff or 'none (API default)'}`."
+
+
+async def open_effort_panel(interaction: nextcord.Interaction, *, conv, agent):
+    if not is_owner(interaction.user.id):
+        await interaction.response.send_message("You don't have permission to run this.", ephemeral=True)
+        return
+    view = EffortView(owner_id=interaction.user.id, conv=conv, agent=agent)
+    await interaction.response.send_message(embed=_build_effort_embed(conv, agent), view=view, ephemeral=True)
+    view.message = await interaction.original_message()

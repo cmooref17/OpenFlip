@@ -138,12 +138,13 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         except Exception as e:
             print_ts(f"/compact: failed to enqueue synthetic turn: {e}", error=True)
 
-    @bot.slash_command(name="effort", description="Set the reasoning-effort override for THIS conversation (owner-only, Anthropic-only).")
+    @bot.slash_command(name="effort", description="Show or set the reasoning-effort override for THIS conversation (owner-only, Anthropic-only).")
     async def effort_cmd(
         interaction: nextcord.Interaction,
         level: str = nextcord.SlashOption(
             choices=["default", "low", "medium", "high", "xhigh", "max"],
-            description="Effort level; 'default' clears the override and falls back to the model config."),
+            default="", required=False,
+            description="Effort level; 'default' clears the override. Omit to open an interactive panel."),
     ):
         # Owner-only: /effort changes the Anthropic request body (output_config.effort)
         # for this conversation, which affects reasoning depth + billing. Mirror
@@ -158,6 +159,13 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
                 "`/effort` is Anthropic-only and there's no active conversation in this channel.",
                 ephemeral=True,
             )
+            return
+        if not level:
+            # Bare /effort → interactive panel showing the current effort + its
+            # source, mirroring /model. Setting still happens via the panel's
+            # picker or the direct `/effort <level>` form below.
+            from . import agent_ui
+            await agent_ui.open_effort_panel(interaction, conv=conv, agent=runner.agent)
             return
         if level == "default":
             conv.effort_override = None
