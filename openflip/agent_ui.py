@@ -620,59 +620,60 @@ async def open_options_panel(interaction: nextcord.Interaction, *, runner_agent_
 # /effort panel
 # ──────────────────────────────────────────────────────────────────────
 #
-# Unlike /model and /options (which operate on an agent, switchable via the
-# shared _AgentPicker), /effort operates on ONE conversation — the channel the
-# command was run in — because the effort override is per-conversation session
-# state, not an agent trait. So this panel takes a live conv object, has no
-# agent picker, and re-renders that same conv in place.
+# Same layout as /model: embed with the current value + where it comes from,
+# a picker with the CURRENT effective level pre-selected, then Refresh + Close.
+# Effort is per-conversation session state (not an agent trait), so the panel
+# operates on the live conversation the command ran in — there is no agent
+# picker because another agent has no conversation in this channel to change.
 
-_EFFORT_LEVELS = ["default", "low", "medium", "high", "xhigh", "max"]
+_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
+_EFFORT_RESET = "__default__"
+
+
+def _effort_state(conv) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
+    """(effective model, session override, model config default, effective effort)."""
+    from .config_global import get_effort
+    model = conv._effective_raw_model()
+    provider = getattr(conv, "_provider_name", "") or ""
+    return model, conv.effort_override, get_effort(model, provider), conv.effective_effort()
 
 
 def _build_effort_embed(conv, agent) -> nextcord.Embed:
-    from .config_global import get_effort
     e = nextcord.Embed(title="🧠 Reasoning Effort", color=0x5865F2)
+    model, override, model_default, effective = _effort_state(conv)
     dname = getattr(agent, "display_name", None) or getattr(agent, "id", "?")
     aid = getattr(agent, "id", "?")
-    e.description = f"**{dname}** (`{aid}`) — THIS conversation"
-    model = conv._effective_raw_model()
-    provider = getattr(conv, "_provider_name", "") or ""
-    override = conv.effort_override
-    model_default = get_effort(model, provider)
-    effective = conv.effective_effort()
+    e.description = f"**{dname}** (`{aid}`) on `{model}`"
     if override:
-        source = "this conversation (override)"
+        source = f"this conversation (model default is `{model_default or 'API default'}`)"
     elif model_default:
         source = "model default (config.json)"
     else:
-        source = "none (API default)"
-    e.add_field(name="Effective model", value=f"`{model}`", inline=True)
-    e.add_field(name="Current effort", value=f"`{effective or 'none (API default)'}`", inline=True)
-    e.add_field(name="Source", value=source, inline=False)
-    if override:
-        # When an override is active, surface what it's beating so the operator
-        # knows what `default` would fall back to.
-        e.add_field(name="Model default", value=f"`{model_default or 'none (API default)'}`", inline=True)
-    e.set_footer(text="Pick a level below. 'default' clears the override and falls back to the model config. Takes effect on the next message.")
+        source = "API default"
+    e.add_field(name="Current effort", value=f"`{effective or 'API default'}`", inline=True)
+    e.add_field(name="Source", value=source, inline=True)
+    e.set_footer(text="Pick a level below to switch this conversation. 'Reset to model default' clears the override. Takes effect on the next message.")
     return e
 
 
 class _EffortPicker(nextcord.ui.StringSelect):
-    def __init__(self, current: Optional[str]):
-        # `current` is the active override (None when there is none). With no
-        # override the effective effort comes from the model config, and picking
-        # "default" is what keeps that state — so mark "default" as selected.
-        marked = current or "default"
+    def __init__(self, conv):
+        _model, override, model_default, effective = _effort_state(conv)
         opts = []
         for lvl in _EFFORT_LEVELS:
-            if lvl == "default":
-                desc = "Clear override → fall back to model config"
+            if lvl == effective:
+                desc = "Current (this conversation)" if override else "Current (model default)"
             else:
-                desc = f"Set effort to {lvl} for this conversation"
+                desc = f"Switch this conversation to {lvl}"
             opts.append(nextcord.SelectOption(
                 label=lvl, value=lvl, description=desc,
-                default=(lvl == marked),
+                default=(lvl == effective),
             ))
+        opts.append(nextcord.SelectOption(
+            label=_truncate(f"Reset to model default ({model_default or 'API default'})", 100),
+            value=_EFFORT_RESET,
+            description="Clear this conversation's override",
+        ))
         super().__init__(
             placeholder="Pick an effort level…",
             options=opts, min_values=1, max_values=1, row=0,
@@ -680,17 +681,34 @@ class _EffortPicker(nextcord.ui.StringSelect):
 
     async def callback(self, interaction: nextcord.Interaction):
         view: "EffortView" = self.view
-        level = self.values[0]
         conv = view.conv
-        # Mirror the slash command's set: "default" clears the override, any
-        # other level sets it. The setter validates against the provider's
-        # levels and drops silently on an invalid one.
-        conv.effort_override = None if level == "default" else level
+        choice = self.values[0]
+        _model, override, _default, effective = _effort_state(conv)
+        # No-op picks (the level it's already on, or reset with no override)
+        # — same as /model picking the model it's already on.
+        if choice == _EFFORT_RESET:
+            if not override:
+                await interaction.response.defer()
+                return
+            conv.effort_override = None
+        else:
+            if choice == effective:
+                await interaction.response.defer()
+                return
+            conv.effort_override = choice
         try:
             conv._save_meta()
         except Exception:
             pass
         await view.refresh(interaction)
+        new_eff = conv.effective_effort()
+        try:
+            await interaction.followup.send(
+                f"✅ Effort → `{new_eff or 'API default'}` for this conversation (takes effect on the next message).",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
 
 
 class EffortView(nextcord.ui.View):
@@ -704,7 +722,8 @@ class EffortView(nextcord.ui.View):
 
     def _build_components(self):
         self.clear_items()
-        self.add_item(_EffortPicker(self.conv.effort_override))
+        self.add_item(_EffortPicker(self.conv))
+        self.add_item(_RefreshModelsButton())
         self.add_item(_CloseButton())
 
     async def interaction_check(self, interaction: nextcord.Interaction) -> bool:
@@ -727,7 +746,8 @@ class EffortView(nextcord.ui.View):
 
     def close_message(self) -> str:
         eff = self.conv.effective_effort()
-        return f"ℹ️ Effort for THIS conversation: `{eff or 'none (API default)'}`."
+        dname = getattr(self.agent, "display_name", None) or getattr(self.agent, "id", "?")
+        return f"ℹ️ Effort kept as `{eff or 'API default'}` for **{dname}** (this conversation)."
 
 
 async def open_effort_panel(interaction: nextcord.Interaction, *, conv, agent):
