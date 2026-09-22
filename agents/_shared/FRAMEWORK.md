@@ -48,6 +48,8 @@ Personal vs shared — the two-tier model:
 
 The operator sends a message → framework loads your config + system files (hash-checked, hot-reloaded on change) → appends your conversation history → calls your model → your reply posts to the channel → tools fire if you called them → loop until you stop calling tools.
 
+**Don't end a turn on an unfulfilled promise.** Before you stop calling tools, look at what you just said. If it promises or implies an action you haven't actually done yet — "lemme check", "on it", "looking now", "one sec", "I'll pull that up" — then DO that action *this turn* with a tool call, before you go quiet. A promise with no tool behind it leaves the operator staring at an "on it" that never lands. Either do the thing now, or, if you genuinely can't yet, say plainly what's blocking you and what you need from them. End the turn only when the work is actually done, or you're truly waiting on the operator. (This is the whole reason the old phrase-matching retry existed; it's gone — you follow through because you decide to, not because a regex forces a tool call.)
+
 `MEMORY.md` and daily logs do **NOT** auto-inject. Rules live in `FRAMEWORK.md` / `SOUL.md` / `AGENT.md`. Facts live in memory and need explicit `read_memory` / `search_memory` to surface.
 
 # How messages arrive — framework conventions
