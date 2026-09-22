@@ -138,14 +138,10 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         except Exception as e:
             print_ts(f"/compact: failed to enqueue synthetic turn: {e}", error=True)
 
-    @bot.slash_command(name="effort", description="Show or set the reasoning-effort override for THIS conversation (owner-only, Anthropic-only).")
-    async def effort_cmd(
-        interaction: nextcord.Interaction,
-        level: str = nextcord.SlashOption(
-            choices=["default", "low", "medium", "high", "xhigh", "max"],
-            default="", required=False,
-            description="Effort level; 'default' clears the override. Omit to open an interactive panel."),
-    ):
+    @bot.slash_command(name="effort", description="(owner) Show or change THIS conversation's reasoning effort — interactive panel.")
+    async def effort_cmd(interaction: nextcord.Interaction):
+        # No options, exactly like /model: the panel shows the current effort +
+        # its source and the picker inside it sets/clears the override.
         # Owner-only: /effort changes the Anthropic request body (output_config.effort)
         # for this conversation, which affects reasoning depth + billing. Mirror
         # /compact's gating.
@@ -160,30 +156,8 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
                 ephemeral=True,
             )
             return
-        if not level:
-            # Bare /effort → interactive panel showing the current effort + its
-            # source, mirroring /model. Setting still happens via the panel's
-            # picker or the direct `/effort <level>` form below.
-            from . import agent_ui
-            await agent_ui.open_effort_panel(interaction, conv=conv, agent=runner.agent)
-            return
-        if level == "default":
-            conv.effort_override = None
-            conv._save_meta()
-            await interaction.response.send_message(
-                "⚙️ Effort override cleared for THIS conversation — falling back to the model default.",
-                ephemeral=True,
-            )
-            return
-        # SlashOption choices are enforced by Discord, so `level` is one of the
-        # five valid levels here; _effort_level re-validates defensively anyway.
-        conv.effort_override = level
-        conv._save_meta()
-        await interaction.response.send_message(
-            f"⚙️ Effort for THIS conversation set to `{level}` (overrides the model default). "
-            f"Use `/effort default` to clear.",
-            ephemeral=True,
-        )
+        from . import agent_ui
+        await agent_ui.open_effort_panel(interaction, conv=conv, agent=runner.agent)
 
     @bot.slash_command(name="session", description="(owner) Show or change THIS conversation's session overrides — model, context, effort, memory…")
     async def session_cmd(

@@ -2813,16 +2813,15 @@ deletes the sidecar with the history, so overrides don't survive a reset.
 
 ### `/effort` — per-conversation override (owner-only, Anthropic + OpenAI)
 
-`/effort <level>` is the short form of `/session set effort <level>` — a
-session-level effort override for THIS conversation that beats the model
-config above. Choices: `low`/`medium`/`high`/`xhigh`/`max` (OpenAI:
+`/effort` sets a session-level effort override for THIS conversation that
+beats the model config above (same thing as `/session set effort <level>`).
+On Discord the slash command takes NO options, exactly like `/model`: it
+opens an interactive panel showing the current effective effort and its
+**source** (this conversation's override, the per-model `config.json`
+default, or none/API default), with a picker to change it in place. Choices:
+`low`/`medium`/`high`/`xhigh`/`max` (OpenAI:
 `minimal`/`low`/`medium`/`high`/`xhigh`), plus `default` to CLEAR the override
-and fall back to the model config. The `level` argument is OPTIONAL: a bare
-`/effort` (Discord slash) opens an interactive panel — same style as `/model` —
-showing the current effective effort and its **source** (this conversation's
-override, the per-model `config.json` default, or none/API default), with a
-picker to change it in place. `/effort <level>` still sets (or clears, with
-`default`) the override directly without the panel. The override persists
+and fall back to the model config. The override persists
 per-conversation in the `.meta.json` sidecar (`overrides.effort`; a pre-2026-09
 top-level `effort_override` key is still read and migrated on load, never
 written), so it survives restarts. It takes effect on the next real turn (no
