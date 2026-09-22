@@ -21,7 +21,6 @@ from .utils import print_ts, COLOR_YELLOW, COLOR_RED, COLOR_GREEN, COLOR_END, sa
 from .acl import is_owner
 from .registry import RUNNERS
 from .turn_retries import (
-    action_promise_should_retry,
     classify_empty_turn,
     detect_peer_prose,
     build_peer_prose_nudge,
@@ -2551,11 +2550,6 @@ class AgentRunner:
                             and turn_count == 1
                             and not is_chain_terminator):
                         _tc_this_turn = force_tool_choice
-                    # Sticky override from action-promise retry. Consumed
-                    # immediately so it only fires once.
-                    if locals().get("_force_next_tc"):
-                        _tc_this_turn = _force_next_tc
-                        _force_next_tc = None
 
                     # ===== Call the model =====
                     # `chat()` consumes `chat_stream()` internally (see
@@ -2694,25 +2688,6 @@ class AgentRunner:
                         print_ts(f"  ← {_prov} replied  tool_calls={[t.function_name for t in _tc]} done={_done}", agent=agent.id)
                     elif _ct.strip():
                         print_ts(f"  ← {_prov} replied  text={_ct[:80].replace(chr(10),' ')!r} done={_done}", agent=agent.id)
-                        # Action-promise retry: if the text reads like an
-                        # action-commitment ("lemme look", "imma do it",
-                        # etc.) but no tool_use accompanied it, retry the
-                        # same turn forcing tool_choice=any so the model
-                        # must emit a tool. Cap at 1 retry per turn.
-                        # Kill switch: OPENFLIP_DISABLE_ACTION_PROMISE_RETRY=1.
-                        # Decision logic extracted to turn_retries.py.
-                        if action_promise_should_retry(
-                                _ct, bool(locals().get("_force_tool_retry_used"))):
-                            _force_tool_retry_used = True
-                            print_ts(
-                                f"{COLOR_YELLOW}{log_tag}action-promise detected without tool — retrying with tool_choice=any{COLOR_END}",
-                                agent=agent.id,
-                            )
-                            # Sticky flag — survives the loop iteration reset.
-                            # Picked up by the tool_choice assignment block
-                            # at the top of the next iteration.
-                            _force_next_tc = {"type": "any"}
-                            continue
                         # Peer-prose leak detection. If text starts with
                         # "<peer_agent_id>: " (or "<peer_agent_id> ,"
                         # or "<peer_agent_id> —"), the model is addressing
@@ -2908,14 +2883,10 @@ class AgentRunner:
                                         conv.messages.append(
                                             ChatMessage('user', _shr.suggested_user_message)
                                         )
-                                    # CRITICAL: force tool_choice=any on the retry so the
-                                    # API mechanically REQUIRES a tool_use block in the
-                                    # response. Without this, the model just reads the
-                                    # nudge and emits another text-only "okay sorry"
-                                    # reply — same defective shape, same operator
-                                    # frustration. This mirrors claude_code's
-                                    # forceToolUseRetry path (see audits/claude_code_full_port).
-                                    _force_next_tc = {"type": "any"}
+                                    # Re-prompt with the injected nudge and let the model
+                                    # answer normally. We do NOT force tool_choice: Opus 5.5
+                                    # rejects it, and Claude Code nudges via instruction, not a
+                                    # forced tool call.
                                     continue
                                 except Exception as _inject_err:
                                     print_ts(
