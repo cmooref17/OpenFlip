@@ -46,9 +46,9 @@ agents/<id>/
 ├── TOOLS.md              # Per-agent extension of _shared/TOOLS.md. Auto-created empty, auto-injected by default. Empty = no-op.
 ├── REMINDER.md           # (optional, legacy) Plain system file — loads ONLY if listed in system_files (some agents do). The per-turn uncached end-of-payload injection mechanic was REMOVED; no special handling remains.
 ├── HEARTBEAT.md          # (optional) Prompt loaded when a `heartbeat:true` cron job fires.
-├── MEMORY.md             # Core memory. NOT auto-loaded — accessed via memory tools.
+├── MEMORY.md             # Memory INDEX, one line per topic file. Auto-loaded every turn (200 lines / 25k chars cap).
 ├── conversations/        # Per-channel <conv_id>.jsonl + <conv_id>.meta.json. Auto-managed.
-├── memory/               # Daily logs (YYYY-MM-DD.md) + index.json (embeddings).
+├── memory/               # topics/<slug>.md (one file per subject) + daily logs (YYYY-MM-DD.md) + index.json (embeddings).
 └── chain_state.json      # In-flight inter-agent chain IDs. Persisted across restarts.
 ```
 
@@ -640,22 +640,30 @@ problem.
 
 ## Memory
 
-- **`save_memory(text: str)`** — append `text` to today's daily log
-  (`agents/<id>/memory/YYYY-MM-DD.md`) with a timestamp and update the
-  embedding index. Auto-injected when `memory_enabled: true`.
-- **`update_core_memory(content: str)`** — overwrite `MEMORY.md` with
-  `content`. Read the file first; you are responsible for preserving
-  what should stay. The existing file is snapshotted to `.snapshots/`
-  before the overwrite, so a bad rewrite is recoverable via
-  `restore_snapshot`.
-- **`search_memory(query: str)`** — cosine-similarity search across
-  `MEMORY.md` + daily logs using the embedding model in `config.json`.
-  Top-5 results above a 0.3 threshold.
-- **`read_memory(file: str = "")`** — empty arg reads `MEMORY.md`. A
-  date (`"2026-05-21"`) reads that day's log.
-- **`list_memory_files()`** — list daily logs with dates and sizes.
+- **`save_memory(text: str, topic: str = "")`** — with `topic`: append a
+  dated line to `agents/<id>/memory/topics/<slug>.md` (created if new) and
+  keep that topic's line in the `MEMORY.md` index current (MEMORY.md is
+  only rewritten when the line actually changes, to spare the prompt
+  cache). Without `topic`: append to today's daily log
+  (`memory/YYYY-MM-DD.md`). Either way the embedding index is updated.
+  Auto-injected when `memory_enabled: true`.
+- **`update_core_memory(content: str)`** — rewrite the `MEMORY.md` INDEX
+  wholesale (reorder, retitle, drop stale lines). Index lines only:
+  `- [Title](memory/topics/<slug>.md) — short hook`. Free-form content is
+  split back into topic files on the next turn. The existing file is
+  snapshotted to `.snapshots/` first; `restore_snapshot` undoes a bad
+  rewrite.
+- **`search_memory(query: str)`** — cosine-similarity search across the
+  index, every topic file and the daily logs, using the embedding model
+  in `config.json`. Top-5 results above a 0.3 threshold.
+- **`read_memory(file: str = "")`** — empty arg reads `MEMORY.md`;
+  `"topics/<slug>"` reads a topic file; a date (`"2026-05-21"`) reads
+  that day's log.
+- **`list_memory_files()`** — list MEMORY.md, topic files and daily logs
+  with sizes.
 - **`dream()`** — run the 4-phase memory-consolidation pass NOW (reads
-  MEMORY.md + daily logs, rewrites core memory via `update_core_memory`).
+  the index + daily logs, files durable facts into topic files via
+  `save_memory(topic=...)`, keeps MEMORY.md a clean index).
   Same pass the `/dream` command and auto-dream fire (see §10).
   Registered like any tool; usually owner-gated.
   It writes the FULL corpus (MEMORY.md + ALL daily logs, nothing
@@ -1127,24 +1135,41 @@ are serialized. Blank auto-injected entries don't pollute on-disk
 
 # 6. Memory
 
-Two tiers, both per-agent (other agents cannot read yours).
+Three pieces, all per-agent (other agents cannot read yours). Same shape
+as Claude Code's auto memory.
 
-## Core memory — `MEMORY.md`
+## The index — `MEMORY.md` (auto-loaded)
 
-One file. Lasting facts: preferences, decisions, anchors, things that
-are TRUE across days. Not auto-loaded into the prompt — you read it
-with `read_memory()`. Updated via `update_core_memory(content)` — pass
-the full new contents; you are responsible for preserving prior facts.
+One line per topic file: `- [Title](memory/topics/<slug>.md) — short
+hook`. `runtime._run_turn` appends it to the system extension EVERY turn
+when memory is on for the conversation (same gate as the memory tools,
+so `/session set memory off` hides it too), capped at 200 lines / 25,000
+chars (`openflip/memory_index.py`, same caps as Claude Code 2.1.280's
+loader). Past the cap the rest is cut and a warning in the prompt names
+exactly what was lost. Every index change rewrites the cached system
+prefix once, so it should change rarely.
 
-Promote a fact to core when: it's mentioned more than once, the
-operator states a lasting preference, or future-you would need it after
-a context wipe.
+An old free-form MEMORY.md converts itself the first time it loads: the
+original is copied to `MEMORY.md.pre-index-<stamp>.bak`, each `## `
+section becomes a topic file, loose text above the first `## ` becomes
+`general_notes`, and MEMORY.md becomes the index. Nothing is deleted;
+an O_EXCL lock stops two workers converting at once. No operator step.
+
+## Topic files — `memory/topics/<slug>.md` (read on demand)
+
+One file per SUBJECT (a person, a project, a rule and its why), with a
+small frontmatter block (`name`, `description`, `modified`). Written by
+`save_memory(text, topic=...)`; opened with `read_memory("topics/<slug>")`
+when an index line matters. File a fact under a topic when it's
+mentioned more than once, the operator states a lasting preference or
+correction, or future-you would need it after a context wipe.
 
 ## Daily logs — `memory/YYYY-MM-DD.md`
 
-Append-only. Today's events. `save_memory(text)` adds a timestamped
-line; the framework auto-creates today's file if missing. Search across
-both tiers with `search_memory(query)`. List dates with
+Append-only. Today's events. `save_memory(text)` with no topic adds a
+timestamped line; the framework auto-creates today's file if missing.
+Search the index, topic files and logs together with
+`search_memory(query)`. List dates with
 `list_memory_files()`.
 
 Memory is FACTS. Behavioral rules go in `SOUL.md` / `AGENT.md` /
@@ -1899,7 +1924,7 @@ when disabled. Default interval 30 min.
 
 STATUS: live. Auto-fire is wired (`openflip/dream_autofire.py` +
 end-of-turn hook in `runtime._run_turn`). Unlike kairos, a dream is
-INVISIBLE — it rewrites `MEMORY.md` in the background and NEVER messages
+INVISIBLE — it files facts into topic files in the background and NEVER messages
 the operator (kairos pinged and got killed; dream does not).
 
 DREAM is NOT a cron job. The check is event-driven: it runs at the end of
@@ -1907,8 +1932,8 @@ a cleanly-completed, top-level, operator-driven turn. Synthetic /
 subagent / chain turns are excluded, so the dream's own (synthetic) turn
 can never recursively trigger another dream. When all gates pass it fires
 a `/dream`-equivalent SILENT synthetic turn — reusing the existing
-`dream()` tool + 4-phase consolidation prompt — which calls
-`update_core_memory()` and stops. Manual `/dream` is unchanged and
+`dream()` tool + 4-phase consolidation prompt — which files facts with
+`save_memory(topic=...)`, tidies the index, and stops. Manual `/dream` is unchanged and
 ignores `dream.enabled`.
 
 The tool spills the FULL corpus (MEMORY.md + ALL daily logs, nothing
@@ -1971,7 +1996,7 @@ a lock older than 30 min is treated as a crashed pass and stolen.
 
 Always fires `auto_post_final_text=False` + `silent=True`,
 `originator_visibility="dream"`. Nothing reaches Discord; the only
-artifact is the rewritten `MEMORY.md`. The fire is logged
+artifacts are the updated topic files and index. The fire is logged
 (`dream_autofire` event) for audit.
 
 ## Speaker attribution (security)
@@ -2106,7 +2131,7 @@ have it.
 ## Isolation
 
 You cannot read another agent's:
-- `MEMORY.md` (path ACL).
+- `MEMORY.md` or `memory/topics/` (path ACL).
 - Conversation `.jsonl` files (path ACL).
 - `agent.json` (default read scope is your own dir + the system temp
   dir).
@@ -2526,17 +2551,16 @@ The default injection order is:
 `SOUL.md → _shared/FRAMEWORK.md → AGENT.md → _shared/TOOLS.md → TOOLS.md`.
 An empty personal file is a no-op, so a not-yet-written one costs nothing.
 
-## Update core memory
+## Save a lasting fact / edit the memory index
 
 ```
-update_core_memory("""
-# Operator
-...current MEMORY.md contents with edits...
-""")
+save_memory("Prefers short replies.", topic="operator_preferences")
 ```
 
-Read first (`read_memory()`), edit the string, write the whole file
-back. There is no partial-update tool — the whole file is replaced.
+Appends to `memory/topics/operator_preferences.md` and adds or refreshes
+its line in the MEMORY.md index. To reorder, retitle or drop index
+lines, read the index (`read_memory()`) and write it back whole with
+`update_core_memory(...)` — index lines only.
 The previous MEMORY.md is snapshotted before the overwrite; a bad
 rewrite can be undone with
 `restore_snapshot("agents/<id>/MEMORY.md", index=0)`.
@@ -2681,11 +2705,11 @@ Possible causes:
    `conversations/`.
 2. `/compact` archived old history into a compaction summary. Check
    `.compaction_*.bak.jsonl`.
-3. The fact was never saved. Memory is opt-in via `save_memory` /
-   `update_core_memory`. Conversation history is per-channel — facts
-   from one channel don't leak to another. To make a fact survive
-   `/reset` or cross-channel, it has to be in `MEMORY.md` or a daily
-   log.
+3. The fact was never saved. Memory is opt-in via `save_memory`.
+   Conversation history is per-channel — facts from one channel don't
+   leak to another. To make a fact survive `/reset` or cross-channel,
+   it has to be in a topic file (listed in the auto-loaded MEMORY.md
+   index) or a daily log.
 4. Anthropic auto-compaction summarized it. Check `.meta.json` for
    `compaction_block`. `/uncompact` restores.
 

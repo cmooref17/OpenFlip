@@ -2179,6 +2179,26 @@ class AgentRunner:
         if not _mem_enabled:
             callable_funcs = strip_memory_tools(callable_funcs)
             api_tool_funcs = strip_memory_tools(api_tool_funcs)
+        # Memory index auto-load (Claude-Code-style): MEMORY.md is an index of
+        # topic files and rides in the system prompt every turn, capped at
+        # 200 lines / 25k chars. Same gate as the memory tools above, so a
+        # memory-off conversation never sees it. Appended after the
+        # agent-stable extension: it only changes when the index itself does,
+        # so the cached system prefix survives ordinary turns. An old-style
+        # MEMORY.md converts itself here on first load (backup kept).
+        if _mem_enabled and agent.memory_enabled:
+            try:
+                from .memory_index import load_index_block
+                _mem_block = load_index_block(os.path.dirname(agent.path))
+                if _mem_block:
+                    system_extension = (
+                        f"{system_extension}\n\n{_mem_block}" if system_extension else _mem_block
+                    )
+            except Exception as _mem_err:
+                print_ts(
+                    f"{COLOR_YELLOW}memory index load failed (continuing without it): {_mem_err}{COLOR_END}",
+                    agent=agent.id,
+                )
         # Conversation key for every _pending_inject/_active_turns access in
         # this turn. For identity-linked (forwarded) conversations this is the
         # PRIMARY conversation_id string (shared across transports); otherwise

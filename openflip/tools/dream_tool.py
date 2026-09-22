@@ -9,8 +9,9 @@ file drifts past any sane size.
 This tool does NOT call an LLM itself. Instead it gathers the memory surface
 (MEMORY.md in full + every daily log) and hands the agent a 4-phase
 consolidation prompt as the tool result. The AGENT then does the actual
-distillation reasoning and writes the consolidated result back by calling
-`update_core_memory` (see memory.py). This mirrors search_memory's pattern:
+distillation reasoning and files the results into topic files with
+`save_memory(text, topic=...)`, keeping MEMORY.md a one-line-per-topic index
+(see memory.py / memory_index.py). This mirrors search_memory's pattern:
 the tool gathers + presents, the model reasons.
 
 Payload budget — why a SPILL FILE, not an inline dump:
@@ -28,10 +29,10 @@ Payload budget — why a SPILL FILE, not an inline dump:
 
 Phases the agent is asked to perform:
     1. Orient    — read MEMORY.md + the daily logs (inline preview + spill file).
-    2. Consolidate — distill into durable facts; convert relative dates to
-                     absolute dates BEFORE writing.
+    2. Consolidate — distill into durable facts filed under topic files;
+                     convert relative dates to absolute dates BEFORE writing.
     3. Prune     — DELETE facts that were later contradicted.
-    4. Cap       — keep MEMORY.md under max_memory_chars.
+    4. Cap       — keep the MEMORY.md index under max_memory_chars.
 
 Triggering: manual /dream command or a direct dream() tool call. The per-agent
 `dream.enabled` flag gates only AUTO-fire (which is wired up separately); it
@@ -241,24 +242,25 @@ def _build_consolidation_prompt(agent_id: str, agent_dir: str, max_memory_chars:
     )
     task_section = (
         "=== YOUR TASK ===\n"
-        "Consolidate the memory surface into a single, clean MEMORY.md. Work "
-        "through four phases:\n"
-        "  1. ORIENT — read MEMORY.md and the daily logs. The inline preview "
-        "below may be partial; the FULL corpus is in the spill file named in the "
-        "index above — read it (or the relevant daily logs) before pruning.\n"
+        "Consolidate the daily logs into your topic files, keeping MEMORY.md a "
+        "clean INDEX (one line per topic file). Work through four phases:\n"
+        "  1. ORIENT — read the MEMORY.md index above and the daily logs. The "
+        "inline preview may be partial; the FULL corpus is in the spill file "
+        "named above — read it before pruning. Open topic files with "
+        "read_memory(file=\"topics/<slug>\").\n"
         "  2. CONSOLIDATE — distill the raw events into durable, standalone "
-        "facts. Merge duplicates. Convert every relative date to an absolute "
-        f"YYYY-MM-DD date (today is {today}).\n"
-        "  3. PRUNE — DELETE any fact that a later entry contradicted or "
-        "superseded. Keep only what is still true. Do not keep both sides of a "
-        "contradiction.\n"
-        f"  4. CAP — keep the final MEMORY.md under {max_memory_chars} "
-        "characters. If it would exceed that, drop the least important / "
-        "least durable details first.\n\n"
-        "When you have the consolidated text ready, call update_core_memory() "
-        "with the COMPLETE new MEMORY.md content (it overwrites the whole "
-        "file). Do not summarize your changes to the user unless asked — just "
-        "perform the consolidation and write it back."
+        "facts and file each under its topic with save_memory(text, topic=...) "
+        "(existing topic when one fits, new topic otherwise). Convert every "
+        "relative date to an absolute YYYY-MM-DD date (today is "
+        f"{today}).\n"
+        "  3. PRUNE — delete facts a later entry contradicted or superseded. "
+        "Fix a topic file in place with edit_file when you hold file tools; "
+        "never keep both sides of a contradiction.\n"
+        f"  4. CAP — keep MEMORY.md an index under {max_memory_chars} "
+        "characters: one short line per topic, no details. Drop or merge "
+        "stale lines with update_core_memory() if needed.\n\n"
+        "Do not summarize your changes to the user unless asked — just "
+        "perform the consolidation."
     )
 
     # Mandatory inline chars: header + core + index + task, plus slack for the
