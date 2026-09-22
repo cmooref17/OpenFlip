@@ -15,6 +15,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import shutil
+import subprocess
 import time
 from contextlib import aclosing
 from typing import Any, Callable, Optional
@@ -133,7 +136,59 @@ _KEYCHAIN_SERVICE = "Claude Code-credentials"
 # entry that Claude Code refreshes.
 _KEYCHAIN_ACCOUNT = os.environ.get("USER") or "Claude Code"
 _DEFAULT_API_BASE = "https://api.anthropic.com"
-_DEFAULT_USER_AGENT = "claude-code/2.1.153"
+
+# Last-resort fallback ONLY if version detection below fails entirely. This is
+# a floor (the current known-good minimum Anthropic accepts for newer models),
+# NOT the source of truth — the real installed Claude Code version is detected
+# dynamically by _detect_claude_code_version(). Bump only if the floor itself
+# stops being accepted.
+_CC_VERSION_FLOOR = "2.1.280"
+_CC_VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
+
+
+def _detect_claude_code_version() -> str:
+    """Return the installed Claude Code version (e.g. "2.1.280").
+
+    Strategy, in order of preference:
+      1. Resolve `claude` on PATH, realpath it, and pull the `.../versions/<V>`
+         segment out of the resolved path (fast, no subprocess).
+      2. Run `claude --version` and parse the leading X.Y.Z from stdout.
+      3. Fall back to _CC_VERSION_FLOOR.
+
+    Every strategy is wrapped so a detection failure can never crash import.
+    """
+    # Strategy 1: resolve the symlink and read the versions/<V> path segment.
+    try:
+        exe = shutil.which("claude")
+        if exe:
+            resolved = os.path.realpath(exe)
+            parts = resolved.split(os.sep)
+            if "versions" in parts:
+                candidate = parts[parts.index("versions") + 1]
+                if _CC_VERSION_RE.match(candidate):
+                    return _CC_VERSION_RE.match(candidate).group(0)
+    except Exception:
+        pass
+
+    # Strategy 2: ask the CLI directly.
+    try:
+        out = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        m = _CC_VERSION_RE.search(out or "")
+        if m:
+            return m.group(0)
+    except Exception:
+        pass
+
+    # Strategy 3: last-resort floor.
+    return _CC_VERSION_FLOOR
+
+
+# Detected ONCE at import — the installed CLI version can't change mid-process.
+_DETECTED_CC_VERSION = _detect_claude_code_version()
+_DEFAULT_USER_AGENT = f"claude-code/{_DETECTED_CC_VERSION}"
 _DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 _CLAUDE_CODE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 _OAUTH_REFRESH_URL = "https://platform.claude.com/v1/oauth/token"
@@ -2136,7 +2191,7 @@ class AnthropicConversation(SessionOverridesMixin):
         # Billing block (claude-cli routing) + cached system prompt.
         _BILLING_BLOCK = {
             "type": "text",
-            "text": "x-anthropic-billing-header: cc_version=2.1.142; cc_entrypoint=sdk-cli; cch=00000;",
+            "text": f"x-anthropic-billing-header: cc_version={_DETECTED_CC_VERSION}; cc_entrypoint=sdk-cli; cch=00000;",
         }
         system_blocks = [_BILLING_BLOCK]
         if system_prompt:
