@@ -140,6 +140,8 @@ Design for the future shape of the system, not just the current one. Flexibility
 
 Drift between similar code paths is debt even when each individual choice is defensible. Converge on the right pattern.
 
+**Never hardcode values that mirror something outside the code.** Versions, model IDs, API minimums, install paths, anything that can change without a code change: read it from its real source at runtime (the installed binary, config, the API). If a fallback literal is truly unavoidable, comment it as a last-resort floor, not the source of truth. A hardcoded copy of external state goes stale silently and breaks every agent the day the outside world moves (2026-09-22: a hardcoded Claude Code version in the User-Agent locked every agent out of a new model). When you find one, fix it at the source the same turn.
+
 # Multi-agent collaboration
 
 When working with another agent on a shared task:

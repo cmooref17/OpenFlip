@@ -2262,7 +2262,8 @@ non-content errors and does NOT append them to conversation history
 
 ## Request shape for /v1/messages
 
-- `User-Agent` must match a Claude Code-shaped UA (`_DEFAULT_USER_AGENT`).
+- `User-Agent` must match a Claude Code-shaped UA (`_DEFAULT_USER_AGENT` = `claude-code/<installed version>`). The version is detected ONCE at import by `_detect_claude_code_version()`: resolve the `claude` symlink → `versions/<V>` path segment, else `claude --version`, else `_CC_VERSION_FLOOR`. The billing block's `cc_version` uses the same value. Newer models 400 on old versions ("Claude Code X does not support this model") — fix is `claude update` **then restart the gateway** (detection is cached per process).
+- No server-side fallback beta is sent: an Opus 5.x/Fable classifier refusal (`stop_reason: refusal`) is NOT retried on another model. Only an EMPTY refusal is surfaced (`⚠️ Model declined (category=…)`); a refusal after partial text just ends the reply with no warning.
 - `anthropic-version` header.
 - `anthropic-beta` header with required flags:
   `claude-code-20250219,oauth-2025-04-20,extended-cache-ttl-2025-04-11,compact-2026-01-12`
