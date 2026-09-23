@@ -2407,6 +2407,33 @@ class AgentRunner:
             framed_user = f"{user_preamble}\n\n---\n\n{user_text}"
         else:
             framed_user = user_text
+        # Memory recall (Claude-Code-style, see openflip/memory_recall.py): on
+        # a human turn a person is waiting on, a small selector model picks up
+        # to 5 relevant topic files and their bodies ride on THIS user message
+        # (not the system prompt, so the cached prefix stays stable). Same
+        # memory gate as the index; never repeats a file in a conversation;
+        # any failure returns "" and the turn proceeds without it.
+        if (_mem_enabled and agent.memory_enabled and operator_facing_turn(
+                auto_post_final_text=auto_post_final_text, silent=silent,
+                is_chain_terminator=is_chain_terminator,
+                originator_agent_id=originator_agent_id,
+                auto_route_from_peer=auto_route_from_peer, log_tag=log_tag)):
+            try:
+                from .memory_recall import RecallState, recall_block
+                _rstate = getattr(conv, "_memory_recall_state", None)
+                if _rstate is None:
+                    _rstate = RecallState()
+                    conv._memory_recall_state = _rstate
+                _recalled = await recall_block(
+                    os.path.dirname(agent.path), user_text, _rstate, agent_id=agent.id,
+                )
+                if _recalled:
+                    framed_user = f"{framed_user}\n\n{_recalled}"
+            except Exception as _recall_err:
+                print_ts(
+                    f"{COLOR_YELLOW}memory recall skipped: {_recall_err}{COLOR_END}",
+                    agent=agent.id,
+                )
         conv.messages.append(ChatMessage('user', framed_user))
 
         async def _restore_system():

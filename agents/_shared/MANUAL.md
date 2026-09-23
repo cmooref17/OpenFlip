@@ -1155,6 +1155,35 @@ section becomes a topic file, loose text above the first `## ` becomes
 `general_notes`, and MEMORY.md becomes the index. Nothing is deleted;
 an O_EXCL lock stops two workers converting at once. No operator step.
 
+## Recall — relevant topic files, per turn (auto)
+
+On an operator-facing human turn with memory on, `runtime._run_turn`
+calls `memory_recall.recall_block()` before appending the user message.
+It mirrors Claude Code 2.1.280's recall supervisor:
+
+- Candidates: one line per topic file, `- filename (mtime): description`
+  (from frontmatter), minus files already recalled in this conversation.
+- Selector: a separate one-shot Anthropic call (`memory_recall_api.py`,
+  same OAuth + headers as the chat provider) with CC's selector prompt
+  verbatim. Model: config.json `memory_recall.model`, else the newest
+  anthropic `sonnet` in the `models` block. Up to 5 filenames.
+- Inject: each chosen file capped at 200 lines / 4096 bytes (truncation
+  note points at `read_memory`), appended to the turn's USER message in a
+  `<relevant-memories>` block prefixed "Retrieved for possible relevance
+  — use only if it actually applies to what the user asked." User message,
+  not system prompt, so the cached prefix is untouched.
+- Limits: skipped for empty / one-word messages (except CJK), per-
+  conversation dedupe, 61,440 recalled bytes per conversation (state is in
+  memory; resets on `/reset` or restart).
+- Never breaks a turn: any selector/network error logs `memory recall
+  failed` and the turn continues without it. Log line on success:
+  `memory recall: N/M via <model> in Xs [files]`.
+- Off: `"memory_recall": {"enabled": false}` in config.json, or env
+  `OPENFLIP_DISABLE_MEMORY_RECALL=1`. Not run on cron / peer / synthetic
+  turns.
+
+Keep each topic file's `description` accurate: it's all the selector sees.
+
 ## Topic files — `memory/topics/<slug>.md` (read on demand)
 
 One file per SUBJECT (a person, a project, a rule and its why), with a
