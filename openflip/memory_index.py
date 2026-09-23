@@ -31,6 +31,9 @@ _INDEX_LINE_RE = re.compile(r"^- \[(?P<title>[^\]]+)\]\((?P<path>[^)\s]+)\)")
 _SECTION_RE = re.compile(r"^## +(?P<title>.+?)\s*$")
 _SLUG_OK_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,79}$")
 _LOCK_STALE_S = 60
+# Claude Code 2.1.280's four memory types (metadata.type in its frontmatter).
+MEMORY_TYPES = ("user", "feedback", "project", "reference")
+_FM_RE = re.compile(r"^---\n(.*?)\n---\n", re.S)
 
 
 def memory_md_path(agent_dir: str) -> str:
@@ -96,10 +99,28 @@ def index_line(title: str, slug: str, hook: str) -> str:
     return f"- [{title}]({topic_rel(slug)})" + (f" — {hook}" if hook else "")
 
 
-def topic_text(slug: str, title: str, hook: str, body: str) -> str:
-    desc = (hook or "").replace('"', "'")
+def _one_line(text: str, limit: int = HOOK_MAX_CHARS) -> str:
+    s = re.sub(r"\s+", " ", (text or "").replace("**", "").replace("`", "")).strip()
+    return s if len(s) <= limit else s[:limit - 1].rstrip() + "…"
+
+
+def read_meta(text: str) -> dict:
+    """Frontmatter fields of a topic file ({} when it has none)."""
+    m = _FM_RE.match(text or "")
+    out: dict = {}
+    if m:
+        for line in m.group(1).splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                out[k.strip()] = v.strip().strip('"')
+    return out
+
+
+def topic_text(slug: str, title: str, hook: str, body: str, mtype: str = "") -> str:
+    desc = _one_line(hook).replace('"', "'")
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
-    return (f"---\nname: {slug}\ndescription: \"{desc}\"\nmodified: {stamp}\n---\n\n"
+    type_line = f"type: {mtype}\n" if mtype in MEMORY_TYPES else ""
+    return (f"---\nname: {slug}\ndescription: \"{desc}\"\n{type_line}modified: {stamp}\n---\n\n"
             f"# {title}\n\n{body.strip()}\n")
 
 
@@ -253,13 +274,19 @@ def load_index_block(agent_dir: str) -> str:
             "with save_memory(text, topic=...).\n\n" + cap_index(content))
 
 
-def upsert_topic(agent_dir: str, slug: str, title: str, text: str, *, replace: bool = False) -> tuple[str, bool]:
+def upsert_topic(agent_dir: str, slug: str, title: str, text: str, *, replace: bool = False,
+                 description: str = "", mtype: str = "") -> tuple[str, bool]:
     """Append (or with replace=True overwrite) a topic file's body and make sure
-    MEMORY.md has its index line. Returns (topic_path, created)."""
+    MEMORY.md has its index line. Returns (topic_path, created).
+
+    `description` is the one-line summary recall picks files by; `mtype` is one
+    of MEMORY_TYPES. Both are kept from the existing file when not given, so an
+    append never throws away a description the agent wrote on purpose."""
     ensure_index(agent_dir)
     path = topic_path(agent_dir, slug)
     existing = _read(path)
     created = not existing
+    old = read_meta(existing)
     if existing and not replace:
         body = topic_body(existing) + "\n" + text.strip()
     else:
@@ -268,8 +295,9 @@ def upsert_topic(agent_dir: str, slug: str, title: str, text: str, *, replace: b
         m = re.search(r"^# (.+)$", existing, re.M)
         title = m.group(1).strip() if m else slug
     title = title or slug.replace("_", " ").capitalize()
-    hook = make_hook(body)
-    _atomic_write(path, topic_text(slug, title, hook, body))
+    hook = _one_line(description) or old.get("description") or make_hook(body)
+    mtype = mtype if mtype in MEMORY_TYPES else old.get("type", "")
+    _atomic_write(path, topic_text(slug, title, hook, body, mtype))
 
     mem = memory_md_path(agent_dir)
     lines = _read(mem).splitlines() or ["# Memory index", ""]
@@ -286,6 +314,24 @@ def upsert_topic(agent_dir: str, slug: str, title: str, text: str, *, replace: b
         lines.append(want)
     _atomic_write(mem, "\n".join(lines).rstrip("\n") + "\n")
     return path, created
+
+
+def delete_topic(agent_dir: str, slug: str) -> bool:
+    """Remove a topic file and its index line (used when merging topics).
+    Returns True if anything was removed."""
+    path = topic_path(agent_dir, slug)
+    removed = False
+    if os.path.exists(path):
+        os.remove(path)
+        removed = True
+    mem = memory_md_path(agent_dir)
+    rel = topic_rel(slug)
+    lines = _read(mem).splitlines()
+    kept = [l for l in lines if not ((m := _INDEX_LINE_RE.match(l.strip())) and m.group("path") == rel)]
+    if len(kept) != len(lines):
+        _atomic_write(mem, "\n".join(kept).rstrip("\n") + "\n")
+        removed = True
+    return removed
 
 
 def list_topic_files(agent_dir: str) -> list[str]:

@@ -640,13 +640,23 @@ problem.
 
 ## Memory
 
-- **`save_memory(text: str, topic: str = "")`** — with `topic`: append a
-  dated line to `agents/<id>/memory/topics/<slug>.md` (created if new) and
-  keep that topic's line in the `MEMORY.md` index current (MEMORY.md is
-  only rewritten when the line actually changes, to spare the prompt
-  cache). Without `topic`: append to today's daily log
-  (`memory/YYYY-MM-DD.md`). Either way the embedding index is updated.
+- **`save_memory(text, topic="", description="", type="", replace=False)`**
+  — with `topic`: append a dated line to
+  `agents/<id>/memory/topics/<slug>.md` (created if new) and keep that
+  topic's line in the `MEMORY.md` index current (MEMORY.md is only
+  rewritten when the line actually changes, to spare the prompt cache).
+  `description` sets the topic's one-line summary (what recall picks by;
+  kept from the file when omitted, else the first line of the body).
+  `type` is one of `user` / `feedback` / `project` / `reference` (Claude
+  Code's four memory types; kept when omitted). `replace=True` overwrites
+  the body instead of appending (the old file is snapshotted first), for
+  rewriting or merging a topic. Without `topic`: append to today's daily
+  log (`memory/YYYY-MM-DD.md`). Either way the embedding index is updated.
   Auto-injected when `memory_enabled: true`.
+- **`delete_memory(topic)`** — delete a topic file and its index line
+  (snapshotted first, so `restore_snapshot` undoes it) and drop its search
+  chunks. For the leftover after merging topics, or a topic that's no
+  longer true.
 - **`update_core_memory(content: str)`** — rewrite the `MEMORY.md` INDEX
   wholesale (reorder, retitle, drop stale lines). Index lines only:
   `- [Title](memory/topics/<slug>.md) — short hook`. Free-form content is
@@ -1187,11 +1197,15 @@ Keep each topic file's `description` accurate: it's all the selector sees.
 ## Topic files — `memory/topics/<slug>.md` (read on demand)
 
 One file per SUBJECT (a person, a project, a rule and its why), with a
-small frontmatter block (`name`, `description`, `modified`). Written by
-`save_memory(text, topic=...)`; opened with `read_memory("topics/<slug>")`
-when an index line matters. File a fact under a topic when it's
-mentioned more than once, the operator states a lasting preference or
-correction, or future-you would need it after a context wipe.
+small frontmatter block (`name`, `description`, optional `type`,
+`modified`). Written by `save_memory(text, topic=...)`; opened with
+`read_memory("topics/<slug>")` when an index line matters. The writing
+rules agents follow (four types, rule + `Why:` + `How to apply:`,
+specific descriptions, update-don't-duplicate, what not to save) live in
+`_shared/FRAMEWORK.md`'s Memory section, copied from Claude Code 2.1.280's
+auto-memory prompt. Topic files are in snapshot scope. The old-file
+converter is mechanical (splits on `## `), so converted topics can need a
+one-time regroup by the agent.
 
 ## Daily logs — `memory/YYYY-MM-DD.md`
 

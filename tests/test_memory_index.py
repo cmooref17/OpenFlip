@@ -123,8 +123,35 @@ def test_empty():
     check("Empty" in mi.load_index_block(d), "(f) no MEMORY.md → Empty block")
 
 
+def test_description_type_replace_delete():
+    d = tempfile.mkdtemp()
+    p, _ = mi.upsert_topic(d, "tooling", "Tooling", "- use pnpm", description="Package manager and build tool choices", mtype="feedback")
+    meta = mi.read_meta(_read(p))
+    check(meta.get("description") == "Package manager and build tool choices" and meta.get("type") == "feedback",
+          "(h) explicit description + type land in frontmatter")
+    idx = _read(os.path.join(d, "MEMORY.md"))
+    check("— Package manager and build tool choices" in idx, "(h) index line uses the description")
+    mi.upsert_topic(d, "tooling", "", "- also: tests run with pytest")
+    meta = mi.read_meta(_read(p))
+    check(meta.get("description") == "Package manager and build tool choices" and meta.get("type") == "feedback",
+          "(i) plain append keeps description + type")
+    mi.upsert_topic(d, "tooling", "", "Rule: pnpm only.\nWhy: lockfile drift.\nHow to apply: every install.", replace=True)
+    body = mi.topic_body(_read(p))
+    check("use pnpm" not in body and body.startswith("Rule: pnpm only."), "(j) replace overwrites the body")
+    check(mi.read_meta(_read(p)).get("type") == "feedback", "(j) replace keeps type")
+    mi.upsert_topic(d, "tooling", "", "- x", mtype="bogus")
+    check(mi.read_meta(_read(p)).get("type") == "feedback", "(k) invalid type ignored, old kept")
+    mi.upsert_topic(d, "other", "Other", "- y")
+    check(mi.delete_topic(d, "tooling"), "(l) delete_topic reports removal")
+    idx = _read(os.path.join(d, "MEMORY.md"))
+    check(not os.path.exists(p) and "tooling.md" not in idx and "other.md" in idx and mi.is_index(idx),
+          "(l) file + index line gone, other topics untouched")
+    check(not mi.delete_topic(d, "tooling"), "(l) deleting a missing topic reports nothing removed")
+
+
 if __name__ == "__main__":
-    for fn in (test_convert_old_style, test_index_untouched, test_upsert, test_cap, test_empty):
+    for fn in (test_convert_old_style, test_index_untouched, test_upsert, test_cap, test_empty,
+               test_description_type_replace_delete):
         print(fn.__name__)
         fn()
     print("\nRESULT:", "ALL PASS" if not FAILS else f"{len(FAILS)} FAIL")

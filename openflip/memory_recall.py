@@ -58,17 +58,20 @@ def list_candidates(agent_dir: str) -> list[dict]:
                 head = f.read(2048)
         except OSError:
             continue
-        desc = _frontmatter(head).get("description") or mi.make_hook(mi.topic_body(head))
-        out.append({"filename": name, "path": path, "mtime": st.st_mtime, "description": desc})
+        fm = _frontmatter(head)
+        desc = fm.get("description") or mi.make_hook(mi.topic_body(head))
+        mtype = fm.get("type", "") if fm.get("type", "") in mi.MEMORY_TYPES else ""
+        out.append({"filename": name, "path": path, "mtime": st.st_mtime, "description": desc, "type": mtype})
     out.sort(key=lambda c: c["mtime"], reverse=True)
     return out
 
 
 def format_candidates(cands: list[dict]) -> str:
-    """CC's `nwt` line shape: "- filename (ISO mtime): description"."""
+    """CC's `nwt` line shape: "- [type] filename (ISO mtime): description"."""
     lines = []
     for c in cands:
-        line = f"- {c['filename']} ({time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(c['mtime']))})"
+        prefix = f"[{c['type']}] " if c.get("type") else ""
+        line = f"- {prefix}{c['filename']} ({time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(c['mtime']))})"
         if c.get("description"):
             line += f": {c['description']}"
         lines.append(line)

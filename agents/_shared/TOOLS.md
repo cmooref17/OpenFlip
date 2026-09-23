@@ -111,7 +111,7 @@ Depth cap `MAX_DEPTH=20`. A fresh user turn resets the depth counter.
 
 ## Memory
 
-Six tools: `save_memory` (with `topic` → that topic file + its MEMORY.md index line; without → today's daily log), `update_core_memory` (rewrite the MEMORY.md index itself — index lines only), `search_memory` (semantic search across the index, topic files and daily logs), `read_memory` (MEMORY.md, a topic like `topics/<slug>`, or a daily log by date), `list_memory_files`, `reindex_memory` (rebuild the search index from on-disk memory files after an out-of-band edit). Exact parameters are in the tool schemas you already receive — when to use which tier is in FRAMEWORK.md's Memory section.
+Seven tools: `save_memory` (with `topic` → that topic file + its MEMORY.md index line, optional `description` / `type` / `replace`; without → today's daily log), `delete_memory` (remove a topic file and its index line), `update_core_memory` (rewrite the MEMORY.md index itself — index lines only), `search_memory` (semantic search across the index, topic files and daily logs), `read_memory` (MEMORY.md, a topic like `topics/<slug>`, or a daily log by date), `list_memory_files`, `reindex_memory` (rebuild the search index from on-disk memory files after an out-of-band edit). Exact parameters are in the tool schemas you already receive — when to use which tier is in FRAMEWORK.md's Memory section.
 
 ## Files, web, and system tools
 

@@ -37,6 +37,7 @@ def should_snapshot(abs_path: str) -> bool:
       - <root>/cron/             scheduling
       - <root>/agents/_shared/   shared framework files (FRAMEWORK.md, TOOLS.md)
       - <root>/agents/<id>/{SOUL.md, AGENT.md, MEMORY.md, agent.json}  identity
+      - <root>/agents/<id>/memory/topics/*.md  long-term memory topic files
 
     Out of scope:
       - conversations/, memory/index.json, live.json, state.json (runtime)
@@ -72,6 +73,10 @@ def should_snapshot(abs_path: str) -> bool:
             fname = parts[2]
             if fname in ("SOUL.md", "AGENT.md", "MEMORY.md", "agent.json"):
                 return True
+        # agents/<id>/memory/topics/<slug>.md: long-term memory, same weight
+        # as MEMORY.md (delete_memory and save_memory(replace=True) rewrite it).
+        if len(parts) == 5 and parts[2:4] == ["memory", "topics"] and parts[4].endswith(".md"):
+            return True
         return False
     return False
 

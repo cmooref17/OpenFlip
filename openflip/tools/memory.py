@@ -257,12 +257,15 @@ async def _index_topic_file(agent_dir: str, slug: str) -> None:
 
 
 @tool
-async def save_memory(text: str, topic: str = "") -> ToolResult:
-    """Save a memory. With `topic`, it's a lasting fact: appended to that topic file (created if new) and listed in your MEMORY.md index, which loads automatically every turn. Without `topic`, it goes to today's daily log (events, one-off notes). Reuse an existing topic from your index when one fits; otherwise name a new one.
+async def save_memory(text: str, topic: str = "", description: str = "", type: str = "", replace: bool = False) -> ToolResult:
+    """Save a memory. With `topic`, it's a lasting fact: appended to that topic file (created if new) and listed in your MEMORY.md index, which loads automatically every turn. Without `topic`, it goes to today's daily log (events, one-off notes). One topic per SUBJECT (a person, a project, a standing rule), organized by subject, not by date or incident: reuse an existing topic from your index when one fits, and fix a wrong fact instead of adding a second one. For a rule or a decision, write the rule first, then a "Why:" line and a "How to apply:" line. How to write memories is in FRAMEWORK.md's Memory section.
 
     Args:
-        text: What to remember — a clear statement of the event, fact, or decision.
-        topic: Optional. Topic for a lasting fact, e.g. "operator_environment" or "Operator's environment". Leave empty for a daily-log entry.
+        text: What to remember, stated as a durable fact or rule (absolute dates, no "yesterday"). With replace=True, the topic's complete new body.
+        topic: Optional. Topic slug for a lasting fact, e.g. "operator_environment". Leave empty for a daily-log entry.
+        description: Optional. One line (under ~150 chars) saying what the whole topic covers. Recall picks files by it, so make it specific. Give it when creating a topic or when its scope changes; otherwise the existing one is kept.
+        type: Optional. user (who the operator is, their preferences), feedback (how they want you to work: corrections AND approaches they confirmed), project (ongoing work, decisions, deadlines), or reference (where to find something).
+        replace: Optional. True overwrites the topic's body with `text` instead of appending. Use it to rewrite or merge a topic.
     """
     agent_dir = _get_agent_dir()
     _maybe_migrate(agent_dir)
@@ -272,9 +275,19 @@ async def save_memory(text: str, topic: str = "") -> ToolResult:
         raw = topic.strip().removesuffix(".md").removeprefix("memory/").removeprefix("topics/")
         slug = raw if mi.valid_slug(raw) else mi.slugify(raw)
         title = "" if raw == slug else raw
-        entry = f"- [{time.strftime('%Y-%m-%d')}] {text.strip()}"
-        _, created = mi.upsert_topic(agent_dir, slug, title, entry)
-        note = "new topic file + index line" if created else "appended; index line refreshed"
+        mtype = (type or "").strip().lower()
+        if mtype and mtype not in mi.MEMORY_TYPES:
+            return ToolResult.fail(f"type must be one of {', '.join(mi.MEMORY_TYPES)} (or empty), not '{type}'.")
+        entry = text.strip() if replace else f"- [{time.strftime('%Y-%m-%d')}] {text.strip()}"
+        if replace and os.path.isfile(mi.topic_path(agent_dir, slug)):
+            try:
+                snapshot_file(mi.topic_path(agent_dir, slug))
+            except Exception as e:
+                print_ts(f"topic snapshot failed (proceeding with rewrite): {e}", error=True)
+        _, created = mi.upsert_topic(agent_dir, slug, title, entry, replace=replace,
+                                     description=description, mtype=mtype)
+        note = ("new topic file + index line" if created
+                else "rewritten; index line refreshed" if replace else "appended; index line refreshed")
         try:
             await _index_topic_file(agent_dir, slug)
         except Exception as e:
@@ -330,6 +343,33 @@ async def save_memory(text: str, topic: str = "") -> ToolResult:
     except Exception:
         pass
     return ToolResult(model_feedback=f"Saved to {date_str} log: {text[:100]}")
+
+
+@tool
+async def delete_memory(topic: str) -> ToolResult:
+    """Delete a topic file and its MEMORY.md index line, e.g. after merging it into another topic or when nothing in it is still true. The file is snapshotted first, so restore_snapshot can undo it.
+
+    Args:
+        topic: The topic slug to delete, e.g. "old_incident_notes".
+    """
+    agent_dir = _get_agent_dir()
+    from .. import memory_index as mi
+    slug = topic.strip().removesuffix(".md").removeprefix("memory/").removeprefix("topics/")
+    if not mi.valid_slug(slug):
+        return ToolResult.fail(f"Invalid topic '{topic}'.")
+    path = mi.topic_path(agent_dir, slug)
+    if os.path.isfile(path):
+        try:
+            snapshot_file(path)
+        except Exception as e:
+            print_ts(f"topic snapshot failed (proceeding with delete): {e}", error=True)
+    if not mi.delete_topic(agent_dir, slug):
+        return ToolResult.fail(f"No topic '{slug}' found.")
+    index_path = _index_path(agent_dir)
+    index = load_json(index_path, default={"version": 2, "entries": []})
+    _remove_source_entries(index, mi.topic_rel(slug))
+    save_json(index_path, index)
+    return ToolResult(model_feedback=f"Deleted topic {mi.topic_rel(slug)} and its index line.")
 
 
 @tool

@@ -384,7 +384,7 @@ def should_respond(agent: Agent, inbound: InboundMessage, bot_user_id: int) -> b
     return False
 
 
-MEMORY_TOOL_NAMES = {"save_memory", "update_core_memory", "search_memory", "read_memory", "list_memory_files", "reindex_memory"}
+MEMORY_TOOL_NAMES = {"save_memory", "delete_memory", "update_core_memory", "search_memory", "read_memory", "list_memory_files", "reindex_memory"}
 
 
 def strip_memory_tools(funcs: list) -> list:

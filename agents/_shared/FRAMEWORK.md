@@ -88,11 +88,25 @@ Three pieces (same shape as Claude Code's auto memory):
 - **Topic files** (`memory/topics/<slug>.md`) — the lasting facts, one file per SUBJECT (a person, a project, a rule and why it exists). Save with `save_memory(text, topic="<slug>")`: it appends to that file (creating it if new) and keeps its index line current. Reuse an existing topic from your index when one fits. On a human turn the framework usually recalls the relevant ones for you: up to 5 topic files a small selector model picked arrive appended to the user's message inside `<relevant-memories>` ("Retrieved for possible relevance"). Use them only if they apply; a file already recalled in this conversation won't be sent again. For anything not recalled, open it with `read_memory(file="topics/<slug>")` when a line in your index matters. Keep each file's `description` accurate — it's what the selector reads.
 - **Daily logs** — events. "Today X happened." `save_memory(text)` with no topic.
 
-An old free-form MEMORY.md converts itself into index + topic files the first time it loads (original kept as `MEMORY.md.pre-index-<stamp>.bak`). Rewrite the index itself (reorder, retitle, drop stale lines) with `update_core_memory`; anything that isn't an index line gets split back out into topic files next turn. Every index change busts the cached prompt prefix once, so don't churn it.
+An old free-form MEMORY.md converts itself into index + topic files the first time it loads (original kept as `MEMORY.md.pre-index-<stamp>.bak`). That conversion is mechanical: it splits on `## ` headings and does NOT regroup by subject, so converted topics may be incident write-ups with weak descriptions. Fix them to the rules below when you touch them. Rewrite the index itself (reorder, retitle, drop stale lines) with `update_core_memory`; anything that isn't an index line gets split back out into topic files next turn. Every index change busts the cached prompt prefix once, so don't churn it.
 
 If a memory file was changed outside the memory tools (file tools, the operator, another process), run `reindex_memory` — it rebuilds the search index from MEMORY.md, the topic files and the daily logs.
 
-**Default to saving.** Saving is cheap and a lost fact is expensive. Fire `save_memory` in the same response when the operator states a fact about themselves or their setup, states a preference, corrects you, or picks an option; when you learn something new about the codebase or your own behavior; or when you find the root cause of a mistake. If you say "noted" or "got it," the save fires in that same response. Before saving something that may already be stored, extend the existing topic instead of duplicating it.
+**How to write a memory** (same rules as Claude Code's auto memory):
+- **One topic per SUBJECT, organized by subject, not by date or incident.** "The operator's machine", "the deploy process", "how the operator wants replies" are topics. "The night X broke" is not: file what it taught you under the subject it's about, and put the story itself in the daily log.
+- **Four types**, set with `save_memory(..., type=...)`:
+  - `user`: who the operator is, their role, setup and preferences.
+  - `feedback`: how they want you to work. Save corrections AND approaches they confirmed ("yes, exactly", accepting an unusual choice), or you'll drift toward over-caution.
+  - `project`: ongoing work, decisions and deadlines that aren't in the code or git.
+  - `reference`: where to find something (a dashboard, a channel, a doc).
+- **Shape:** lead with the rule or fact. For feedback and project, follow it with a `Why:` line (the reason, often the incident) and a `How to apply:` line (when it kicks in). The why is what lets you judge edge cases later.
+- **Description:** one specific line under ~150 chars saying what the whole topic covers, set with `description=`. Recall picks files by it, so "Operator's machine: GPUs, OS, services, what serves which site" beats "He is repeatedly furious when...".
+- **Absolute dates.** "Thursday" becomes "2026-03-05".
+- **Update, don't duplicate.** When a fact changes or turns out wrong, rewrite the topic with `save_memory(text, topic, replace=True)`. Merge overlapping topics the same way, then remove the leftover with `delete_memory(topic)`.
+- **Don't save** what the code, git, or your system files already say (architecture, file paths, commit history, fix recipes), in-progress task state, or anything from this conversation that won't matter next time. When asked to save a summary, save what was surprising or non-obvious about it.
+- Correction to a single case ("for now", "in this change")? That's a one-off, not a memory. Otherwise save the general lesson, not the incident.
+
+**Default to saving.** Saving is cheap and a lost fact is expensive. Fire `save_memory` in the same response when the operator states a fact about themselves or their setup, states a preference, corrects you, or confirms an approach; when you learn something new about your environment or behavior; or when you find the root cause of a mistake. If you say "noted" or "got it," the save fires in that same response.
 
 **Recall:** relevant topic files usually arrive on their own in `<relevant-memories>`. If something from past sessions matters (a recurring project, "like last time," or you're about to say "I don't know") and it wasn't recalled, `search_memory` or `read_memory` before answering. Anything said in THIS conversation is already in your context, so don't search for it.
 

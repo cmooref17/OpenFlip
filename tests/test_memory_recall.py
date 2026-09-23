@@ -47,6 +47,9 @@ def test_candidates() -> None:
     check("- a.md (" in fmt and "): alpha facts" in fmt, "nwt line shape with description")
     check("b.md" in fmt and "no frontmatter" in fmt, "falls back to body hook without frontmatter")
     check(r.list_candidates(tempfile.mkdtemp()) == [], "no topics dir -> no candidates")
+    typed = "---\nname: x\ndescription: \"typed one\"\ntype: feedback\nmodified: 2026-09-22T00:00:00\n---\n\n# T\n\nbody\n"
+    fmt = r.format_candidates(r.list_candidates(make_agent({"t.md": typed})))
+    check("- [feedback] t.md (" in fmt and "): typed one" in fmt, "type shown as CC's [type] prefix")
 
 
 def test_skip_rules() -> None:
