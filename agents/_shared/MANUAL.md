@@ -1900,24 +1900,22 @@ when disabled. Default interval 30 min.
 - Idle-tick pruning — a tick with NO tool calls and NO send_message has
   its tick message + empty reply pruned from in-memory conversation so
   idle ticks don't inflate cost.
-- Stop-hook exemption — `originator_visibility="kairos"` is exempt from
-  `promise_without_action`. Prompt also instructs emitting NO text when
-  idle.
+- Idle ticks — the prompt instructs emitting NO text when idle.
 - Retry-heuristic location — the four in-loop turn-retry heuristics
-  (action-promise, peer-prose, empty-reply, and the `promise_without_action`
-  stop-hook invocation) were extracted out of `runtime._run_turn` into
-  `openflip/turn_retries.py` (extracted 2026-06-07; see the
-  agent's audit log under `agents/<id>/audits/`). The decision
-  logic — phrase lists, peer-prose line scan, nudge text, env kill switches
-  (`OPENFLIP_DISABLE_ACTION_PROMISE_RETRY` / `_PEER_PROSE_RETRY` /
-  `_EMPTY_RETRY`), and the `stop_hooks.evaluate_stop_hooks` wrapper — lives
-  there now; `runtime.py` still owns the one-shot flags, the `conv.messages`
-  nudge append, the sticky `tool_choice=any` override, and the `continue`.
-  Pure code motion, no behavior change. (2026-07-29: the terminal-contract
-  empty-turn classifier `classify_empty_turn` also lives there — pinned by
-  `tests/test_empty_turn_classifier.py`.)
-- No self-retrigger — kairos send_message posts as the bot;
-  `should_respond()` filters the agent's own id. Must not reset another
+  (action-promise, p- Retry-heuristic location — the in-loop turn-retry helpers live in
+  `openflip/turn_retries.py`: the empty-reply nudge (`_EMPTY_RETRY` kill
+  switch), the no-final-text guarantee, `operator_facing_turn`, and the
+  terminal-contract empty-turn classifier `classify_empty_turn` (pinned by
+  `tests/test_empty_turn_classifier.py`). `runtime.py` owns the one-shot
+  flags, the `conv.messages` nudge append, and the `continue`. There are
+  NO phrase-matching retries: the action-promise phrase list + forced
+  `tool_choice`, the `promise_without_action` regex stop hook (and the
+  whole `stop_hooks.py` module), and the peer-prose line scan were all
+  removed 2026-09-22. Announce-without-act is handled by the FRAMEWORK.md
+  "don't end a turn on an unfulfilled promise" instruction, as in Claude
+  Code; peer messages are only ever sent via `talk_to_agent` (plain text
+  routes to whoever triggered the turn).
+ the agent's own id. Must not reset another
   agent's cooldown.
 
 ## DREAM (auto memory consolidation)

@@ -232,7 +232,7 @@ def delete_conversation_files(
 
 
 # Every framework-injected user-role message (mid-turn soft-inject wrapper in
-# runtime._drain_pending_injects, turn_retries/stop_hooks nudges, the
+# runtime._drain_pending_injects, turn_retries nudges, the
 # post-compaction / turn-failed / aborted-pre-send notes) starts with this
 # prefix. Real turn-starting messages (build_user_prompt output, cron/dream
 # prompts) never do — with ONE known exception, documented below.

@@ -22,13 +22,10 @@ from .acl import is_owner
 from .registry import RUNNERS
 from .turn_retries import (
     classify_empty_turn,
-    detect_peer_prose,
-    build_peer_prose_nudge,
     empty_retry_nudge,
     no_final_text_guarantee_enabled,
     no_final_text_nudge,
     operator_facing_turn,
-    run_stop_hooks,
 )
 from . import agent_state as _agent_state
 from .transport import Transport
@@ -2465,8 +2462,8 @@ class AgentRunner:
         # Claude-Code-style query loop. Single exit gate: `needs_follow_up`
         # is True iff the assistant message contained at least one tool_use
         # block. No tool_use → loop ends, post-loop section handles final
-        # text + stop_hooks + terminal-contract diagnostic. Mirrors
-        # queryLoop in claude-code's src/query.ts at line 241.
+        # text + the terminal-contract diagnostic. Mirrors queryLoop in
+        # claude-code's src/query.ts.
         #
         # Architectural reason: openflip used to layer three inline retry
         # guards on top of the natural exit (empty_retry_attempted,
@@ -2475,13 +2472,9 @@ class AgentRunner:
         # model kept inventing new phrasings to escape the regex/heuristic
         # nudges, and the band-aids decayed faster than they could be
         # added. Claude Code's loop does NOT retry — prose-without-tool is
-        # a legitimate exit. Failures-to-act were intended to be caught by
-        # a post-turn stop_hook layer that fires ONE follow-up synthetic
-        # turn with tool_choice=any. NOTE: that stop_hook layer is NOT
-        # IMPLEMENTED yet — only the terminal-contract diagnostic exists
-        # (it warns but does not retry). The primary defense is the
-        # FRAMEWORK.md "Action-promise STOP-TEST" rule (prompt-level
-        # coupling of announce + act in the same response).
+        # a legitimate exit. The defense against announce-without-act is
+        # the FRAMEWORK.md "don't end a turn on an unfulfilled promise"
+        # instruction (prompt-level, as in Claude Code). No regex hooks.
         last_ai_message = None
         turn_count = 0
         # Track soft-inject drain across finally/post-loop so the follow-up
@@ -2708,51 +2701,6 @@ class AgentRunner:
                         print_ts(f"  ← {_prov} replied  tool_calls={[t.function_name for t in _tc]} done={_done}", agent=agent.id)
                     elif _ct.strip():
                         print_ts(f"  ← {_prov} replied  text={_ct[:80].replace(chr(10),' ')!r} done={_done}", agent=agent.id)
-                        # Peer-prose leak detection. If text starts with
-                        # "<peer_agent_id>: " (or "<peer_agent_id> ,"
-                        # or "<peer_agent_id> —"), the model is addressing
-                        # another agent in prose but did NOT fire
-                        # talk_to_agent. Without intervention the text
-                        # auto-routes to whoever triggered this turn
-                        # (often the operator), leaking inter-agent
-                        # prose into the wrong channel.
-                        #
-                        # Behavior: inject a [FRAMEWORK] nudge naming the
-                        # detected peer and require the model to either
-                        # (a) re-emit using talk_to_agent, or
-                        # (b) rewrite the reply for the actual reader.
-                        # Cap at 1 retry per turn to bound cost.
-                        # Kill switch: OPENFLIP_DISABLE_PEER_PROSE_RETRY=1.
-                        # Detection logic extracted to turn_retries.py
-                        # (line-by-line scan, fenced-code skipping, kill
-                        # switch + one-shot gating all inside the helper).
-                        _detected_peer = detect_peer_prose(
-                            _ct,
-                            agent.id,
-                            lambda _pid: RUNNERS.get(_pid) is not None,
-                            bool(locals().get("_peer_prose_retry_used")),
-                        )
-                        if _detected_peer:
-                            _peer_prose_retry_used = True
-                            print_ts(
-                                f"{COLOR_YELLOW}{log_tag}peer-prose leak detected "
-                                f"(addressed '{_detected_peer}' without talk_to_agent) "
-                                f"— injecting nudge and retrying{COLOR_END}",
-                                agent=agent.id,
-                            )
-                            try:
-                                _CM = chat_message_class(agent.provider)
-                                _nudge = build_peer_prose_nudge(_detected_peer)
-                                conv.messages.append(_CM('user', _nudge))
-                            except Exception as _nudge_err:
-                                print_ts(
-                                    f"{COLOR_YELLOW}{log_tag}peer-prose nudge "
-                                    f"injection failed (continuing without retry): "
-                                    f"{_nudge_err}{COLOR_END}",
-                                    agent=agent.id,
-                                )
-                            else:
-                                continue
                     else:
                         # Empty reply — no text AND no tool_use. Inject a
                         # nudge into history before retrying so the API
@@ -2848,73 +2796,15 @@ class AgentRunner:
                     # post_tool_empty_retry_attempted, promise_retry_attempted,
                     # force_tool_choice continue) are GONE — the structural
                     # exit replaces them. Promise-without-action is handled
-                    # primarily by the FRAMEWORK.md "Action-promise STOP-TEST"
-                    # prompt rule, BACKSTOPPED by the stop_hook layer just
-                    # below — see `openflip/stop_hooks.py` for the hook
-                    # registry and the promise_without_action regex.
+                    # by the FRAMEWORK.md "don't end a turn on an unfulfilled
+                    # promise" instruction, as in Claude Code. The regex
+                    # stop-hook layer and the peer-prose line scan were
+                    # removed 2026-09-22 (phrase-guessing heuristics that
+                    # misfired; plain text already routes to whoever
+                    # triggered the turn, and talk_to_agent is the only way
+                    # to reach a peer).
                     needs_follow_up = bool(_tc)
                     if not needs_follow_up:
-                        # ----- Stop-hook layer -----
-                        # Mirrors Claude Code's `handleStopHooks` pattern: a
-                        # text-only turn (no tool_use) gets one chance to be
-                        # rewritten/extended if any registered hook decides
-                        # the reply is malformed. The current single hook,
-                        # `promise_without_action`, catches text like
-                        # "checking…" / "let me look" / "on it" that leaves
-                        # the operator staring at a dangling promise.
-                        #
-                        # Depth-cap: `_promise_hook_used` is a one-shot flag
-                        # local to THIS _run_turn invocation. We allow ONE
-                        # retry per turn — same convention as the other one-
-                        # shot flags above (`_empty_retry_used`,
-                        # `_force_tool_retry_used`, `_peer_prose_retry_used`).
-                        # A second misfire after a nudge is a deeper model
-                        # failure that an infinite-retry loop would only mask.
-                        if not locals().get("_promise_hook_used"):
-                            try:
-                                # Invocation extracted to turn_retries.run_stop_hooks
-                                # (thin wrapper around stop_hooks.evaluate_stop_hooks).
-                                _shr = run_stop_hooks(
-                                    agent_id=agent.id,
-                                    channel_id=int(getattr(channel, "id", 0) or 0),
-                                    assistant_text=_ct,
-                                    tool_was_called=bool(_tc),
-                                    depth=int(depth),
-                                    is_chain_terminator=is_chain_terminator,
-                                    is_synthetic=str(log_tag or "").strip().startswith("[synthetic]"),
-                                    originator_visibility=originator_visibility or "",
-                                )
-                            except Exception as _stop_err:
-                                _shr = None
-                                print_ts(
-                                    f"{COLOR_YELLOW}{log_tag}stop_hook evaluation failed "
-                                    f"(continuing without retry): {_stop_err}{COLOR_END}",
-                                    agent=agent.id,
-                                )
-                            if _shr is not None and _shr.blocked:
-                                _promise_hook_used = True
-                                print_ts(
-                                    f"{COLOR_YELLOW}{log_tag}stop_hook fired: {_shr.reason} "
-                                    f"— injecting nudge + forcing tool_choice=any and retrying{COLOR_END}",
-                                    agent=agent.id,
-                                )
-                                try:
-                                    if _shr.suggested_user_message:
-                                        conv.messages.append(
-                                            ChatMessage('user', _shr.suggested_user_message)
-                                        )
-                                    # Re-prompt with the injected nudge and let the model
-                                    # answer normally. We do NOT force tool_choice: Opus 5.5
-                                    # rejects it, and Claude Code nudges via instruction, not a
-                                    # forced tool call.
-                                    continue
-                                except Exception as _inject_err:
-                                    print_ts(
-                                        f"{COLOR_YELLOW}{log_tag}stop_hook nudge injection "
-                                        f"failed (falling through to exit): "
-                                        f"{_inject_err}{COLOR_END}",
-                                        agent=agent.id,
-                                    )
                         # ----- Final-text guarantee (CC parity, 2026-07-15) -----
                         # Claude Code's query loop cannot end a turn on the
                         # round that ran tools: after tool_use it ALWAYS runs

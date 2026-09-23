@@ -14,7 +14,7 @@ preserved EXACTLY as they were inline — this is code motion, not a redesign.
 """
 from __future__ import annotations
 import os
-from typing import Callable, Optional
+from typing import Optional
 
 
 # Nudge injected before retrying an empty (no text, no tool_use) reply so the
@@ -28,73 +28,6 @@ _EMPTY_RETRY_NUDGE = (
     "your normal voice. If you need another tool "
     "call, fire it. Do not stay silent."
 )
-
-
-def detect_peer_prose(
-    text: str,
-    this_agent_id: str,
-    is_known_peer: Callable[[str], bool],
-    already_used: bool,
-) -> Optional[str]:
-    """Peer-prose leak detection. Returns the detected peer agent id when the
-    model is addressing another agent in prose (line begins with
-    "<peer_agent_id>: " / "<peer> ," / "<peer> —") but did NOT fire
-    talk_to_agent — without intervention the text auto-routes to whoever
-    triggered this turn (often the operator), leaking inter-agent prose into
-    the wrong channel. Returns None when nothing detected. Cap at 1 retry per
-    turn (`already_used`). Kill switch: OPENFLIP_DISABLE_PEER_PROSE_RETRY=1.
-
-    Whole-message scan, not just first token. Catches three real-world shapes:
-      1. "<peer>: hi"            (first-line prefix)
-      2. "night Mini. the maintainer agent: g'night you too"
-                                 (mid-message line start)
-      3. "thanks. \n<peer>: ..."
-                                 (later line prefix)
-
-    We look line-by-line for any line whose first whitespace-token, with
-    trailing :,—- stripped, is a known peer agent id (not this agent). Lines
-    inside fenced code blocks (```...```) are skipped — quoted code that
-    happens to name a peer shouldn't trigger the nudge.
-    """
-    if os.environ.get("OPENFLIP_DISABLE_PEER_PROSE_RETRY") == "1":
-        return None
-    if already_used:
-        return None
-    _detected_peer = None
-    _in_fence = False
-    for _line in text.splitlines():
-        _stripped = _line.strip()
-        if _stripped.startswith("```"):
-            _in_fence = not _in_fence
-            continue
-        if _in_fence or not _stripped:
-            continue
-        _tok = _stripped.split(None, 1)[0]
-        _bare = _tok.rstrip(":,—-")
-        if (_bare and _bare != this_agent_id
-                and is_known_peer(_bare)):
-            _detected_peer = _bare
-            break
-    return _detected_peer
-
-
-def build_peer_prose_nudge(detected_peer: str) -> str:
-    """The [FRAMEWORK] nudge text injected when peer-prose is detected: names
-    the detected peer and requires the model to either (a) re-emit using
-    talk_to_agent, or (b) rewrite the reply for the actual reader."""
-    return (
-        f"[FRAMEWORK]: Your last reply began with "
-        f"'{detected_peer}:' as if addressing peer "
-        f"agent '{detected_peer}', but you did not "
-        f"call talk_to_agent. Plain prose in this "
-        f"channel does NOT route to a peer — it goes "
-        f"to whoever this channel belongs to (often the "
-        f"operator). If you meant to message "
-        f"'{detected_peer}', call talk_to_agent now. "
-        f"If the message was actually meant for the "
-        f"current channel's reader, rewrite without "
-        f"the peer-id prefix."
-    )
 
 
 def empty_retry_nudge(already_used: bool) -> Optional[str]:
@@ -259,37 +192,3 @@ def classify_empty_turn(
             )):
         return "notify_minimal"
     return "suppress"
-
-
-def run_stop_hooks(
-    *,
-    agent_id: str,
-    channel_id: int,
-    assistant_text: str,
-    tool_was_called: bool,
-    depth: int,
-    is_chain_terminator: bool,
-    is_synthetic: bool,
-    originator_visibility: str,
-):
-    """Stop-hook invocation. Mirrors Claude Code's `handleStopHooks` pattern: a
-    text-only turn (no tool_use) gets one chance to be rewritten/extended if any
-    registered hook decides the reply is malformed. The current single hook,
-    `promise_without_action`, catches text like "checking…" / "let me look" /
-    "on it" that leaves the operator staring at a dangling promise.
-
-    Thin wrapper around `stop_hooks.evaluate_stop_hooks` so the import + call
-    live with the other turn-retry heuristics. Exceptions propagate to the
-    caller's existing try/except (which sets the result to None and logs).
-    """
-    from .stop_hooks import evaluate_stop_hooks
-    return evaluate_stop_hooks(
-        agent_id=agent_id,
-        channel_id=channel_id,
-        assistant_text=assistant_text,
-        tool_was_called=tool_was_called,
-        depth=depth,
-        is_chain_terminator=is_chain_terminator,
-        is_synthetic=is_synthetic,
-        originator_visibility=originator_visibility,
-    )
