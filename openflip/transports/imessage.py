@@ -462,6 +462,11 @@ class IMessageTransport:
         makes sends survive a restart (the chat-id captured before the restart
         may no longer resolve). Returns None for an empty/unusable target."""
         s = str(session_id).strip()
+        # Callers sometimes hand over a full conversation_id ("imessage:+1555",
+        # e.g. the in-memory key of an identity-linked conversation). imsg has
+        # no idea what that prefix is and fails (rc=1), so strip it.
+        if s.lower().startswith("imessage:"):
+            s = s.split(":", 1)[1].strip()
         if not s:
             return None
         return ["--chat-id", s] if s.isdigit() else ["--to", s]
@@ -490,8 +495,11 @@ class IMessageTransport:
                 print_ts(f"imsg send timed out after 30s", error=True)
                 return
             if proc.returncode != 0:
+                # Name the target args (not the message text) so a failed send
+                # says WHERE it tried to go; stderr kept to 1000 chars.
                 print_ts(
-                    f"imsg send rc={proc.returncode}: {stderr.decode('utf-8', 'replace')[:300]}",
+                    f"imsg send rc={proc.returncode} target={' '.join(addr)}: "
+                    f"{stderr.decode('utf-8', 'replace').strip()[:1000]}",
                     error=True,
                 )
         except Exception as e:

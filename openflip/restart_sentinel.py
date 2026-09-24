@@ -509,7 +509,19 @@ async def _process_one(path: str) -> None:
                 # ACLs still resolve. Fall back to the bare int only when
                 # marker_conv_id is empty/unparseable.
                 _cont_target: object = int(channel_id)
+                # Identity-linked conversation: deliver the continuation via the
+                # transport the person last used, keeping the shared history.
+                _linked_cont = None
                 if marker_conv_id:
+                    try:
+                        from . import linked_routes as _lr
+                        _linked_cont = _lr.delivery_session(
+                            os.path.dirname(runner.agent.path), marker_conv_id)
+                    except Exception:
+                        _linked_cont = None
+                if _linked_cont is not None:
+                    _cont_target = _linked_cont
+                elif marker_conv_id:
                     from .session import Session as _Session
                     _t_name, _sep, _tid = marker_conv_id.partition(":")
                     _t_name, _tid = _t_name.strip(), _tid.strip()

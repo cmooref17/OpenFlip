@@ -337,6 +337,21 @@ class AgentRunner:
         """
         return self._transports[0]
 
+    def transport_named(self, name: str) -> Optional[Transport]:
+        """This agent's transport with that name, or None.
+
+        Out-of-turn work that carries a Session (cron, restart continuation,
+        linked-route delivery) must send through the Session's OWN transport.
+        On a multi-transport agent `self.transport` is just the first one in
+        the list, so a Discord session built on it would be sent through
+        iMessage (or vice versa)."""
+        if not name:
+            return None
+        for t in self._transports:
+            if getattr(t, "name", "") == name:
+                return t
+        return None
+
     @property
     def is_headless(self) -> bool:
         """True when this agent has no real messaging surface — every transport
@@ -1251,6 +1266,11 @@ class AgentRunner:
         # Build the channel shim — runtime.py's queue payload + _run_turn
         # expect a channel object with .id, .send, .typing(), etc.
         channel = TransportChannel(transport=_transport, session=inbound.session)
+        # Identity-linked conversations: remember which transport the person
+        # used last, so out-of-turn sends (send_message by session_id, cron,
+        # restart continuations) deliver there instead of the primary's prefix.
+        from . import linked_routes as _lr
+        _lr.record(os.path.dirname(self.agent.path), inbound.session)
         speaker_id = inbound.sender_id
         is_dm = inbound.is_dm
         role_ids = inbound.session.speaker_role_ids
@@ -1404,6 +1424,8 @@ class AgentRunner:
             from .config_global import get_owner_id
             owner_id = get_owner_id("discord")
             inbound = build_inbound_from_discord(message, self.bot.user.id, owner_id)
+        from . import linked_routes as _lr
+        _lr.record(os.path.dirname(self.agent.path), inbound.session)
         speaker_id = inbound.sender_id
         is_dm = inbound.is_dm
         role_ids = inbound.session.speaker_role_ids
@@ -1717,7 +1739,20 @@ class AgentRunner:
                 transport=self.transport,
                 session=_session_for_chan,
             )
-        elif not hasattr(self.transport, "bot"):
+        elif (isinstance(channel_id, Session)
+              and self.transport_named(channel_id.transport) is not None
+              and not hasattr(self.transport_named(channel_id.transport), "bot")):
+            # Caller passed a Session for a NON-Discord transport this agent
+            # has (e.g. iMessage on a Discord-first agent): run it on THAT
+            # transport, not the primary.
+            from .transports.channel_shim import TransportChannel
+            channel = TransportChannel(
+                transport=self.transport_named(channel_id.transport),
+                session=channel_id,
+            )
+        elif (not hasattr(self.transport, "bot")
+              and not (isinstance(channel_id, Session)
+                       and hasattr(self.transport_named(channel_id.transport), "bot"))):
             # Non-headless transport without a Discord bot (iMessage and any
             # future non-Discord transport). The Discord path below would
             # AttributeError on self.bot.get_channel. Wrap the existing
@@ -1806,7 +1841,7 @@ class AgentRunner:
                 # run against its conversation_id via the shim.
                 from .transports.channel_shim import TransportChannel
                 channel = TransportChannel(
-                    transport=self.transport,
+                    transport=self.transport_named(_passed_session.transport) or self.transport,
                     session=_passed_session,
                 )
         else:

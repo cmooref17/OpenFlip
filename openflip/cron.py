@@ -492,6 +492,18 @@ def _resolve_session_target(job: dict, runner) -> object:
     tool_grants = [str(g) for g in raw_grants] if isinstance(raw_grants, list) else []
     session_id = (job.get("sessionId") or "").strip()
     if session_id:
+        # Identity-linked conversation: deliver via the transport the person
+        # last used (history still lands in the shared conversation).
+        try:
+            import os as _os
+            from . import linked_routes as _lr
+            _ls = _lr.delivery_session(_os.path.dirname(runner.agent.path), session_id,
+                                       tool_grants=tool_grants)
+            if _ls is not None:
+                return _ls
+        except Exception as _lr_err:
+            print_ts(f"{COLOR_YELLOW}cron: linked-route lookup failed ({_lr_err}); using sessionId as-is{COLOR_END}",
+                     agent=job.get("agentId"))
         transport_name, sep, tid = session_id.partition(":")
         transport_name, tid = transport_name.strip(), tid.strip()
         if sep and transport_name and tid:

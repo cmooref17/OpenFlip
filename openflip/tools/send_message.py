@@ -136,6 +136,16 @@ async def send_message(text: str, channel_id: int = 0, session_id: str = "") -> 
 
         # Transport prefix → which transport to route through.
         prefix = conv_id.split(":", 1)[0] if ":" in conv_id else ""
+        # Identity-linked conversation: the prefix is the PRIMARY's transport,
+        # not necessarily where the person is. Deliver via the route they used
+        # last (recorded on inbound); history stays in the shared conversation.
+        _linked_route = None
+        try:
+            import os as _os
+            from .. import linked_routes as _lr
+            _linked_route = _lr.lookup(_os.path.dirname(agent.path), conv_id)
+        except Exception:
+            _linked_route = None
 
         # Find the LIVE in-memory conversation by MATCHING conversation_id.
         # CRITICAL: for iMessage 1:1 DMs the conversation_id is
@@ -145,10 +155,16 @@ async def send_message(text: str, channel_id: int = 0, session_id: str = "") -> 
         # KEY of the matched conversation IS the send key; we must NOT derive a
         # numeric key from the handle suffix. Mirrors inject_context's lookup.
         send_key = None
-        for _k, _c in runner.conversations.items():
-            if getattr(_c, "conversation_id", None) == conv_id:
-                send_key = str(_k)
-                break
+        if _linked_route is not None:
+            # Linked conversations are keyed in memory by the primary id, so the
+            # dict key is not a native send key; use the recorded native target.
+            prefix = _linked_route.transport
+            send_key = _linked_route.transport_id
+        else:
+            for _k, _c in runner.conversations.items():
+                if getattr(_c, "conversation_id", None) == conv_id:
+                    send_key = str(_k)
+                    break
 
         transport = _resolve_transport(runner, prefix)
         if transport is None:

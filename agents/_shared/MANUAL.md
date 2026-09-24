@@ -1508,6 +1508,27 @@ other's turns live, no restart needed. Turns from the two transports
 serialize against each other like two messages in one channel (they ARE
 one conversation).
 
+**Out-of-turn delivery follows the person (2026-09-24).** Live replies
+always post back through the channel the message came in on. Work that
+starts later from only a conversation_id — `send_message(session_id=...)`,
+cron jobs (their `sessionId` defaults to the current conversation, i.e. the
+PRIMARY), and restart continuations — used to read the transport off the
+id's prefix, so it went to the primary's transport (e.g. iMessage) even when
+the person had been talking on Discord. Now every inbound message in a
+linked conversation records its native route (transport, transport id,
+handle) in `agents/<id>/linked_routes.json` (`openflip/linked_routes.py`),
+and those three paths deliver via the route used last. History still lands
+in the shared primary conversation; only delivery changes. Unlinked
+conversations never get an entry, so nothing changes for them. Until the
+person sends one message after the upgrade there is no route yet, and the
+old prefix behavior applies. On multi-transport agents, synthetic turns
+carrying a Session now run on that Session's own transport
+(`AgentRunner.transport_named`) instead of the first one in the list. The
+iMessage transport also strips an `imessage:` prefix from any address it is
+handed (a prefixed id used to reach `imsg send --to imessage:...` and fail
+with rc=1), and a failed send now logs the target args and up to 1000 chars
+of stderr.
+
 **1:1 only.** The rewrite applies to DMs / 1:1 chats. Guild channels and
 iMessage group chats are shared spaces keyed by channel — they are never
 rewritten, even when a linked person speaks in them.
