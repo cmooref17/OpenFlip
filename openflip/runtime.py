@@ -2459,9 +2459,13 @@ class AgentRunner:
                 if _rstate is None:
                     _rstate = RecallState()
                     conv._memory_recall_state = _rstate
-                _recalled = await recall_block(
-                    os.path.dirname(agent.path), user_text, _rstate, agent_id=agent.id,
-                )
+                # Show "typing..." while the selector model runs: a person is
+                # waiting on this turn (operator_facing_turn above), and the
+                # selector can take seconds before the main typing block opens.
+                async with _discord_safe_typing(channel, agent_id=agent.id):
+                    _recalled = await recall_block(
+                        os.path.dirname(agent.path), user_text, _rstate, agent_id=agent.id,
+                    )
                 if _recalled:
                     framed_user = f"{framed_user}\n\n{_recalled}"
             except Exception as _recall_err:

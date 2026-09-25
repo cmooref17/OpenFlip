@@ -1189,6 +1189,9 @@ It mirrors Claude Code 2.1.280's recall supervisor:
 - Limits: skipped for empty / one-word messages (except CJK), per-
   conversation dedupe, 61,440 recalled bytes per conversation (state is in
   memory; resets on `/reset` or restart).
+- Typing indicator: the selector call runs inside the transport's typing
+  context, so the person sees "typing..." during the (sometimes multi-
+  second) selection instead of dead air before the main turn loop starts.
 - Never breaks a turn: any selector/network error logs `memory recall
   failed` and the turn continues without it. Log line on success:
   `memory recall: N/M via <model> in Xs [files]`.
