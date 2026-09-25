@@ -950,8 +950,12 @@ re-fire on boot.
 - **`generate_image(prompt, model=None, lora=None, lora_strength=1.0,
   negative_prompt=None)`** — txt2img via ComfyUI. Owner-locked params:
   width, height, steps, cfg, sampler, batch_size, default model.
-- **`edit_image(image_url, instruction)`** — img2img via
-  Qwen-Image-Edit-Plus + optional 4-step Lightning LoRA.
+- **`edit_image(image_url, instruction, reference_urls=None)`** — img2img via
+  Qwen-Image-Edit-Plus + optional 4-step Lightning LoRA. `reference_urls`
+  takes up to 2 extra images to pull things from ("put this hat on me"):
+  `image_url` is Picture 1 (the one changed; output keeps its size), the
+  references are Pictures 2-3, and the instruction names them ("the hat from
+  Picture 2"). Wired into the encoder's image2/image3 slots.
 - **`upscale_image(image_url)`** — 4× ESRGAN upscale. Bound-down before
   upscale to stay within VRAM.
 - **`generate_video(prompt)`** — txt2video via Wan 2.2 T2V.
