@@ -150,14 +150,44 @@ def _detect_claude_code_version() -> str:
     """Return the installed Claude Code version (e.g. "2.1.280").
 
     Strategy, in order of preference:
-      1. Resolve `claude` on PATH, realpath it, and pull the `.../versions/<V>`
-         segment out of the resolved path (fast, no subprocess).
-      2. Run `claude --version` and parse the leading X.Y.Z from stdout.
-      3. Fall back to _CC_VERSION_FLOOR.
+      1. Scan the official-installer version dir (~/.local/share/claude/
+         versions/, or $CLAUDE_CONFIG_DIR/versions) and pick the HIGHEST
+         X.Y.Z present. This is the self-updating install, so it's the real
+         current version — and it can't be poisoned by a stale `claude` on
+         PATH (a leftover system-wide npm install left /usr/bin/claude
+         pointing at an ancient cli.js; PATH found it first and reported
+         2.1.50, which made the API reject every newer model. 2026-09-25.)
+      2. Resolve `claude` on PATH, realpath it, and pull the `.../versions/<V>`
+         segment out of the resolved path.
+      3. Run `claude --version` and parse the leading X.Y.Z from stdout.
+      4. Fall back to _CC_VERSION_FLOOR.
 
     Every strategy is wrapped so a detection failure can never crash import.
     """
-    # Strategy 1: resolve the symlink and read the versions/<V> path segment.
+    # Strategy 1: scan the official-installer versions dir and take the max.
+    # This dir only ever holds real installed versions, so the newest one
+    # is authoritative and immune to a stale PATH entry.
+    try:
+        base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser(
+            os.path.join("~", ".local", "share", "claude")
+        )
+        versions_dir = os.path.join(base, "versions")
+        best: tuple[int, ...] | None = None
+        best_str = ""
+        for entry in os.listdir(versions_dir):
+            m = _CC_VERSION_RE.match(entry)
+            if not m:
+                continue
+            v = m.group(0)
+            key = tuple(int(x) for x in v.split("."))
+            if best is None or key > best:
+                best, best_str = key, v
+        if best_str:
+            return best_str
+    except Exception:
+        pass
+
+    # Strategy 2: resolve the symlink and read the versions/<V> path segment.
     try:
         exe = shutil.which("claude")
         if exe:
@@ -170,7 +200,7 @@ def _detect_claude_code_version() -> str:
     except Exception:
         pass
 
-    # Strategy 2: ask the CLI directly.
+    # Strategy 3: ask the CLI directly.
     try:
         out = subprocess.run(
             ["claude", "--version"],
@@ -182,7 +212,7 @@ def _detect_claude_code_version() -> str:
     except Exception:
         pass
 
-    # Strategy 3: last-resort floor.
+    # Strategy 4: last-resort floor.
     return _CC_VERSION_FLOOR
 
 
