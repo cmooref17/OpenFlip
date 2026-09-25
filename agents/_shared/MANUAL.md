@@ -2935,6 +2935,10 @@ Text-mirror gating in general: `/effort`, `/session`, `/model`, `/models`,
 `/dream`, `/uncompact`, `/reload`, `/restart` are owner-only; `/reset`,
 `/compact`, `/status`, `/help` are ungated (see "Owner vs admin" in §3).
 
+The Discord `/model` panel has no agent picker: it always edits the model of the
+agent whose bot the command was run on (switch another agent by running its bot's
+`/model`).
+
 `/model` is also a cross-transport text-prefix mirror (the Discord slash `/model`
 opens an interactive panel that can't render off-Discord): bare `/model` shows the
 current model + provider + usage, `/model <model-name>` switches the agent's model

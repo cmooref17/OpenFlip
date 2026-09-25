@@ -328,7 +328,8 @@ class ModelView(nextcord.ui.View):
 
     def _build_components(self):
         self.clear_items()
-        self.add_item(_AgentPicker(self.agent_id))
+        # No agent picker: /model always edits the agent it was run on
+        # (same shape as /effort, which only ever targets its own conversation).
         agent = _get_agent(self.agent_id) if self.agent_id else None
         self.add_item(_ModelPicker(self.models, agent.model if agent else None, disabled=(agent is None)))
         self.add_item(_RefreshModelsButton())
