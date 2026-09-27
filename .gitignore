@@ -103,6 +103,8 @@ openflip/tools/*
 !openflip/tools/cron_jobs.py
 !openflip/tools/dream_tool.py
 !openflip/tools/inject_context.py
+!openflip/tools/download_media.py
+!openflip/tools/_ytdlp.py
 
 
 # Third-party transport plugins — local extension point, never tracked so a

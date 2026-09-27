@@ -18,6 +18,7 @@ from . import snapshots  # noqa: F401
 from . import claude_code  # noqa: F401
 from . import end_chain  # noqa: F401
 from . import cron_jobs  # noqa: F401
+from . import download_media  # noqa: F401
 
 # === Optional extras ===
 # Files at openflip/tools/<name>.py OR package dirs openflip/tools/<name>/ that
@@ -32,7 +33,7 @@ _core_modules = {
     "_base", "web_search", "memory", "dream_tool", "files", "fetch_url", "run_command",
     "restart", "send_message", "talk_to_agent", "inject_context", "delete_message",
     "fetch_discord_message", "snapshots", "claude_code", "end_chain",
-    "cron_jobs",
+    "cron_jobs", "download_media", "_ytdlp",
 }
 for _fname in sorted(_os.listdir(_tools_dir)):
     if _fname.startswith("__"):

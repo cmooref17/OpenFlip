@@ -39,6 +39,7 @@ Step-by-step recipes for each are in
 - Python 3.11+
 - A Discord bot token per agent (free — see SETUP.md §8)
 - An Anthropic API key, or a local [Ollama](https://ollama.com) server
+- Optional: `ffmpeg` (plus `deno` or `node` for YouTube) for the `download_media` tool
 
 ## Quick start
 
