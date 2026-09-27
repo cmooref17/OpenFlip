@@ -1496,7 +1496,7 @@ identity's native conversation:
 
 ```json
 "identity_links": {
-  "discord:139243578504249344": "imessage:+15551234567"
+  "discord:123456789012345678": "imessage:+15551234567"
 }
 ```
 

@@ -211,7 +211,7 @@ def build_user_prompt(inbound: InboundMessage) -> str:
     raw_speaker = inbound.sender_display_name or "User"
     speaker = name_map.get(raw_speaker, raw_speaker)
     # Authoritative operator tag. Display names are spoofable (any guild
-    # member can nickname themselves "Flip"), so prompt-level rules that key
+    # member can nickname themselves after the owner), so prompt-level rules that key
     # on WHO is speaking need a framework-verified signal: strip any
     # user-supplied "[operator]" from the name, then append the real tag
     # only when the session says the sender IS the configured owner.

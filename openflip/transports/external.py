@@ -281,7 +281,7 @@ class ExternalTransport:
         is the token's operator-assigned fixed `session` — every turn on the
         token lands in one conversation, exactly as before. A token with
         `allow_session_choice` + `session_prefix` may name a session in the
-        body, but ONLY under its prefix (`mtg-` → `mtg-flip-3f2a…`), matching
+        body, but ONLY under its prefix (`mtg-` → `mtg-game-3f2a…`), matching
         the strict charset the trigger endpoint uses; anything else is a 400,
         never a silent fallback. The prefix is the security boundary: a game
         token can create/use/delete `mtg-*` sessions and nothing else."""
