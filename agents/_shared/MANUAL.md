@@ -966,6 +966,18 @@ re-fire on boot.
   audio over 600s.
 - **`remove_audio_track(audio_url, target)`** — Demucs; same model;
   removes the named stem (instrumental / karaoke).
+- **`download_media(url, audio_only=False, start=None, end=None)`** —
+  downloads a video (mp4, H.264/AAC, capped at `video_max_height`) or
+  just its audio from any yt-dlp-supported site; `start`/`end` (seconds)
+  keep only a section. Posts the file in chat when it's under
+  `max_attach_mb`, and always returns its local path (feed it to
+  `extract_audio_track` etc.). yt-dlp is auto-managed by `_ytdlp.py`:
+  the newest release is kept at `<data_dir>/bin/yt-dlp` and refreshed
+  daily, since sites break old builds (a stale yt-dlp gets YouTube 403s);
+  node is passed as the JS runtime when deno is absent. Refuses internal
+  hosts; non-owners get site extractors only (no generic extractor).
+  Owner-locked via `/toolset download_media`: duration/size/attach caps,
+  video height, audio format/quality, timeout, custom `ytdlp_path`.
 - **`generate_tts(model_id, text)`** — TTS via Gradio. `model_id` is
   `creator-modelname`; profile loaded from `data/tts_models/<id>/profile.pt`.
   Optional `language` hint via toolset.
