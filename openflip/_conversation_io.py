@@ -254,17 +254,57 @@ def find_undo_cut_index(msgs: list[dict]) -> int:
     recoverable; do NOT try to enumerate individual wrapper texts here to
     "fix" it — that list would drift as nudges are added.
     """
+    return find_undo_cut_index_n(msgs, 1)
+
+
+def find_undo_cut_index_n(msgs: list[dict], n: int) -> int:
+    """Index of the user message that started the n-th most recent turn, or
+    -1 when fewer than n turns exist. n=1 is find_undo_cut_index."""
+    found = 0
     for i in range(len(msgs) - 1, -1, -1):
         m = msgs[i]
         if m.get("role") != "user":
             continue
         if str(m.get("content", "")).lstrip().startswith(_FRAMEWORK_MSG_PREFIX):
             continue
-        return i
+        found += 1
+        if found >= n:
+            return i
     return -1
 
 
-def undo_last_turn(conv, *, log_agent_id: Optional[str] = None) -> Optional[tuple[int, str, str]]:
+# Where the operator's own words start inside a stored turn-starting user
+# message. The runtime frames it as
+#   [<per-speaker preamble>\n\n---\n\n]<build_user_prompt text>[\n\n<relevant-memories>…]
+# and build_user_prompt text is "[stamp]\n[replying to …]\n<Name>: <text>".
+_PREAMBLE_SEP = "\n\n---\n\n"
+_RECALL_OPEN = "\n\n<relevant-memories>"
+_STAMP_LINE_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} [A-Za-z]+\]\n")
+_REPLY_LINE_RE = re.compile(r'^\[replying to [^\n]*\]\n')
+
+
+def user_facing_text(content: str) -> str:
+    """The operator's own message out of a stored turn-starting user message:
+    strips the per-speaker preamble (tool-config block), the recalled-memory
+    block, the time stamp, the [replying to …] quote and the "Name: " /
+    "Name [operator]: " speaker prefix. Display only — never fed back to the
+    model. Falls back to the stripped raw content when the shape is unknown."""
+    text = str(content or "")
+    i = text.find(_PREAMBLE_SEP)
+    if i >= 0 and text[:i].lstrip().startswith(("Current tool configuration", "[Speaker-specific access notes")):
+        text = text[i + len(_PREAMBLE_SEP):]
+    j = text.find(_RECALL_OPEN)
+    if j >= 0:
+        text = text[:j]
+    text = _STAMP_LINE_RE.sub("", text, count=1)
+    text = _REPLY_LINE_RE.sub("", text, count=1)
+    m = re.match(r"^[^\n:]{1,80}?(?: \[operator\])?: ", text)
+    if m:
+        text = text[m.end():]
+    return text.strip()
+
+
+def undo_last_turn(conv, *, log_agent_id: Optional[str] = None, count: int = 1) -> Optional[tuple[int, str, str, str]]:
     """Remove the most recent turn from `conv` — disk AND memory — as if it
     never happened. Duck-typed over the three conversation classes (they
     share `_conversation_path()`, `messages`, `_persisted_count`), so there
@@ -282,13 +322,21 @@ def undo_last_turn(conv, *, log_agent_id: Optional[str] = None) -> Optional[tupl
     (AgentRunner.undo_last_turn's guard) — a mid-flight turn re-saves its
     own view of history at end-of-turn and would resurrect the removed tail.
 
-    Returns (removed_count, preview_of_cut_message, backup_basename);
-    None when there is nothing to undo. Raises RuntimeError if the backup
-    could not be written (no safety net → no rewrite).
+    `count` undoes that many turns at once (cut at the start of the
+    count-th most recent turn); when fewer turns exist, returns None and
+    changes nothing.
+
+    Returns (removed_count, removed_operator_messages, backup_basename,
+    raw_content_of_cut_message); None when there is nothing to undo.
+    removed_operator_messages is the operator's own text (user_facing_text)
+    of each removed turn start, oldest first. The raw
+    content is the stored turn-starting user message exactly as it sat in
+    history (for /redo). Raises RuntimeError if the backup could not be
+    written (no safety net → no rewrite).
     """
     path = conv._conversation_path()
     msgs = read_all_messages(path)
-    cut = find_undo_cut_index(msgs)
+    cut = find_undo_cut_index_n(msgs, max(1, int(count or 1)))
     if cut < 0:
         return None
 
@@ -319,11 +367,18 @@ def undo_last_turn(conv, *, log_agent_id: Optional[str] = None) -> Optional[tupl
         to_drop -= 1
     conv._persisted_count = sum(1 for m in conv.messages if _role(m) != "system")
 
-    raw = " ".join(str(msgs[cut].get("content", "")).split())
-    preview = raw[:120] + ("…" if len(raw) > 120 else "")
+    cut_content = str(msgs[cut].get("content", ""))
+    # The operator's own words from every removed turn start, oldest first
+    # (framework wrappers skipped, same rule as the cut).
+    previews = [
+        user_facing_text(m.get("content", ""))
+        for m in msgs[cut:]
+        if m.get("role") == "user"
+        and not str(m.get("content", "")).lstrip().startswith(_FRAMEWORK_MSG_PREFIX)
+    ]
     print_ts(
-        f"undo: removed last turn — {removed} message(s) from disk index {cut}; "
-        f"backup {os.path.basename(backup)}",
+        f"undo: removed {max(1, int(count or 1))} turn(s) — {removed} message(s) from disk "
+        f"index {cut}; backup {os.path.basename(backup)}",
         agent=log_agent_id,
     )
-    return removed, preview, os.path.basename(backup)
+    return removed, previews, os.path.basename(backup), cut_content

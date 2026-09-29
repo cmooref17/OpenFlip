@@ -741,7 +741,7 @@ class AgentRunner:
         self._pending_inject.pop(conv_key, None)
         return ok
 
-    def undo_last_turn(self, conv_key: int | str, fallback_conv_id: str = "") -> tuple[bool, str]:
+    def undo_last_turn(self, conv_key: int | str, fallback_conv_id: str = "", count: int = 1) -> tuple[bool, str]:
         """Remove the most recent turn (the turn-starting user message plus
         everything after it — assistant reply, tool messages, soft-injected
         follow-ups, framework notes) from this conversation, memory and disk,
@@ -759,39 +759,116 @@ class AgentRunner:
         synchronous (no awaits), so nothing interleaves on the event loop
         between the in-flight guard and the rewrite.
 
+        `count` (the `/undo N` argument) removes that many turns at once.
+
         Returns (ok, operator-facing message). Both paths send the message
         as-is, so keep it self-explanatory.
         """
+        ok, msg, _cut = self._undo_turns(conv_key, fallback_conv_id, count, verb="/undo")
+        return ok, msg
+
+    @staticmethod
+    def _format_removed_messages(previews: list, budget: int = 1500) -> str:
+        """The operator's removed message(s) as quoted lines, oldest first,
+        so they can see (and copy) what they said. Stored turn messages also
+        carry the tool-config preamble and recalled memories;
+        _conversation_io.user_facing_text already stripped those. Kept under
+        `budget` chars so the whole reply fits one Discord message."""
+        if not previews:
+            return ""
+        head = "Your last message was:" if len(previews) == 1 else "Your removed messages were:"
+        per = max(120, budget // len(previews))
+        blocks = []
+        for p in previews:
+            t = (p or "").strip() or "(empty)"
+            if len(t) > per:
+                t = t[:per].rstrip() + "…"
+            blocks.append("\n".join("> " + line for line in t.splitlines()))
+        return head + "\n" + "\n\n".join(blocks)
+
+    def _undo_turns(self, conv_key: int | str, fallback_conv_id: str, count: int,
+                    *, verb: str) -> tuple[bool, str, str]:
+        """Shared body of /undo and /redo. Returns (ok, message, raw content of
+        the removed turn-starting user message — "" on failure)."""
+        try:
+            count = max(1, int(count or 1))
+        except (TypeError, ValueError):
+            return (False, f"⚠️ {verb}: the number of turns must be a whole number.", "")
         active = self._active_turns.get(conv_key)
         if active is not None and not active.done():
-            return (False, "A turn is in flight in this conversation — `/stop` it first (or wait for it to finish), then `/undo`.")
+            return (False, f"A turn is in flight in this conversation — `/stop` it first (or wait for it to finish), then `{verb}`.", "")
         conv = self.conversations.get(conv_key)
         if conv is None:
             if not fallback_conv_id:
-                return (False, "⚠️ /undo: could not resolve conversation id for this channel.")
+                return (False, f"⚠️ {verb}: could not resolve conversation id for this channel.", "")
             try:
                 conv = self.get_conversation(conv_key, fallback_conv_id)
             except Exception as e:
-                return (False, f"⚠️ /undo: could not load this channel's conversation: {e}")
+                return (False, f"⚠️ {verb}: could not load this channel's conversation: {e}", "")
         from . import _conversation_io as _cio_undo
         try:
-            result = _cio_undo.undo_last_turn(conv, log_agent_id=self.agent.id)
+            result = _cio_undo.undo_last_turn(conv, log_agent_id=self.agent.id, count=count)
         except Exception as e:
-            print_ts(f"{COLOR_YELLOW}/undo failed: {e}{COLOR_END}", agent=self.agent.id)
-            return (False, f"⚠️ /undo failed: {e}")
+            print_ts(f"{COLOR_YELLOW}{verb} failed: {e}{COLOR_END}", agent=self.agent.id)
+            return (False, f"⚠️ {verb} failed: {e}", "")
         if result is None:
-            return (False, "Nothing to undo — no turn found in this conversation's history.")
-        removed, preview, backup_name = result
+            if count > 1:
+                return (False, f"Nothing undone — this conversation has fewer than {count} turns.", "")
+            return (False, "Nothing to undo — no turn found in this conversation's history.", "")
+        removed, previews, backup_name, cut_content = result
+        what = "the last turn" if count == 1 else f"the last {count} turns"
         msg = (
-            f"↩️ Undid the last turn — removed {removed} message(s), starting from: “{preview}”\n"
-            f"History backup: `{backup_name}`"
+            f"↩️ Undid {what} ({removed} message(s)). History backup: `{backup_name}`\n"
+            + self._format_removed_messages(previews)
         )
         if getattr(conv, "_compaction_block", None):
             msg += (
                 "\n⚠️ This conversation carries a compaction summary. If the undone content "
                 "was already compacted into it, `/uncompact` (or `/reset`) is the only full purge."
             )
-        return (True, msg)
+        return (True, msg, cut_content)
+
+    async def redo_last_turn(self, conv_key: int | str, fallback_conv_id: str, *,
+                             target, speaker_id: int = 0, speaker_handle: str = "") -> tuple[bool, str]:
+        """/redo: undo the last turn, then send the same message again as a
+        fresh turn in this conversation (a retry for a bad reply).
+
+        The re-sent user message is the stored one, byte-for-byte (its original
+        tool-config preamble, time stamp and recalled memories) — see
+        `verbatim_user_message` in `_run_turn`. The history before it is
+        untouched by the undo, so the cached prefix up to the previous turn is
+        reused and the request looks exactly like the original did.
+
+        `target` is where the new turn runs (the invoking Session when one is
+        available — routes correctly on every transport — else the channel id),
+        same convention as /dream. It runs as an operator turn (log tag
+        "[redo] ", not "[synthetic] "): the reply posts normally, a human
+        message doesn't drop it from the queue, and it gets the operator-turn
+        guarantees. Memory recall is skipped because the message already
+        carries the original turn's recalled memories.
+
+        Image attachments on the original message are NOT re-sent (only their
+        [attachment: url] lines, which are in the text).
+        """
+        ok, msg, cut_content = self._undo_turns(conv_key, fallback_conv_id, 1, verb="/redo")
+        if not ok:
+            return (False, msg)
+        try:
+            await self.run_synthetic_turn(
+                target,
+                cut_content,
+                auto_post_final_text=True,
+                speaker_id=int(speaker_id) if speaker_id else 0,
+                speaker_handle=speaker_handle or "",
+                originator_visibility="operator_channel",
+                verbatim_user_message=cut_content,
+                log_tag="[redo] ",
+            )
+        except Exception as e:
+            print_ts(f"{COLOR_YELLOW}/redo: failed to enqueue the retry: {e}{COLOR_END}", agent=self.agent.id)
+            return (False, msg.replace("↩️ Undid", "↩️ Undid (but could not re-send)", 1)
+                    + f"\n⚠️ Re-send failed: {e}. Send the message again yourself.")
+        return (True, msg.replace("↩️ Undid the last turn", "🔁 Redoing the last turn", 1))
 
     def _drain_pending_injects(self, channel_id: int | str, conv) -> int:
         """Soft-inject drain. `channel_id` is a conversation key (int or
@@ -1556,6 +1633,8 @@ class AgentRunner:
         originator_session: Optional[Session] = None,
         chain_root_agent_id: str = "",
         force_tool_choice: dict | None = None,
+        verbatim_user_message: str | None = None,
+        log_tag: str = "[synthetic] ",
     ) -> None:
         """Fire a turn for this agent without an inbound Discord message.
 
@@ -1656,7 +1735,7 @@ class AgentRunner:
             "owner": is_owner_turn,
             "user_text": prompt_text,
             "discord_message": None,
-            "log_tag": "[synthetic] ",
+            "log_tag": log_tag,
             "auto_post_final_text": auto_post_final_text,
             "depth": depth,
             "originator_agent_id": originator_agent_id or "",
@@ -1676,6 +1755,7 @@ class AgentRunner:
             # tell the genuine top-level operator terminator from a nested one.
             "chain_root_agent_id": chain_root_agent_id or "",
             "force_tool_choice": force_tool_choice,
+            "verbatim_user_message": verbatim_user_message,
         })
 
     async def _resolve_synthetic_channel(
@@ -1913,6 +1993,7 @@ class AgentRunner:
         originator_session: Optional[Session] = None,
         chain_root_agent_id: str = "",
         force_tool_choice: dict | None = None,
+        verbatim_user_message: str | None = None,
     ) -> None:
         """Shared agent loop — calls the model, runs tools, feeds results back,
         loops until the model emits no more tool calls or hits the turn cap.
@@ -2442,13 +2523,22 @@ class AgentRunner:
             framed_user = f"{user_preamble}\n\n---\n\n{user_text}"
         else:
             framed_user = user_text
+        # /redo: re-send the undone turn's stored message byte-for-byte (its
+        # original preamble, stamp and recalled memories). Rebuilding it would
+        # re-run memory recall (whose per-conversation dedupe already counts
+        # those files) and re-stamp the time, changing the message; verbatim
+        # keeps the retried turn identical to the original, so the history
+        # prefix stays the same and the cache read still hits.
+        _verbatim = verbatim_user_message is not None
+        if _verbatim:
+            framed_user = verbatim_user_message
         # Memory recall (Claude-Code-style, see openflip/memory_recall.py): on
         # a human turn a person is waiting on, a small selector model picks up
         # to 5 relevant topic files and their bodies ride on THIS user message
         # (not the system prompt, so the cached prefix stays stable). Same
         # memory gate as the index; never repeats a file in a conversation;
         # any failure returns "" and the turn proceeds without it.
-        if (_mem_enabled and agent.memory_enabled and operator_facing_turn(
+        if (not _verbatim and _mem_enabled and agent.memory_enabled and operator_facing_turn(
                 auto_post_final_text=auto_post_final_text, silent=silent,
                 is_chain_terminator=is_chain_terminator,
                 originator_agent_id=originator_agent_id,

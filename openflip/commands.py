@@ -69,8 +69,14 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         runner.reset_conversation(conv_key, fallback_conv_id=conv_id)
         await interaction.response.send_message("Conversation reset.", ephemeral=True)
 
-    @bot.slash_command(name="undo", description="Undo the last turn — remove it from this conversation's history.")
-    async def undo_cmd(interaction: nextcord.Interaction):
+    @bot.slash_command(name="undo", description="Undo the last turn (or the last N turns) — remove it from this conversation's history.")
+    async def undo_cmd(
+        interaction: nextcord.Interaction,
+        turns: int = nextcord.SlashOption(
+            name="turns", description="How many turns to undo (default 1)",
+            required=False, default=1, min_value=1, max_value=50,
+        ),
+    ):
         # Owner-only: /undo rewrites persisted history. Mirrors /uncompact,
         # /compact gating. The guard+cut+backup+rewrite sequence lives in ONE
         # place: AgentRunner.undo_last_turn, shared with the text-prefix
@@ -79,7 +85,21 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         ch_id = interaction.channel.id
         conv_key = _conv_key_for_interaction(runner, interaction)
         conv_id = conv_key if isinstance(conv_key, str) else f"discord:{ch_id}"
-        _ok, msg = runner.undo_last_turn(conv_key, fallback_conv_id=conv_id)
+        _ok, msg = runner.undo_last_turn(conv_key, fallback_conv_id=conv_id, count=turns or 1)
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @bot.slash_command(name="redo", description="Undo the last turn and send the same message again (retry the reply).")
+    async def redo_cmd(interaction: nextcord.Interaction):
+        # Owner-only (rewrites history like /undo). Undo + verbatim re-send
+        # live in ONE place: AgentRunner.redo_last_turn, shared with the
+        # text-prefix /redo (text_commands._do_redo).
+        if not await _owner_check(interaction): return
+        ch_id = int(getattr(interaction.channel, "id", 0) or 0)
+        conv_key = _conv_key_for_interaction(runner, interaction)
+        conv_id = conv_key if isinstance(conv_key, str) else f"discord:{ch_id}"
+        _ok, msg = await runner.redo_last_turn(
+            conv_key, conv_id, target=ch_id, speaker_id=int(interaction.user.id),
+        )
         await interaction.response.send_message(msg, ephemeral=True)
 
     @bot.slash_command(name="compact", description="Compact this channel's conversation now (needs ~50k+ tokens).")

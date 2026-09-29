@@ -1706,6 +1706,44 @@ Then the conversation is popped from the live cache and the files deleted,
 so the next message starts genuinely fresh. Epochs, interrupts, and the
 queue drain are all per-conversation and never cross conversations.
 
+## /undo and /redo
+
+Owner-only on every transport (slash and text-prefix). Both rewrite
+persisted history, so both REFUSE while a turn is in flight in the
+conversation — `/stop` first.
+
+`/undo [N]` removes the last turn (or the last N turns): the turn-starting
+user message plus everything after it (assistant replies, tool messages,
+soft-injected follow-ups, framework notes), from disk AND memory. The cut
+walks back past `[FRAMEWORK]`-prefixed user messages, so a nudge belongs to
+the turn it annotates. The live `.jsonl` is backed up to
+`.pre_undo_<ts>.bak.jsonl` first (no backup → no rewrite); the kept head is
+rewritten byte-for-byte with its original `ts` stamps. Asking for more turns
+than exist changes nothing. The reply quotes the operator's own removed
+message(s) — the stored message also carries the per-speaker tool-config
+preamble, the time stamp, a reply quote and any recalled memories;
+`_conversation_io.user_facing_text` strips those for display only.
+
+`/redo` = `/undo` + send the same message again as a fresh turn (retry a bad
+reply). The re-sent user message is the STORED one, byte-for-byte
+(`verbatim_user_message` on `_run_turn`): original preamble, stamp and
+recalled memories, and memory recall is skipped for it. That keeps the
+retried request identical to the original — same history prefix, same user
+message — so the prompt cache that covered the original request is still
+valid (rebuilding the message would re-run recall, whose per-conversation
+dedupe already counts those files, and could add a new time stamp). The
+retry runs as an operator turn (log tag `[redo] `: posts its reply, isn't
+dropped by the human-preempts-synthetic queue drain, gets the final-text
+guarantee). Image attachments on the original message are not re-downloaded
+(their `[attachment: url]` lines are in the text). One implementation each:
+`AgentRunner.undo_last_turn` / `AgentRunner.redo_last_turn`, shared by the
+slash commands (`commands.py`) and the text mirrors (`text_commands.py`).
+Tests: `tests/test_undo_redo.py`.
+
+A compacted conversation keeps its compaction summary; if the undone content
+was already compacted into it, `/uncompact` (or `/reset`) is the only full
+purge.
+
 ## /compact and /uncompact (Anthropic only)
 
 Gating: the SLASH `/compact` and `/uncompact` are owner-only; the
@@ -2967,14 +3005,14 @@ synthetic turn fired). Same model-gating caveat applies: don't set
 `xhigh`/`max` on a model that doesn't support it.
 
 Available as both the Discord slash command and a cross-transport text-prefix
-mirror (iMessage + any non-Discord transport), alongside `/reset`, `/compact`,
-`/uncompact`, `/session`, `/model` (alias `/models`), `/dream`, `/status`,
+mirror (iMessage + any non-Discord transport), alongside `/reset`, `/undo`,
+`/redo`, `/compact`, `/uncompact`, `/session`, `/model` (alias `/models`), `/dream`, `/status`,
 `/reload`, `/restart`, `/help`. On the text mirror the arg is optional too, but
 there's no panel off-Discord: bare `/effort` shows the current override + usage;
 `/effort <level>` sets it. `/effort` is
 owner-only on every transport (Ollama agents report it as unavailable).
 Text-mirror gating in general: `/effort`, `/session`, `/model`, `/models`,
-`/dream`, `/uncompact`, `/reload`, `/restart` are owner-only; `/reset`,
+`/dream`, `/undo`, `/redo`, `/uncompact`, `/reload`, `/restart` are owner-only; `/reset`,
 `/compact`, `/status`, `/help` are ungated (see "Owner vs admin" in §3).
 
 The Discord `/model` panel has no agent picker: it always edits the model of the

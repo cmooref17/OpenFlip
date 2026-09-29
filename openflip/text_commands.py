@@ -32,6 +32,7 @@ from .utils import print_ts, save_json, COLOR_YELLOW, COLOR_END
 _TEXT_COMMANDS = {
     "/reset",
     "/undo",
+    "/redo",
     "/compact",
     "/uncompact",
     "/effort",
@@ -138,7 +139,18 @@ async def handle_text_command(
         if not is_owner(speaker_id, transport=tname, handle=handle):
             await _send(transport, session_id, channel, "Owner only.")
             return True
-        await _do_undo(runner, conv_key, channel, transport, session_id)
+        await _do_undo(runner, conv_key, channel, transport, session_id, arg)
+        return True
+
+    if head == "/redo":
+        # Owner-only, same gating as /undo (it rewrites history, then
+        # re-sends). Pass the Session so the retry routes to THIS
+        # conversation on every transport (same reason as /dream below).
+        if not is_owner(speaker_id, transport=tname, handle=handle):
+            await _send(transport, session_id, channel, "Owner only.")
+            return True
+        await _do_redo(runner, conv_key, channel, transport, session_id,
+                       session if session is not None else ch_id, speaker_id, handle)
         return True
 
     if head == "/compact":
@@ -270,12 +282,34 @@ async def _do_reset(runner, ch_id, channel, transport, session_id) -> None:
     await _send(transport, session_id, channel, "Conversation reset.")
 
 
-async def _do_undo(runner, ch_id, channel, transport, session_id) -> None:
+async def _do_undo(runner, ch_id, channel, transport, session_id, arg: str = "") -> None:
     # The full guard+cut+backup+rewrite sequence lives in ONE place:
     # AgentRunner.undo_last_turn, shared with the slash /undo — same
     # no-drift rule as _do_reset above. Never inline an undo body here.
+    # Optional arg: how many turns to undo ("/undo 3").
+    count = 1
+    if arg:
+        try:
+            count = int(arg.split()[0])
+        except ValueError:
+            await _send(transport, session_id, channel, "Usage: `/undo` or `/undo <number of turns>`")
+            return
+        if count < 1:
+            await _send(transport, session_id, channel, "Usage: `/undo` or `/undo <number of turns>`")
+            return
     conv_id = _conversation_id_for_channel(channel, ch_id)
-    _ok, msg = runner.undo_last_turn(ch_id, fallback_conv_id=conv_id)
+    _ok, msg = runner.undo_last_turn(ch_id, fallback_conv_id=conv_id, count=count)
+    await _send(transport, session_id, channel, msg)
+
+
+async def _do_redo(runner, ch_id, channel, transport, session_id, target, speaker_id, handle) -> None:
+    # Undo + verbatim re-send live in ONE place: AgentRunner.redo_last_turn,
+    # shared with the slash /redo. Never inline a redo body here.
+    conv_id = _conversation_id_for_channel(channel, ch_id)
+    _ok, msg = await runner.redo_last_turn(
+        ch_id, conv_id, target=target,
+        speaker_id=int(speaker_id) if speaker_id else 0, speaker_handle=handle or "",
+    )
     await _send(transport, session_id, channel, msg)
 
 
