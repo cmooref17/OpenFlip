@@ -415,6 +415,9 @@ def _build_external_transport(agent: Agent) -> "ExternalTransport | None":
     key_path = str(ext.get("key_path", "") or "")
     token_path = str(ext.get("token_path", "") or "")
     request_timeout = float(ext.get("request_timeout", 120.0) or 120.0)
+    # None → the transport's loopback default; passed through as-is otherwise
+    # so a malformed value is rejected (fail closed) inside the transport.
+    trusted_proxies = ext.get("trusted_proxies")
 
     from .transports.external import ExternalTransport
     try:
@@ -426,6 +429,7 @@ def _build_external_transport(agent: Agent) -> "ExternalTransport | None":
             key_path=key_path,
             token_path=token_path,
             request_timeout=request_timeout,
+            trusted_proxies=trusted_proxies,
         )
     except Exception as e:
         print_ts(

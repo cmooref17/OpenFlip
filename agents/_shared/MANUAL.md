@@ -1365,6 +1365,7 @@ at runtime, no restart/SIGHUP needed). Shape:
       "allow_model_choice": false,
       "allowed_models": [],
       "rate_limit": 20,
+      "allowed_ips": ["203.0.113.7", "192.0.2.0/24"],
       "allowed_tools": ["web_search", "generate_image"],
       "session_overrides": {"memory": false, "context_window": 200000}
     }
@@ -1379,7 +1380,8 @@ name — every turn on this token lands in conversation `external:<session>`,
 never anything from the request body), `default_model` (**required**),
 `allow_model_choice` (bool, default false), `allowed_models` (list, only
 meaningful when `allow_model_choice` is true), `rate_limit` (req/min, default
-20), `allowed_tools` (optional per-token tool ceiling — see below),
+20), `allowed_ips` (optional per-token address lock — see below),
+`allowed_tools` (optional per-token tool ceiling — see below),
 `session_overrides` (optional — see below). Missing/empty/unparseable token
 file → **every** request 401 (fail closed). Tokens are compared in constant
 time; a token <32 chars is ignored.
@@ -1402,6 +1404,29 @@ already runs at that model's 200k window / trigger / effort without needing
 conversation that can never write to the agent's memory (the memory tools are
 hidden from and blocked for that conversation, regardless of
 `memory_enabled` and `allowed_tools`).
+
+**Per-token `allowed_ips` (address lock).** Optional list of IPv4/IPv6
+addresses and CIDR ranges. When present, a request carrying that token from any
+other address gets **403** `{"error": "this token is not allowed from your
+address"}`, checked right after the token matches and **before** the rate limit
+(an outsider holding a leaked token can't use up its budget). Use it for a
+token that ships inside something others can copy (a game save, a mod file):
+the leaked token then only works from the operator's own network. Tokens
+without the key are unaffected. Fail closed: `[]` or a non-list value denies
+every address, and an address that can't be determined is denied.
+
+The caller's address is the socket peer. `X-Forwarded-For` is believed only
+when the peer is a **trusted proxy** (default: loopback, i.e. a reverse proxy
+on the same machine such as Caddy), and only the rightmost hops (the ones the
+proxy appended) count, so a caller connecting straight to the port, or
+prepending an address in front of the proxy, can't claim one. Configure other
+proxies with `trusted_proxies` (list of CIDRs) in the transport config below;
+a malformed value trusts no proxy. IPv4-mapped IPv6 (`::ffff:a.b.c.d`) matches
+plain IPv4 entries. Refusals log one line per (session, address) per 10
+minutes. When the operator's home IP changes (dynamic ISP address), the token
+stops working from home until `allowed_ips` is updated; the file is re-read
+per request, so no restart is needed for that. Tests:
+`tests/test_external_ip_lock.py`.
 
 **Per-token `allowed_tools` (restrictive intersection).** Optional. When
 present it NARROWS the agent's `auth.external` ACL ceiling for this token — it
@@ -1443,8 +1468,8 @@ the body is ignored.
 
 **Response.** `200 {"reply": "<full agent text>"}`. The whole reply is captured
 (multi-chunk included). Error codes: **400** malformed/empty body or
-disallowed model, **401** missing/invalid token, **403** never (auth is
-all-or-nothing per token), **404** wrong agent path / unknown route, **413**
+disallowed model, **401** missing/invalid token, **403** token used from an
+address outside its `allowed_ips`, **404** wrong agent path / unknown route, **413**
 body over 16 KiB, **429** over the token's rate limit, **503** agent disabled,
 **504** turn didn't finish within the request timeout (default 120s), **500**
 internal error (details redacted). Concurrent requests for the same `session`
@@ -1458,7 +1483,9 @@ entries are invisible (fail closed).
 **Config** lives on `agent.json` under an `external` block (carried as a real
 field so it survives `agent.save()`), with a `config.json`
 `integrations.external.agents.<id>` fallback. Keys: `port`, `bind_host`,
-`cert_dir`, `cert_path`, `key_path`, `token_path`, `request_timeout`. Enabled
+`cert_dir`, `cert_path`, `key_path`, `token_path`, `request_timeout`,
+`trusted_proxies` (CIDR list whose `X-Forwarded-For` is believed for
+`allowed_ips`; default loopback). Enabled
 on agent_b; not on other agents.
 
 ---

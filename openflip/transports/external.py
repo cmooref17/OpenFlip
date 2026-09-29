@@ -29,6 +29,11 @@ Security posture (fail closed everywhere):
   - The session is keyed "external:<name>" and is_owner is hard-False
     (make_external_session), so owner-only tools/disclosure never unlock and a
     tool needs an explicit `auth.external` ACL block to be callable at all.
+  - Optional per-token `allowed_ips` (addresses/CIDRs) → 403 for any other
+    caller address, checked before the rate limit so an outsider holding the
+    token can't burn its request budget. The address is the socket peer;
+    X-Forwarded-For is believed only from a `trusted_proxies` peer (default
+    loopback), so a caller connecting straight to the port can't claim one.
   - Body capped at 16 KiB → 413. Per-token sliding-window rate limit → 429.
   - Per-session lock serializes concurrent same-token requests so two callers
     can't interleave into one conversation's turn.
@@ -45,6 +50,7 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import ipaddress
 import json
 import re
 import os
@@ -68,6 +74,27 @@ _MAX_BODY_BYTES = 16 * 1024
 # charset family as web.app._TRIGGER_SESSION_ID_RE, shorter cap; ':' is
 # excluded so the id can never smuggle a transport prefix.
 _SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+# Peers whose X-Forwarded-For is believed when a token has `allowed_ips`: a
+# reverse proxy on the same machine. Any other peer is judged by its socket
+# address and its headers are ignored.
+_DEFAULT_TRUSTED_PROXIES = ("127.0.0.0/8", "::1/128")
+
+
+def _parse_ip(value: str) -> "ipaddress.IPv4Address | ipaddress.IPv6Address | None":
+    """One address from a socket peer or an X-Forwarded-For hop, or None.
+
+    IPv4-mapped IPv6 (``::ffff:a.b.c.d``, what a dual-stack socket reports for
+    an IPv4 client) is unwrapped so it matches plain IPv4 rules."""
+    s = (value or "").strip().strip('"')
+    if s.startswith("[") and "]" in s:
+        s = s[1:s.index("]")]
+    try:
+        ip = ipaddress.ip_address(s)
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
 
 
 class ExternalTransport:
@@ -85,6 +112,7 @@ class ExternalTransport:
         key_path: str = "",
         token_path: str = "",
         request_timeout: float = 120.0,
+        trusted_proxies: Optional[list] = None,
     ):
         self.port = int(port)
         self.bind_host = bind_host or "0.0.0.0"
@@ -112,6 +140,14 @@ class ExternalTransport:
 
         # Per-token sliding-window request timestamps for rate limiting.
         self._rate_hits: dict[str, list[float]] = {}
+
+        # Proxies whose X-Forwarded-For is believed (see _client_ip). None →
+        # loopback. A malformed value trusts NO proxy (fail closed: proxied
+        # callers then look like the proxy itself and IP-locked tokens deny).
+        self._trusted_proxies = self._parse_trusted_proxies(trusted_proxies)
+        # (session, ip) → last time an IP-lock rejection was logged, so a
+        # stolen token being hammered doesn't flood the log.
+        self._ip_reject_logged: dict[tuple[str, str], float] = {}
 
         # Per-request reply capture: {session_name: [chunk, ...]}. send()
         # appends; the handler joins and clears.
@@ -314,6 +350,96 @@ class ExternalTransport:
         hits.append(now)
         return True
 
+    # ------------------------------------------------------------ IP lock
+
+    def _parse_trusted_proxies(self, raw: Any) -> list:
+        """Networks whose X-Forwarded-For header is believed. None → loopback.
+        Anything malformed → [] (trust no proxy: fail closed)."""
+        if raw is None:
+            raw = list(_DEFAULT_TRUSTED_PROXIES)
+        if not isinstance(raw, list):
+            print_ts(
+                f"{COLOR_RED}ExternalTransport: trusted_proxies must be a list; "
+                f"trusting no proxy.{COLOR_END}",
+                agent=self._agent_id(), error=True,
+            )
+            return []
+        nets = []
+        for item in raw:
+            try:
+                nets.append(ipaddress.ip_network(str(item).strip(), strict=False))
+            except ValueError:
+                print_ts(
+                    f"{COLOR_RED}ExternalTransport: bad trusted_proxies entry "
+                    f"{item!r} ignored.{COLOR_END}",
+                    agent=self._agent_id(), error=True,
+                )
+        return nets
+
+    def _client_ip(self, request: web.Request) -> "ipaddress.IPv4Address | ipaddress.IPv6Address | None":
+        """The caller's real address, or None if it can't be determined.
+
+        Starts from the socket peer. Only while the address in hand belongs to
+        a trusted proxy is X-Forwarded-For consulted, walked right to left
+        (each proxy appends the address it saw, so the rightmost hops are the
+        ones our proxy wrote; anything further left is caller-supplied). So a
+        caller hitting the port directly is judged by its socket address, and
+        a forged header in front of a trusted proxy is never reached."""
+        peer = request.remote
+        if peer is None and request.transport is not None:
+            info = request.transport.get_extra_info("peername")
+            peer = info[0] if info else None
+        ip = _parse_ip(str(peer or ""))
+        if ip is None:
+            return None
+        if not any(ip in net for net in self._trusted_proxies):
+            return ip
+        hops: list[str] = []
+        for header in request.headers.getall("X-Forwarded-For", []):
+            hops.extend(h.strip() for h in header.split(","))
+        for hop in reversed([h for h in hops if h]):
+            hop_ip = _parse_ip(hop)
+            if hop_ip is None:
+                return None  # garbled chain from our own proxy: fail closed
+            ip = hop_ip
+            if not any(ip in net for net in self._trusted_proxies):
+                return ip
+        return ip
+
+    def _ip_allowed(self, entry: dict, request: web.Request) -> tuple[bool, str]:
+        """(allowed, caller ip as text). Tokens without `allowed_ips` are
+        unrestricted. Present but empty or malformed → deny all (fail closed:
+        a typo must never fall open)."""
+        if "allowed_ips" not in entry or entry.get("allowed_ips") is None:
+            return True, ""
+        raw = entry.get("allowed_ips")
+        ip = self._client_ip(request)
+        shown = str(ip) if ip is not None else "unknown"
+        if not isinstance(raw, list) or ip is None:
+            return False, shown
+        for item in raw:
+            try:
+                net = ipaddress.ip_network(str(item).strip(), strict=False)
+            except ValueError:
+                continue
+            if net.version == ip.version and ip in net:
+                return True, shown
+        return False, shown
+
+    def _log_ip_reject(self, entry: dict, ip: str) -> None:
+        """One log line per (session, address) per 10 minutes."""
+        sess = str(entry.get("session") or entry.get("session_prefix") or "?")
+        key = (sess, ip)
+        now = time.time()
+        if now - self._ip_reject_logged.get(key, 0.0) < 600:
+            return
+        self._ip_reject_logged[key] = now
+        print_ts(
+            f"{COLOR_YELLOW}ExternalTransport: refused token for '{sess}' from "
+            f"{ip} (not in its allowed_ips).{COLOR_END}",
+            agent=self._agent_id(),
+        )
+
     # --------------------------------------------------------------- handler
 
     async def _handle_request(self, request: web.Request) -> web.Response:
@@ -478,6 +604,14 @@ class ExternalTransport:
         entry = self._match_token(provided)
         if entry is None:
             return None, web.json_response({"error": "invalid token"}, status=401)
+        # IP lock, before the rate limit: a stolen token used from elsewhere
+        # must not eat the owner's per-minute budget.
+        ok, ip = self._ip_allowed(entry, request)
+        if not ok:
+            self._log_ip_reject(entry, ip)
+            return None, web.json_response(
+                {"error": "this token is not allowed from your address"}, status=403,
+            )
         # Per-token rate limit. Key by a hash of the token (never store/echo it).
         token_key = hashlib.sha256(provided.encode("utf-8")).hexdigest()
         rate_limit = int(entry.get("rate_limit", 20) or 20)
