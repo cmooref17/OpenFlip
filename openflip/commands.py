@@ -920,11 +920,26 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
 
     # ---------------- MODEL / OPTIONS PANELS (interactive) ---------------------
 
-    @bot.slash_command(name="model", description="(owner) Show or change an agent's model — interactive panel.")
+    @bot.slash_command(name="model", description="Show or change the model — owner: the agent's model; allowed users: this chat only.")
     async def model_cmd(interaction: nextcord.Interaction):
-        if not await _owner_check(interaction): return
         from . import agent_ui
-        await agent_ui.open_model_panel(interaction, runner_agent_id=runner.agent.id)
+        if is_owner(interaction.user.id):
+            await agent_ui.open_model_panel(interaction, runner_agent_id=runner.agent.id)
+            return
+        if interaction.user.id not in agent_ui.model_command_users():
+            await interaction.response.send_message("You don't have permission to run this.", ephemeral=True)
+            return
+        # Allowed non-owner: per-conversation session override only, never agent.json.
+        _conv_key = _conv_key_for_interaction(runner, interaction)
+        conv = runner.conversations.get(_conv_key)
+        if conv is None:
+            _ch_id = int(getattr(interaction.channel, "id", 0) or 0)
+            _conv_id = _conv_key if isinstance(_conv_key, str) else f"discord:{_ch_id}"
+            try:
+                conv = runner.get_conversation(_conv_key, _conv_id)
+            except Exception as _e:
+                print_ts(f"/model: conversation preload failed: {_e}", error=True, agent=runner.agent.id)
+        await agent_ui.open_session_model_panel(interaction, conv=conv, agent=runner.agent)
 
     @bot.slash_command(name="options", description="(owner) Show or change an agent's Ollama options — interactive panel.")
     async def options_cmd(interaction: nextcord.Interaction):

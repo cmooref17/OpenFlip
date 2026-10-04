@@ -56,7 +56,7 @@ async def claude_code(task: str, timeout: int = _DEFAULT_TIMEOUT, model: str = "
         timeout: Max seconds to wait for Claude Code to finish (default 600,
             i.e. 10 minutes). Capped at 1800 (30 minutes).
         model: Which Claude model Claude Code should run on. Defaults to
-            "claude-opus-4-8" (cost-safe). Pass "claude-fable-5" ONLY when
+            "claude-opus-4-8" (cost-safe). Pass "claude-fable-5-1" ONLY when
             the owner has explicitly approved it — Fable is much more
             expensive. This overrides whatever default is pinned in
             ~/.claude/settings.json, so the stuck-default never matters.

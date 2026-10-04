@@ -758,3 +758,93 @@ async def open_effort_panel(interaction: nextcord.Interaction, *, conv, agent):
     view = EffortView(owner_id=interaction.user.id, conv=conv, agent=agent)
     await interaction.response.send_message(embed=_build_effort_embed(conv, agent), view=view, ephemeral=True)
     view.message = await interaction.original_message()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# /model for allowed non-owners — per-conversation only
+# ──────────────────────────────────────────────────────────────────────
+# Users listed in config `integrations.discord.model_command_users` may run
+# /model, but it never touches agent.json: their pick becomes a SESSION
+# override on the conversation they ran it in (same store as /session), so
+# it can't change the agent's model for anyone else. Only same-provider
+# models are offered (a session override can't change provider).
+
+def model_command_users() -> set[int]:
+    try:
+        from .config_global import get_config
+        raw = (((get_config() or {}).get("integrations") or {}).get("discord") or {}).get("model_command_users") or []
+        return {int(x) for x in raw}
+    except Exception:
+        return set()
+
+
+def _session_model_choices(agent) -> list[str]:
+    prov = getattr(agent, "provider", "ollama")
+    if prov == "anthropic":
+        return list(_claude_models())
+    if prov == "openai":
+        return [f"openai/{m}" for m in _openai_models()]
+    return []
+
+
+def _session_effective(conv, agent) -> str:
+    try:
+        return conv.overrides.get("model") or agent.model
+    except Exception:
+        return agent.model
+
+
+class _SessionModelPicker(nextcord.ui.StringSelect):
+    def __init__(self, choices: list[str], current: str):
+        cur_bare = current.split("/", 1)[-1]
+        opts = [nextcord.SelectOption(label=_truncate(m, 100), value=m,
+                                      default=(m.split("/", 1)[-1] == cur_bare))
+                for m in choices[:24]]
+        opts.append(nextcord.SelectOption(label="Reset to default", value="__reset__",
+                                          description="Use the agent's normal model again"))
+        super().__init__(placeholder="Pick a model for this chat…", options=opts,
+                         min_values=1, max_values=1, row=0)
+
+    async def callback(self, interaction: nextcord.Interaction):
+        view: "SessionModelView" = self.view
+        pick = self.values[0]
+        if pick == "__reset__":
+            view.conv.unset_override("model")
+            msg = f"✅ This chat is back to the default model `{view.agent.model}`."
+        else:
+            ok, res = view.conv.set_override("model", pick)
+            msg = f"✅ This chat now uses `{res}`." if ok else f"❌ {res}"
+        view.stop()
+        await interaction.response.edit_message(content=msg, embed=None, view=None)
+
+
+class SessionModelView(nextcord.ui.View):
+    def __init__(self, user_id: int, conv, agent):
+        super().__init__(timeout=_VIEW_TIMEOUT_S)
+        self.user_id = user_id
+        self.conv = conv
+        self.agent = agent
+        self.add_item(_SessionModelPicker(_session_model_choices(agent), _session_effective(conv, agent)))
+        self.add_item(_CloseButton())
+
+    async def interaction_check(self, interaction: nextcord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This panel belongs to someone else.", ephemeral=True)
+            return False
+        return True
+
+    def close_message(self) -> str:
+        return f"ℹ️ Model kept as `{_session_effective(self.conv, self.agent)}` for this chat."
+
+
+async def open_session_model_panel(interaction: nextcord.Interaction, *, conv, agent):
+    if conv is None:
+        await interaction.response.send_message("❌ Couldn't load this chat. Send me a message first, then try again.", ephemeral=True)
+        return
+    if not _session_model_choices(agent):
+        await interaction.response.send_message("❌ No models to pick from for this agent.", ephemeral=True)
+        return
+    e = nextcord.Embed(title="🤖 Model for this chat", color=0x5865F2)
+    e.description = (f"**{agent.display_name}** in this conversation only.\n"
+                     f"Current: `{_session_effective(conv, agent)}` (default `{agent.model}`)")
+    await interaction.response.send_message(embed=e, view=SessionModelView(interaction.user.id, conv, agent), ephemeral=True)
