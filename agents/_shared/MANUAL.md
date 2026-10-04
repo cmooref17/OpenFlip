@@ -168,7 +168,7 @@ them), not in any agent.json.
   prefix (stripped by `_normalize_model` before the API call) and the
   optional `-1m` suffix. Current model IDs: `claude-opus-4-8` (newest,
   released 2026-05-28, 1M-context-capable), `claude-opus-4-7`,
-  `claude-sonnet-4-6`. Append `-1m` to opt into the 1M-token context beta
+  `claude-sonnet-5-5`. Append `-1m` to opt into the 1M-token context beta
   (`context-1m-2025-08-07`) — this is encoded as a name suffix in the
   field but sent as an `anthropic-beta` header, not a different model id.
   So a 1M Opus 4.8 agent reads exactly:
@@ -1398,7 +1398,7 @@ request (removing a key from the token does NOT unset an already-persisted
 override — use `/session unset` or `/session clear` for that). The token's
 `default_model` remains a **per-turn** override and still wins over a
 `session_overrides.model` for the model id; because every model-derived
-lookup follows the effective model, a token pinned to `claude-sonnet-4-6`
+lookup follows the effective model, a token pinned to `claude-sonnet-5-5`
 already runs at that model's 200k window / trigger / effort without needing
 `context_window` in the seed. `"memory": false` is the way to give a token a
 conversation that can never write to the agent's memory (the memory tools are
@@ -2961,7 +2961,7 @@ Keys by provider: anthropic `model`, `context_window`, `compaction_trigger`,
 
 - `/session` (or `/session show`) — every setting with its effective value
   and which layer it came from.
-- `/session set <key> <value>` — e.g. `/session set model claude-sonnet-4-6`,
+- `/session set <key> <value>` — e.g. `/session set model claude-sonnet-5-5`,
   `/session set context_window 200k`, `/session set effort xhigh`,
   `/session set memory off`, `/session set options temperature=0.7
   num_predict=512` (ollama; several `k=v` pairs, merged over
