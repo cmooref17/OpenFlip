@@ -579,8 +579,9 @@ Read once at startup (`config_global.get_config` — changes need a
 gateway restart). Beyond `integrations.*`, `models.*`, and
 `identity_links` covered above:
 
-- `searxng_host` — SearXNG instance for `web_search` (default
-  `http://127.0.0.1:8888`; needs `json` in its `search.formats`).
+- `searxng_host` — SearXNG instance for `web_search`'s `searxng` backend
+  and the `auto` fallback (default `http://127.0.0.1:8888`; needs `json`
+  in its `search.formats`).
 - `comfyui_host` — ComfyUI for the image/video tools.
 - `tts_gradio_host` — Gradio TTS server for `generate_tts`.
 - `ollama_host` — Ollama for the ollama provider + embeddings.
@@ -712,8 +713,19 @@ problem.
 
 ## Web
 
-- **`web_search(query: str)`** — search via local SearXNG. Silent to
-  Discord (result text goes only to the model).
+- **`web_search(query: str)`** — web search. Silent to Discord (result
+  text goes only to the model). Owner picks the backend with
+  `/toolset web_search backend <auto|anthropic|searxng>`:
+  - `anthropic`: one small Messages call over the anthropic provider's
+    OAuth login with Anthropic's server tool `web_search_20250305`
+    (max 3 searches per call). Returns titles, URLs and page ages plus
+    a short sourced summary. Model = `/toolset web_search model`, empty
+    = newest anthropic sonnet in config `models`. Needs a working
+    anthropic login; each call costs the search model's tokens.
+  - `searxng`: local SearXNG (`searxng_host`); `categories`,
+    `language`, `time_range`, `engines` only apply here.
+  - `auto` (default): anthropic, falling back to SearXNG if the call
+    fails (HTTP error, no login, no model).
 - **`fetch_url(url: str)`** — fetch a URL. HTML auto-stripped to
   readable text. ~100KB cap. Browser headers. Silent to Discord.
   **SSRF-guarded:** private/internal/link-local/loopback/reserved and
