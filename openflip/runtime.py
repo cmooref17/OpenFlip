@@ -2466,7 +2466,9 @@ class AgentRunner:
         # backoff) — so this outer cap must leave room for a long healthy
         # stream PLUS the retry budget. It should fire only on true hangs.
         CHAT_TIMEOUT_S = 600
-        MAX_TOOL_TURNS = 100
+        from .config_global import get_max_tool_turns
+        MAX_TOOL_TURNS = get_max_tool_turns()   # config `max_tool_turns`, default 300
+        _cap_warned = False
         # Provider retry-notice hook: fires once per chat() call when
         # transient-error recovery is taking more than a few seconds, so
         # the operator isn't staring at a silent typing indicator.
@@ -2658,7 +2660,7 @@ class AgentRunner:
                         print_ts(f"{COLOR_YELLOW}{log_tag}Tool loop exceeded {MAX_TOOL_TURNS} turns; aborting.{COLOR_END}", agent=agent.id)
                         if auto_post_final_text:
                             try:
-                                await _safe_channel_send(channel, f"⚠️ Tool loop exceeded {MAX_TOOL_TURNS} turns. Stopping. Try `/reset` and rephrase.")
+                                await _safe_channel_send(channel, f"⚠️ Tool loop hit the {MAX_TOOL_TURNS}-round cap (config `max_tool_turns`). Stopping this turn.")
                             except Exception:
                                 pass
                         break
@@ -3203,6 +3205,20 @@ class AgentRunner:
                         if tu_id:
                             tool_msg["tool_use_id"] = tu_id
                         conv.messages.append(tool_msg)
+
+                    # Near the round cap: tell the model BEFORE it gets cut off, so it can
+                    # report progress and schedule its own continuation (add_cron_job run_at)
+                    # instead of the turn dying silently mid-task.
+                    if not _cap_warned and turn_count >= MAX_TOOL_TURNS - 10:
+                        _cap_warned = True
+                        try:
+                            conv.messages.append(ChatMessage('user',
+                                f"[FRAMEWORK]: This turn is at round {turn_count} of a hard cap of {MAX_TOOL_TURNS}. "
+                                "Within the next few rounds: tell the operator where you are (send_message), and if work "
+                                "remains, schedule your own continuation with add_cron_job(run_at=~1 minute from now) whose "
+                                "prompt lists the exact next steps. The turn will be stopped at the cap."))
+                        except Exception:
+                            pass
 
                     # Soft-inject drain. Must happen AFTER tool_results are
                     # appended (so we don't break the tool_use→tool_result

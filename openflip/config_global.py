@@ -400,6 +400,20 @@ def get_run_command_admin_only() -> bool:
     return True
 
 
+def get_max_tool_turns() -> int:
+    """Hard cap on model rounds (tool batches) in ONE turn. Top-level config key
+    `max_tool_turns` (int, >= 10). Default 300: long agentic jobs (builds, batch
+    renders) legitimately run past 100 rounds, and the old hardcoded 100 silently
+    killed an overnight job mid-task. A warning is injected near the cap so the
+    agent can hand off (cron one-shot) instead of dying silently.
+    """
+    try:
+        n = int(get_config().get("max_tool_turns", 300))
+    except (TypeError, ValueError):
+        return 300
+    return max(10, n)
+
+
 def get_openai_api_key() -> str:
     """Return the OpenAI API key, or "" if unconfigured.
 
