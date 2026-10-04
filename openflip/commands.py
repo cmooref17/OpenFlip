@@ -191,7 +191,7 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
             description="Setting to change (which keys apply depends on the provider — see show)"),
         value: str = nextcord.SlashOption(
             default="", required=False,
-            description="New value, e.g. claude-sonnet-4-6 · 200k · xhigh · off · temperature=0.7 num_predict=512"),
+            description="New value, e.g. claude-sonnet-5-5 · 200k · xhigh · off · temperature=0.7 num_predict=512"),
     ):
         # Owner-only: session overrides change the request body (model,
         # context window, compaction, output cap, effort, memory) and hence

@@ -73,7 +73,7 @@ def _claude_models() -> list[str]:
             return claude
     except Exception:
         pass
-    return ["claude-opus-4-8", "claude-sonnet-4-6"]
+    return ["claude-opus-5-5", "claude-sonnet-5-5"]
 
 
 def _is_claude_model(model: str) -> bool:

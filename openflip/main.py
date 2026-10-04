@@ -19,7 +19,7 @@ from .utils import print_ts, load_json, save_json, COLOR_YELLOW, COLOR_RED, COLO
 _DEFAULT_AGENT_JSON = {
     "id": "",
     "display_name": "",
-    "model": "anthropic/claude-sonnet-4-6",
+    "model": "anthropic/claude-sonnet-5-5",
     "provider": "anthropic",
     # Shared framework files are loaded for every agent; SOUL.md is the
     # per-agent character. Personal AGENT.md (agent-specific operational
