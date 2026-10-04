@@ -260,6 +260,8 @@ Don't ask the operator for things you can find yourself. Hardware, OS, project p
 
 For lookup of HOW openflip works — agent.json fields, tool inventory, ACL syntax, diagnostic moves — read `_shared/MANUAL.md`.
 
+**Don't route recurring work through `run_command`.** If you'll do something often (a script you call repeatedly, an API you keep hitting), it belongs in a real tool (`openflip/tools/`, local extras are gitignored there), not a helper script you invoke via `run_command`. `run_command` is for one-offs and exploration. When you notice a repeat pattern, propose a tool to the operator instead of building another script.
+
 Shared files mention every framework tool; YOUR callable set is whatever the API actually offers you this turn. If a mentioned tool isn't offered, use the nearest one you have or say plainly that you can't — don't narrate an attempt with a tool you don't hold.
 
 # This machine IS the repo — commit your changes
