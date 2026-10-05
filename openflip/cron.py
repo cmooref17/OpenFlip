@@ -670,6 +670,33 @@ async def _fire(job: dict) -> None:
                 _meta = _cpath[: -len(".jsonl")] + ".meta.json" if _cpath.endswith(".jsonl") else _cpath + ".meta.json"
                 if os.path.isfile(_meta):
                     os.replace(_meta, f"{_meta}.archived-{_ts}")
+                    # The archived meta also held the session's SETTINGS (the
+                    # "overrides" block: model, effort, etc. — and the legacy
+                    # top-level "effort_override" key), not just per-run state
+                    # (compaction_block, last_usage). Those settings must carry
+                    # into the fresh session; only the per-run state should
+                    # reset. Re-emit a settings-only meta so a cron session's
+                    # model/effort override survives more than one run.
+                    # load_overrides_from_meta re-validates every value on load,
+                    # so a stale/hand-edited block can't smuggle in junk.
+                    try:
+                        _old_meta = load_json(f"{_meta}.archived-{_ts}", default={})
+                        if isinstance(_old_meta, dict):
+                            _carry = {}
+                            _ovr = _old_meta.get("overrides")
+                            if isinstance(_ovr, dict) and _ovr:
+                                _carry["overrides"] = _ovr
+                            _legacy_eff = _old_meta.get("effort_override")
+                            if isinstance(_legacy_eff, str) and _legacy_eff:
+                                _carry["effort_override"] = _legacy_eff
+                            if _carry:
+                                save_json(_meta, _carry)
+                    except Exception as _meta_err:
+                        print_ts(
+                            f"{COLOR_YELLOW}cron: couldn't carry session "
+                            f"overrides forward ({_meta_err}){COLOR_END}",
+                            agent=agent_id,
+                        )
                 # Retention: keep the 5 newest archives per session.
                 for _old in sorted(_glob.glob(f"{_cpath}.archived-*"))[:-5]:
                     try:
