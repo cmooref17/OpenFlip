@@ -2516,6 +2516,17 @@ class AgentRunner:
         # diagnostic instead of letting the operator see silence. Models
         # Claude Code's `isResultSuccessful` exit check.
         _posted_assistant_text = False
+        # Unattended-work activity line (cron/kairos only). Long overnight work
+        # turns otherwise show nothing but a "typing" indicator for the whole
+        # run — the operator can't tell a live multi-tool turn from a dead one
+        # (2026-10-05: an agent looked silently stalled for ~2h). On cron/kairos
+        # turns past the first couple of rounds, we post a one-line "working:
+        # <tools>" status before each tool batch, throttled to one line per
+        # _ACTIVITY_MIN_GAP_S so a fast tool loop can't spam the channel. Never
+        # fires on normal operator chat turns (their text already flows) or on
+        # peer/silent turns. Tracks the last post time (epoch seconds) for the
+        # throttle.
+        _last_activity_s = 0.0
         # Captured provider/framework error string for this turn. Set when the
         # in-loop framework-error branch fires (non-200 from the API: rate
         # limit / overload / auth / 400). The terminal-result contract at
@@ -3129,6 +3140,30 @@ class AgentRunner:
                             continue
                         break
                     ai_message.tool_calls = new_calls
+
+                    # Unattended-work activity line. Cron/kairos turns only,
+                    # past round 2 (quick jobs stay silent), throttled to one
+                    # line per _ACTIVITY_MIN_GAP_S. Names the tools about to
+                    # run so a long overnight turn reads as alive, not stalled.
+                    # Best-effort: a send failure here is cosmetic and must
+                    # never tear the turn.
+                    if (originator_visibility in ("cron", "kairos")
+                            and turn_count >= 3 and new_calls):
+                        import time as _act_time
+                        _ACTIVITY_MIN_GAP_S = 30.0
+                        _now_s = _act_time.time()
+                        if (_now_s - _last_activity_s) >= _ACTIVITY_MIN_GAP_S:
+                            _last_activity_s = _now_s
+                            try:
+                                _tool_names = ", ".join(
+                                    dict.fromkeys(t.function_name for t in new_calls)
+                                )
+                                await _safe_channel_send(
+                                    channel,
+                                    f"⚙️ *working (round {turn_count}): {_tool_names}*",
+                                )
+                            except Exception:
+                                pass
 
                     _ch_id_ic = _conv_key
                     tool_results = await execute_tool_calls(
