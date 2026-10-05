@@ -660,6 +660,15 @@ def _build_effort_embed(conv, agent) -> nextcord.Embed:
 class _EffortPicker(nextcord.ui.StringSelect):
     def __init__(self, conv):
         _model, override, model_default, effective = _effort_state(conv)
+        # The dropdown box shows the label of whichever option has
+        # default=True; with none set it falls back to the placeholder. So
+        # when the effective effort is a level we list, pre-select it so the
+        # box reads the current value — like /model always does with its
+        # current model. When effort is genuinely unset (no session override
+        # AND no config default → the API decides), we don't invent a specific
+        # level (the API default isn't ours to assert); instead the embed
+        # already states "API default", and the placeholder below names that
+        # so the box is never a blank "Pick a level…".
         opts = []
         for lvl in _EFFORT_LEVELS:
             if lvl == effective:
@@ -675,8 +684,11 @@ class _EffortPicker(nextcord.ui.StringSelect):
             value=_EFFORT_RESET,
             description="Clear this conversation's override",
         ))
+        # Placeholder shows the current effective level (or "API default" when
+        # unset) so the collapsed box always reflects the current state, even
+        # in the unset case where no option can carry default=True.
         super().__init__(
-            placeholder="Pick an effort level…",
+            placeholder=f"Current: {effective or 'API default'} — pick to change",
             options=opts, min_values=1, max_values=1, row=0,
         )
 
