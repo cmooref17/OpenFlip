@@ -214,6 +214,24 @@ async def _notify_compaction_done(channel, *, was_manual: bool, elapsed_s: float
         pass
 
 
+def _primary_mem_key(conv_id: str) -> int | str:
+    """In-memory conversations-dict key for a forwarded (identity-linked) conversation.
+
+    A secondary identity (e.g. a voice or iMessage session) forwards into its
+    PRIMARY's conversation_id. If that primary is a Discord channel, the
+    primary's own turns key the dict by the bare int channel id, so the
+    secondary must use that SAME int key. Keying it by the "discord:<id>"
+    string instead gave the file two live objects, each saving its own stale
+    state (history counters, /session overrides) over the other's.
+    Non-Discord primaries keep the string key, as before.
+    """
+    if isinstance(conv_id, str) and conv_id.startswith("discord:"):
+        tail = conv_id.split(":", 1)[1]
+        if tail.isdigit():
+            return int(tail)
+    return conv_id
+
+
 class AgentRunner:
     def __init__(self, agent: Agent, token: str, transport: Optional[Transport] = None, transports: Optional[list[Transport]] = None):
         self.agent = agent
@@ -450,7 +468,7 @@ class AgentRunner:
         if is_forwarded_conversation(conv_id, native_key):
             if native_channel_id:
                 self._linked_channel_keys[int(native_channel_id)] = conv_id
-            return conv_id
+            return _primary_mem_key(conv_id)
         return native_channel_id
 
     def conv_key(self, channel_id: int | str) -> int | str:
@@ -461,8 +479,9 @@ class AgentRunner:
         unchanged, preserving legacy behavior for unlinked conversations.
         """
         if isinstance(channel_id, str):
-            return channel_id
-        return self._linked_channel_keys.get(int(channel_id or 0), channel_id)
+            return _primary_mem_key(channel_id)
+        k = self._linked_channel_keys.get(int(channel_id or 0), channel_id)
+        return _primary_mem_key(k) if isinstance(k, str) else k
 
     def conv_epoch(self, key: int | str) -> int:
         """Current reset-generation epoch for a conversation key (0 if never
@@ -506,7 +525,7 @@ class AgentRunner:
                 if linked:
                     if ch_id:
                         self._linked_channel_keys[ch_id] = linked
-                    key = linked
+                    key = _primary_mem_key(linked)
         return key
 
     def get_conversation(self, channel_id: int | str, conversation_id: str, native_key: str = "") -> DiscordConversation | AnthropicConversation | OpenAIConversation:
@@ -539,7 +558,7 @@ class AgentRunner:
         # safe default that keys by the native int, never mis-forwards).
         _nk = native_key or conversation_id
         if is_forwarded_conversation(conversation_id, _nk):
-            key = conversation_id
+            key = _primary_mem_key(conversation_id)
             try:
                 _native = int(channel_id)
             except (TypeError, ValueError):

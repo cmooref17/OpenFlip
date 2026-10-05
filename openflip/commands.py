@@ -39,7 +39,7 @@ def _conv_key_for_interaction(runner, interaction) -> int | str:
         if linked:
             if ch_id:
                 runner._linked_channel_keys[ch_id] = linked
-            key = linked
+            key = runner.conv_key(linked)
     return key
 
 

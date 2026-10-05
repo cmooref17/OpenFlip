@@ -1560,11 +1560,16 @@ identity's native conversation:
 `<transport>:<id>` is a KEY in the map
 (`resolve_linked_conversation_id`), the session's `conversation_id` is
 rewritten to the PRIMARY's native conversation_id — so history lives in
-the primary's existing `.jsonl` and the runtime's in-memory conversation
+the primary's existing `.jsonl`, and the runtime's in-memory conversation
 state (live conversation object, active-turn slot, soft-inject buffer) is
-keyed by that same string on every transport
-(`is_forwarded_conversation`). The primary identity's own sessions are
-untouched — it keys by its native id as always. Both transports see each
+keyed the same way the PRIMARY's own sessions key it
+(`is_forwarded_conversation` + `runtime._primary_mem_key`): a Discord
+primary (`discord:<id>`) is keyed by its bare int channel id, any other
+primary by the conversation_id string. Both transports therefore share ONE
+live conversation object; before 2026-10-04 a Discord primary got a second
+object under the string key, and each copy saved stale state (e.g. a
+`/session` model override) over the other. The primary identity's own
+sessions are untouched — it keys by its native id as always. Both transports see each
 other's turns live, no restart needed. Turns from the two transports
 serialize against each other like two messages in one channel (they ARE
 one conversation).
