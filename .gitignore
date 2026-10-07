@@ -95,6 +95,7 @@ openflip/tools/*
 !openflip/tools/restart.py
 !openflip/tools/send_message.py
 !openflip/tools/talk_to_agent.py
+!openflip/tools/subagent.py
 !openflip/tools/delete_message.py
 !openflip/tools/fetch_discord_message.py
 !openflip/tools/snapshots.py

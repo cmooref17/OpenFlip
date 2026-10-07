@@ -242,3 +242,108 @@ def render_summary_for_command(tool_name: Optional[str] = None) -> str:
     for name in sorted(_SCHEMAS.keys()):
         out.append(render_summary_for_command(name))
     return "\n\n".join(out) if out else "No tools registered."
+
+
+# ---------------------------------------------------------------------------
+# spawn_subagents (openflip/tools/subagent.py) — owner-controlled worker policy.
+#
+# Registered here (not in the tool module) because the hard-deny set below is
+# shared by the /toolset-time validator AND the tool's call-time grant
+# computation, and the tool module imports this one. The settings are the
+# CEILING for every worker an orchestrating agent spawns; the tool only ever
+# narrows them per task.
+# ---------------------------------------------------------------------------
+
+# Tools a worker can NEVER be granted, whatever `allowed_tools` says. Workers
+# are ephemeral, unattended and non-owner: nothing that mutates state outside
+# its own context, reaches a human/agent, re-enters the agent loop, or spawns
+# further work is allowed. Enforced in code at call time (never by prompt).
+SUBAGENT_DENIED_TOOLS: frozenset[str] = frozenset({
+    # recursion / control plane
+    "spawn_subagents", "restart_gateway", "restart_flask_app", "claude_code",
+    "force_reply", "resolve_approval", "request_approval",
+    # anything that talks to a human or another agent
+    "talk_to_agent", "send_message", "send_file", "inject_context",
+    "delete_message", "discord_post", "discord_manage", "flip_send", "flip_voice",
+    # cron
+    "add_cron_job", "cancel_cron_job", "list_cron_jobs",
+    # shell + file writes (host and sandbox)
+    "run_command", "run_command_sandbox", "write_file", "write_file_sandbox",
+    "edit_file", "delete_file", "restore_snapshot",
+    # memory WRITES (reads stay allowed)
+    "save_memory", "update_core_memory", "delete_memory", "dream", "reindex_memory",
+})
+
+SUBAGENT_DEFAULT_TOOLS = "web_search,fetch_url,read_file,list_files,search_memory,read_memory"
+
+
+def parse_tool_list(raw: Any) -> list[str]:
+    """Split a comma/whitespace-separated tool-name string into a deduped list
+    (order preserved). Accepts a list too (ingress / tests)."""
+    if isinstance(raw, (list, tuple)):
+        items = [str(x) for x in raw]
+    else:
+        items = str(raw or "").replace(",", " ").split()
+    out: list[str] = []
+    for name in items:
+        name = name.strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def _validate_subagent_tools(value: Any) -> Optional[str]:
+    names = parse_tool_list(value)
+    if not names:
+        return "allowed_tools must name at least one tool"
+    denied = [n for n in names if n in SUBAGENT_DENIED_TOOLS]
+    if denied:
+        return f"always denied for subagent workers: {', '.join(denied)}"
+    try:
+        from .tools._base import TOOL_REGISTRY
+    except Exception:
+        return None  # registry unavailable (CLI) — skip the existence check
+    unknown = [n for n in names if n not in TOOL_REGISTRY]
+    if unknown:
+        return f"unknown tool(s): {', '.join(unknown)}"
+    return None
+
+
+def _validate_worker_model(value: Any) -> Optional[str]:
+    """Owner-time sanity only: the name must be a known config.json model.
+    Provider compatibility with the CALLING agent is re-checked at call time
+    by the tool (an ollama agent can't run a claude worker and vice versa)."""
+    name = str(value or "").strip()
+    if not name:
+        return "worker_model must be a non-empty model name"
+    bare = name.split("/", 1)[1] if "/" in name else name
+    models = get_config().get("models") or {}
+    if models and bare not in models:
+        return f"`{bare}` is not in config.json `models` (known: {', '.join(sorted(models))})"
+    return None
+
+
+register("spawn_subagents", [
+    SettingSchema("worker_model", "str", "claude-sonnet-5-5",
+        "Default model for spawned workers (a task may name its own). Must be a "
+        "config.json `models` entry on the calling agent's provider.",
+        validator=_validate_worker_model),
+    SettingSchema("worker_effort", "choice", "medium",
+        "Reasoning effort applied to every worker turn (ignored by providers without an effort knob).",
+        choices=["minimal", "low", "medium", "high", "xhigh", "max"]),
+    SettingSchema("allowed_tools", "str", SUBAGENT_DEFAULT_TOOLS,
+        "Comma-separated CEILING of tools a worker may be granted. A task's "
+        "requested tools are intersected with this; the built-in deny list "
+        "(spawn/restart/messaging/cron/shell/file+memory writes) always applies.",
+        validator=_validate_subagent_tools),
+    SettingSchema("max_parallel", "int", 4,
+        "Maximum tasks in ONE spawn_subagents call (the call is rejected above this).",
+        min=1, max=16),
+    SettingSchema("max_inflight_per_agent", "int", 6,
+        "Maximum workers running at once per agent across concurrent calls; "
+        "tasks beyond the free slots fail immediately instead of queueing.",
+        min=1, max=32),
+    SettingSchema("timeout_s", "int", 300,
+        "Per-task wall-clock limit in seconds; a worker still running past it is hard-interrupted.",
+        min=10, max=3600),
+])

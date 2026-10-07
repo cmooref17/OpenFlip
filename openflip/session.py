@@ -206,3 +206,42 @@ def make_external_session(
         handle="",
         tool_allowlist=tool_allowlist,
     )
+
+
+def make_subagent_session(agent_id: str, task_uuid: str, grants: list[str]) -> Session:
+    """Build a Session for one ephemeral subagent/worker task.
+
+    Subagent foundation: an
+    orchestrating agent hands a scoped sub-task to a throwaway worker turn
+    that runs in its OWN conversation (`internal:subagent-<task_uuid>` — its
+    history lands in `agents/<id>/conversations/internal:subagent-<uuid>.jsonl`,
+    isolated from every human conversation) and returns only its final text.
+
+    Modeled on `make_external_session`:
+      - `is_owner` is hard-False and `speaker_id` is a NON-OWNER hash — a
+        worker can never unlock owner-only tools or disclosure.
+      - `speaker_id` is derived from `task_uuid`, so two parallel workers get
+        DISTINCT speaker ids and the tool_executor `_inflight` lock — keyed on
+        (agent, speaker, tool) — never serializes one worker behind another.
+        It is only an in-memory keying value; nothing on disk depends on it.
+      - `tool_grants` == `tool_allowlist` == a copy of `grants`: the grants
+        make the worker's tools callable without a human auth match (the
+        session has no human), and the identical allowlist CEILS it to exactly
+        that set — a worker can't reach anything outside what the caller
+        handed it. The caller is responsible for intersecting `grants` down
+        from its own privileges and for stripping always-denied tools.
+    """
+    speaker_id = abs(hash(f"internal:subagent:{agent_id}:{task_uuid}")) % (2**31)
+    return Session(
+        transport="internal",
+        transport_id=f"subagent-{task_uuid}",
+        conversation_id=f"internal:subagent-{task_uuid}",
+        speaker_id=speaker_id,
+        speaker_role_ids=[],
+        is_owner=False,
+        is_dm=True,
+        display_name=f"{agent_id} subagent {task_uuid[:8]}",
+        handle="",
+        tool_grants=list(grants),
+        tool_allowlist=list(grants),
+    )

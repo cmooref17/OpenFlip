@@ -900,6 +900,25 @@ problem.
   `channel_id` only and have NOT yet been migrated to the canonical
   `session_id` arg. Until that pass lands, those two remain
   `channel_id`-keyed.
+- **`spawn_subagents(tasks: list)`** — Claude Code's Task tool, openflip
+  style. One call fans out up to `max_parallel` (default 4) EPHEMERAL
+  workers in parallel; each task is `{prompt, tools?, label?, model?}`. Each
+  worker is a fresh `internal:subagent-<uuid>` turn on the SAME agent runner
+  with its own context, a cheaper model (`worker_model`, default
+  `claude-sonnet-5-5`; must share the agent's provider), memory OFF, and a
+  tool set = requested ∩ `allowed_tools` (owner ceiling, default read-only:
+  web_search, fetch_url, read_file, list_files, search_memory, read_memory)
+  minus a hard-coded deny set (spawn_subagents itself, messaging, cron,
+  writes, run_command, memory writes, restarts…). Only each worker's final
+  text returns, so prompts must be self-contained. Gated on
+  `Session.is_owner` (a human owner turn — cron/synthetic orchestrators
+  can't spawn). Per-task `timeout_s` (300) interrupts stragglers;
+  `max_inflight_per_agent` (6) caps workers across concurrent calls. Worker
+  conversations (and their pre_reset backups) are deleted when the task
+  returns. Owner settings: `/toolset spawn_subagents <key> <value>`.
+  Plumbing: `run_synthetic_turn(result_future=…)` returns a turn's final
+  text without posting; `session.make_subagent_session()` builds the
+  non-owner worker session.
 
 ## Cron
 

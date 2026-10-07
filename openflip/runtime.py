@@ -232,6 +232,33 @@ def _primary_mem_key(conv_id: str) -> int | str:
     return conv_id
 
 
+def _settle_result_future(
+    result_future: "asyncio.Future | None",
+    *,
+    text: str | None = None,
+    cancelled: bool = False,
+) -> None:
+    """Resolve a subagent/worker `result_future` exactly once, never raising.
+
+    Subagent foundation (2026-10-06): a caller that wants a turn's final text
+    handed BACK (not posted) passes an `asyncio.Future` through
+    `run_synthetic_turn(result_future=...)`. Every exit path of that turn calls
+    this: the post-loop final-text point sets the real text; the cancel branch
+    sets CancelledError; every other early exit / error path sets "" so an
+    awaiter can never hang. `done()`-guarded so the first settle wins and later
+    calls are no-ops. A None future (every pre-existing caller) is a no-op.
+    """
+    if result_future is None or result_future.done():
+        return
+    try:
+        if cancelled:
+            result_future.set_exception(asyncio.CancelledError())
+        else:
+            result_future.set_result(text or "")
+    except Exception:
+        pass
+
+
 class AgentRunner:
     def __init__(self, agent: Agent, token: str, transport: Optional[Transport] = None, transports: Optional[list[Transport]] = None):
         self.agent = agent
@@ -1065,6 +1092,7 @@ class AgentRunner:
             turn_task._channel_id = channel_id
             turn_task._prev_task = prev_task
             turn_task._started_run = False
+            turn_task._result_future = kwargs.get("result_future")
             if channel_id:
                 self._active_turns[channel_id] = turn_task
             # Slot reconciliation + task_done() accounting live in this
@@ -1112,6 +1140,13 @@ class AgentRunner:
             self._inbound_queue.task_done()
         except Exception:
             pass
+        # Subagent foundation backstop: whatever way the supervisor ended
+        # (normal, raised, cancelled — even before its first __step), a
+        # still-pending `result_future` is settled here so the awaiter never
+        # hangs. No-op when the turn already set its real result.
+        _rf = getattr(task, "_result_future", None)
+        if _rf is not None:
+            _settle_result_future(_rf, text="", cancelled=task.cancelled())
 
     async def _serialized_turn(self, channel_id: int | str, prev_task: Optional[asyncio.Task], kwargs: dict):
         """Run one turn, serialized behind any prior same-channel turn. Spawned
@@ -1654,6 +1689,7 @@ class AgentRunner:
         force_tool_choice: dict | None = None,
         verbatim_user_message: str | None = None,
         log_tag: str = "[synthetic] ",
+        result_future: "asyncio.Future | None" = None,
     ) -> None:
         """Fire a turn for this agent without an inbound Discord message.
 
@@ -1697,11 +1733,21 @@ class AgentRunner:
             failure silently).
         Propagated through talk_to_agent so the recipient's chain-terminator
         turn knows whether the original requester is watching.
+
+        `result_future` (when set) asks for the turn's FINAL TEXT to be handed
+        back through the future instead of posted anywhere: the turn runs as
+        if `silent=True`, posts nothing to any channel, and resolves the future
+        with the model's final plain text ("" if the turn ended without text).
+        Every exit path settles it — cancellation sets CancelledError, any
+        other abort sets "" — so an awaiter can never hang. Subagent/worker
+        foundation. Default None leaves
+        every existing caller unchanged.
         """
         from .config_global import get_owner_id
         owner_id = get_owner_id("discord")
         if not owner_id:
             print_ts(f"{COLOR_RED}run_synthetic_turn: no owner_id configured{COLOR_END}", error=True, agent=self.agent.id)
+            _settle_result_future(result_future, text="")
             return
         # ATTRIBUTION vs PRIVILEGE split (security-load-bearing — read before editing):
         #
@@ -1735,6 +1781,7 @@ class AgentRunner:
             # raw-int path hit a genuine "channel not found" — abandon the
             # turn (unchanged). A transient fetch *stall* no longer lands
             # here; it now falls through to the shim inside the resolver.
+            _settle_result_future(result_future, text="")
             return
 
         ch_label = f"#{getattr(channel, 'name', channel.id)}"
@@ -1775,6 +1822,11 @@ class AgentRunner:
             "chain_root_agent_id": chain_root_agent_id or "",
             "force_tool_choice": force_tool_choice,
             "verbatim_user_message": verbatim_user_message,
+            # Subagent foundation: carried only when a caller wants the final
+            # text handed back. Settled by `_run_turn` (real text / cancel) and
+            # by the `_on_turn_done` backstop (every other exit, incl. a
+            # supervisor cancelled before `_run_turn` ever started).
+            "result_future": result_future,
         })
 
     async def _resolve_synthetic_channel(
@@ -2013,6 +2065,7 @@ class AgentRunner:
         chain_root_agent_id: str = "",
         force_tool_choice: dict | None = None,
         verbatim_user_message: str | None = None,
+        result_future: "asyncio.Future | None" = None,
     ) -> None:
         """Shared agent loop — calls the model, runs tools, feeds results back,
         loops until the model emits no more tool calls or hits the turn cap.
@@ -2052,6 +2105,16 @@ class AgentRunner:
         # auto-leaks into the operator's DM as unsolicited maintenance noise.
         # The operator explicitly flagged this 2026-05-23 as a flaw.
         _human_softinjected_this_turn = False
+
+        # Subagent foundation: a turn whose final text is handed back through
+        # `result_future` posts NOTHING to any channel — it behaves like
+        # silent=True throughout (typing indicator, in-loop posts, the final
+        # post block, the terminal-result contract). The "Lost text" drop
+        # diagnostic is suppressed for it (the text isn't lost, it's returned)
+        # and the human-soft-inject visibility flips below are disabled for it
+        # (`result_future is None` guards) so nothing can turn posting back on.
+        if result_future is not None:
+            silent = True
 
         # ---- Superseded chain-terminator: deliver tagged, never drop ----
         # If this turn is an auto-route reply (auto_route_from_peer is set)
@@ -3297,7 +3360,7 @@ class AgentRunner:
                         # Soft-injects only come from the _handle_message
                         # path (human transports), so any drain > 0 is a
                         # human speaking. See 2026-05-22 routing_bug notes.
-                        if _drained_n > 0 and (not auto_post_final_text or silent):
+                        if _drained_n > 0 and (not auto_post_final_text or silent) and result_future is None:
                             auto_post_final_text = True
                             silent = False
                             _human_softinjected_this_turn = True
@@ -3397,6 +3460,7 @@ class AgentRunner:
                 _agent_state.on_turn_end(agent.id)
             except Exception:
                 pass
+            _settle_result_future(result_future, cancelled=True)
             raise  # Let the worker see CancelledError so it knows to log + continue.
         except asyncio.TimeoutError:
             print_ts(f"{COLOR_RED}{log_tag}Chat timeout after {CHAT_TIMEOUT_S}s — model unresponsive{COLOR_END}", agent=agent.id, error=True)
@@ -3534,7 +3598,7 @@ class AgentRunner:
                     # Human soft-injected during a synthetic turn → flip
                     # visibility so the post-block sends to the operator.
                     # See 2026-05-22 routing_bug notes.
-                    if _drained_count > 0 and (not auto_post_final_text or silent):
+                    if _drained_count > 0 and (not auto_post_final_text or silent) and result_future is None:
                         auto_post_final_text = True
                         silent = False
                         _human_softinjected_this_turn = True
@@ -3589,7 +3653,7 @@ class AgentRunner:
                     _human_softinject_drained_this_turn = True
                 # Human soft-injected during a synthetic turn → flip
                 # visibility (see 2026-05-22 routing_bug notes).
-                if _post_drained > 0 and (not auto_post_final_text or silent):
+                if _post_drained > 0 and (not auto_post_final_text or silent) and result_future is None:
                     auto_post_final_text = True
                     silent = False
                     _human_softinjected_this_turn = True
@@ -4042,6 +4106,14 @@ class AgentRunner:
                                 f"{(final_text or '')[:120].replace(chr(10), ' ')!r}{COLOR_END}",
                                 agent=agent.id,
                             )
+                    elif result_future is not None:
+                        # Subagent/worker turn: the text is handed back to the
+                        # awaiting caller below, not dropped — no diagnostic.
+                        print_ts(
+                            f"{log_tag}worker turn finished; returning "
+                            f"{len(final_text)} chars to caller via result_future",
+                            agent=agent.id,
+                        )
                     else:
                         # Non-chain silent turn (cron/heartbeat/kairos) ended in
                         # plain text — deliberate drop, but log loudly: the model
@@ -4062,6 +4134,16 @@ class AgentRunner:
                         _posted_assistant_text = True
                     except Exception as e:
                         print_ts(f"{COLOR_RED}{log_tag}Failed to post message: {e}{COLOR_END}", error=True, agent=agent.id)
+
+        # Subagent foundation: hand the final plain text back to the awaiting
+        # caller. History is already persisted (`_save_conv("post-loop")`
+        # above). "" when the turn ended without text (no assistant message,
+        # framework error, STAY_SILENT, or a trailing tool call).
+        if result_future is not None:
+            _rf_text = ""
+            if last_ai_message is not None and not final_calls:
+                _rf_text = final_text or ""
+            _settle_result_future(result_future, text=_rf_text)
 
         # Chain consumed: clear tracker for this peer if it still holds the
         # chain_id we came in with. If the agent dispatched a NEW chain to
