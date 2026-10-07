@@ -50,6 +50,55 @@ _MAX_BYTES = 100_000  # ~100 KB text cap
 _TIMEOUT = 20  # seconds
 _MAX_REDIRECTS = 5  # match the previous allow_redirects cap
 
+# Anti-bot wall markers: if a fetched page looks like one of these AND the
+# caller is the owner, fetch_url escalates to the headless-browser fallback
+# (_browser_fetch) which renders the page through the SSRF-guarded proxy and
+# waits for the wall to clear. Owner-only: the browser path is gated so a
+# non-owner / background turn can never trigger it (see the escalation block).
+_WALL_MARKERS = (
+    "making sure you", "anubis", "checking your browser", "just a moment",
+    "__cf_chl", "cf-browser-verification", "enable javascript and cookies",
+    "verifying you are human", "attention required", "cf-chl-opt",
+)
+
+
+def _looks_walled(status: int, body_text: str) -> bool:
+    """True if a fetch result looks like an anti-bot challenge page rather than
+    real content: a challenge status with a tiny/empty body, or a body carrying
+    a known challenge marker."""
+    low = (body_text or "").lower()
+    if any(m in low for m in _WALL_MARKERS):
+        return True
+    # A 403/503 with almost no readable text is very likely a challenge stub.
+    if status in (403, 503) and len(low.strip()) < 500:
+        return True
+    return False
+
+
+async def _try_browser_fetch(url: str) -> "str | None":
+    """Escalate to the headless-browser fallback (owner-only caller already
+    checked). Renders through the SSRF-guarded proxy, waits for the wall to
+    clear, returns stripped text — or None on any failure / if the browser
+    helper isn't present (gitignored local extra). Never raises; a failure
+    just means the caller keeps the plain-fetch result."""
+    try:
+        from ._browser_fetch import fetch_rendered
+    except Exception:
+        return None
+    try:
+        html = await asyncio.wait_for(fetch_rendered(url), timeout=70)
+    except Exception:
+        return None
+    if not html:
+        return None
+    text = _strip_html(html) if "<" in html else html
+    if not text.strip() or _looks_walled(200, text):
+        # Still a wall (e.g. Anubis/DataDome we can't beat) → honest None.
+        return None
+    if len(text) > _MAX_BYTES:
+        text = text[:_MAX_BYTES] + "\n\n[truncated]"
+    return text
+
 # Statuses aiohttp would normally treat as redirects.
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
@@ -310,6 +359,13 @@ async def fetch_url(url: str) -> ToolResult:
 
                 if resp.status >= 400:
                     body = await resp.text(errors="replace")
+                    # Owner-only: an anti-bot challenge (403/503 + wall markers)
+                    # escalates to the headless browser, which can clear many
+                    # JS/Cloudflare walls a plain fetch can't.
+                    if privileged and _looks_walled(resp.status, body):
+                        _browser_text = await _try_browser_fetch(url)
+                        if _browser_text is not None:
+                            return ToolResult(model_feedback=f"Content from {url} (via browser):\n\n{_browser_text}")
                     return ToolResult.fail(f"HTTP {resp.status}: {body[:500]}")
 
                 raw = await resp.read()
@@ -321,6 +377,14 @@ async def fetch_url(url: str) -> ToolResult:
                 # Convert HTML to text
                 if "html" in ct:
                     text = _strip_html(text)
+
+                # Owner-only: a 200 that is actually an anti-bot challenge page
+                # (Cloudflare/Anubis serve the wall with a 200) escalates to the
+                # headless browser to render the real content.
+                if privileged and "html" in ct and _looks_walled(resp.status, text):
+                    _browser_text = await _try_browser_fetch(url)
+                    if _browser_text is not None:
+                        return ToolResult(model_feedback=f"Content from {url} (via browser):\n\n{_browser_text}")
 
                 if not text.strip():
                     return ToolResult(model_feedback=f"Fetched {url} — response was empty.")
