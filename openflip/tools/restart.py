@@ -99,44 +99,48 @@ def _check_agent_configs() -> list[tuple[str, str]]:
     return errors
 
 
-def _check_other_agents_busy(*, exclude_agent_id: str, stale_after_s: float = 60.0) -> list[dict]:
-    """Read every other agent's live.json and return a list of those currently
-    in a turn or running a tool. Stale entries (last_active_ms older than
-    stale_after_s) are treated as not busy — they're either idle or crashed.
+def _check_other_agents_busy(*, exclude_agent_id: str) -> list[dict]:
+    """Return every OTHER agent that has a turn running right now.
 
-    Returns a list of {agent_id, activity, last_active_ms, age_s} dicts,
+    Source of truth is the live in-process runner state, not live.json:
+    restart_gateway runs inside the same process as every AgentRunner, so a
+    turn is in flight exactly when its task sits in `runner._active_turns`
+    and isn't done. That covers human, synthetic, cron, peer and subagent
+    turns alike, no matter how long they've been running.
+
+    The old check read live.json and skipped anything whose last_active_ms
+    was >60s old. live.json is only flushed at turn start/end (tool activity
+    updates the in-memory cache only), so any turn longer than a minute
+    looked "stale" and got killed mid-work (2026-10-07: miniflip's 30-minute
+    turn was cut off mid-`sleep 75`). No staleness timeout here: a genuinely
+    wedged turn still blocks, and force=True is the escape hatch.
+
+    Returns a list of {agent_id, activity, current_tool, age_s, turns} dicts,
     or [] if nobody else is busy.
     """
-    import time
-    import os
-
-    agents_dir = os.path.join(project_root(), "agents")
-    if not os.path.isdir(agents_dir):
-        return []
+    from ..registry import RUNNERS
+    from .. import agent_state as _as
 
     busy = []
     now_ms = int(time.time() * 1000)
-    for entry in os.listdir(agents_dir):
-        if entry.startswith("_") or entry == exclude_agent_id:
+    for aid, runner in list(RUNNERS.items()):
+        if aid == exclude_agent_id:
             continue
-        live_path = os.path.join(agents_dir, entry, "live.json")
-        if not os.path.isfile(live_path):
+        try:
+            running = [t for t in list(runner._active_turns.values())
+                       if t is not None and not t.done()]
+        except Exception:
+            running = []
+        if not running:
             continue
-        state = load_json(live_path, default={}) or {}
-        is_busy = bool(state.get("is_in_turn")) or state.get("current_tool") is not None
-        if not is_busy:
-            continue
+        state = _as._CACHE.get(aid) or {}
         last_active_ms = int(state.get("last_active_ms") or 0)
-        age_s = (now_ms - last_active_ms) / 1000.0 if last_active_ms else 999999.0
-        if age_s > stale_after_s:
-            # Stale — agent likely crashed or hung; safe to restart over it.
-            continue
         busy.append({
-            "agent_id": entry,
-            "activity": state.get("activity") or "(unknown)",
+            "agent_id": aid,
+            "activity": state.get("activity") or "in a turn",
             "current_tool": state.get("current_tool"),
-            "last_active_ms": last_active_ms,
-            "age_s": age_s,
+            "age_s": (now_ms - last_active_ms) / 1000.0 if last_active_ms else 0.0,
+            "turns": len(running),
         })
     return busy
 
@@ -208,8 +212,9 @@ async def restart_gateway(reason: str, continuation: str = "", force: bool = Fal
     Owner-only. Restarts the entire framework — every agent goes offline
     briefly. Use sparingly.
 
-    Preflight: refuses to restart if any OTHER agent is currently in a turn or
-    running a tool. Stale activity (>60s old) is ignored — assumed crashed.
+    Preflight: refuses to restart if any OTHER agent has a turn running right
+    now (read live from the in-process runners, however long the turn has run).
+    A wedged turn also blocks; force=True is the escape hatch.
     The calling agent itself is always excluded from the check (it's by
     definition mid-tool when calling this).
 
@@ -272,7 +277,7 @@ async def restart_gateway(reason: str, continuation: str = "", force: bool = Fal
             lines = [
                 f"- {b['agent_id']}: {b['activity']}"
                 + (f" (tool: {b['current_tool']})" if b.get('current_tool') else "")
-                + f" — {b['age_s']:.1f}s ago"
+                + f" — {b['turns']} turn(s) running, last activity {b['age_s']:.0f}s ago"
                 for b in busy
             ]
             details = "\n".join(lines)

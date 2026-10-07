@@ -791,7 +791,9 @@ problem.
   cleanly for the supervisor to respawn (start.bat's loop / NSSM /
   Task Scheduler — requires `OPENFLIP_SUPERVISED=1`); with neither
   configured it refuses rather than strand the framework offline.
-  Preflight checks: no peer agent mid-turn, no queued inbound, no
+  Preflight checks: no peer agent mid-turn (read live from each runner's
+  `_active_turns`, so a turn of any length counts; a wedged turn also
+  blocks — `force=True` is the escape hatch), no queued inbound, no
   human-spoken message in the last 5s, no syntax errors in `openflip/`,
   all `agent.json` files valid. Pass `force=True` ONLY when the operator
   asked for it. The optional `continuation` fires as a synthetic turn
