@@ -923,13 +923,14 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
     @bot.slash_command(name="model", description="Show or change the model — owner: the agent's model; allowed users: this chat only.")
     async def model_cmd(interaction: nextcord.Interaction):
         from . import agent_ui
-        if is_owner(interaction.user.id):
-            await agent_ui.open_model_panel(interaction, runner_agent_id=runner.agent.id)
-            return
-        if interaction.user.id not in agent_ui.model_command_users():
+        # /model is per-conversation for EVERYONE, owner included: it shows and
+        # sets THIS chat's model (session override), so what it displays is what
+        # the chat actually runs on. The agent-wide default (agent.json) is
+        # changed with the text mirror `/model <name>`.
+        if not is_owner(interaction.user.id) and interaction.user.id not in agent_ui.model_command_users():
             await interaction.response.send_message("You don't have permission to run this.", ephemeral=True)
             return
-        # Allowed non-owner: per-conversation session override only, never agent.json.
+        # Per-conversation session override only, never agent.json.
         _conv_key = _conv_key_for_interaction(runner, interaction)
         conv = runner.conversations.get(_conv_key)
         if conv is None:

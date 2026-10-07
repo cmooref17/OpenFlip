@@ -3032,9 +3032,13 @@ Text-mirror gating in general: `/effort`, `/session`, `/model`, `/models`,
 `/dream`, `/undo`, `/redo`, `/uncompact`, `/reload`, `/restart` are owner-only; `/reset`,
 `/compact`, `/status`, `/help` are ungated (see "Owner vs admin" in §3).
 
-The Discord `/model` panel has no agent picker: it always edits the model of the
-agent whose bot the command was run on (switch another agent by running its bot's
-`/model`).
+The Discord `/model` panel is PER-CONVERSATION for everyone, the owner included:
+it shows the model THIS chat actually runs on (session override if set, else the
+agent default, both shown) and its picker sets a session override for this chat
+only, with "Reset to default" to clear it. It never edits agent.json. To change an
+agent's default model, use the text mirror `/model <model-name>` below. (Before
+2026-10-06 the owner's slash `/model` edited agent.json and ignored session
+overrides, so it could show the default while the chat ran on another model.)
 
 `/model` is also a cross-transport text-prefix mirror (the Discord slash `/model`
 opens an interactive panel that can't render off-Discord): bare `/model` shows the
