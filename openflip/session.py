@@ -18,6 +18,23 @@ from typing import Optional
 
 
 @dataclass
+class WorkerOutcome:
+    """Result handed back through a `run_synthetic_turn(result_future=...)`.
+
+    Subagent workers settle their future with one of these instead of bare
+    text so the spawner can judge success structurally — on tool-outcome
+    COUNTS, never by matching strings in the reply. `calls` is how many tool
+    calls the worker's turn processed, `errors` how many of those failed
+    (ToolResult not ok — includes ACL denials), `denied` the subset that were
+    ACL-denied. A turn that called no tools settles with all-zero counts.
+    """
+    text: str = ""
+    calls: int = 0
+    errors: int = 0
+    denied: int = 0
+
+
+@dataclass
 class Session:
     """One conversation context, transport-agnostic.
 
@@ -65,6 +82,22 @@ class Session:
     # narrower than the agent's `auth.external` ceiling (per-token least
     # privilege). Threaded Session → build_visible_tools → evaluate_tools_for_
     # speaker, parallel to tool_grants but applied as a ceiling, not a grant.
+    read_scope: Optional[list[str]] = None
+    # Independent FILE-READ scope for this session, overriding the agent's
+    # transport-keyed `allowed_read_paths` entirely (files.py `_effective_allowed`).
+    # Semantics (fail-closed):
+    #   None        → no override. The session resolves path ACLs normally (the
+    #                 value for EVERY Discord / iMessage / cron / external
+    #                 session — nothing changes for them).
+    #   [] (empty)  → read scope is empty; downstream default-deny / read-
+    #                 fallback (agent dir + system temp) applies, same as an
+    #                 agent with no allowed_read_paths configured.
+    #   [dir, …]    → reads are confined to exactly these dirs.
+    # In every non-None case WRITES resolve to [] (writes denied) — this scope
+    # is read-only. `denied_paths` still wins (checked first in _check_access).
+    # Set by `make_subagent_session` so an ephemeral worker (transport
+    # "internal", whose agent may only have a "discord" path block) can read the
+    # project dirs the owner scopes it to via spawn_subagents `read_paths`.
 
     @property
     def channel_id_int(self) -> int:
@@ -208,7 +241,12 @@ def make_external_session(
     )
 
 
-def make_subagent_session(agent_id: str, task_uuid: str, grants: list[str]) -> Session:
+def make_subagent_session(
+    agent_id: str,
+    task_uuid: str,
+    grants: list[str],
+    read_scope: Optional[list[str]] = None,
+) -> Session:
     """Build a Session for one ephemeral subagent/worker task.
 
     Subagent foundation: an
@@ -230,6 +268,11 @@ def make_subagent_session(agent_id: str, task_uuid: str, grants: list[str]) -> S
         that set — a worker can't reach anything outside what the caller
         handed it. The caller is responsible for intersecting `grants` down
         from its own privileges and for stripping always-denied tools.
+      - `read_scope` is stored as an INDEPENDENT copy (so a later mutation of
+        the caller's list can't reach into the worker's session). None = the
+        worker resolves path ACLs normally; a list (possibly empty) confines
+        its file reads per Session.read_scope. See the spawn_subagents
+        `read_paths` setting.
     """
     speaker_id = abs(hash(f"internal:subagent:{agent_id}:{task_uuid}")) % (2**31)
     return Session(
@@ -244,4 +287,5 @@ def make_subagent_session(agent_id: str, task_uuid: str, grants: list[str]) -> S
         handle="",
         tool_grants=list(grants),
         tool_allowlist=list(grants),
+        read_scope=None if read_scope is None else list(read_scope),
     )

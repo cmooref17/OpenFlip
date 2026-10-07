@@ -909,16 +909,32 @@ problem.
   tool set = requested ∩ `allowed_tools` (owner ceiling, default read-only:
   web_search, fetch_url, read_file, list_files, search_memory, read_memory)
   minus a hard-coded deny set (spawn_subagents itself, messaging, cron,
-  writes, run_command, memory writes, restarts…). Only each worker's final
-  text returns, so prompts must be self-contained. Gated on
-  `Session.is_owner` (a human owner turn — cron/synthetic orchestrators
-  can't spawn). Per-task `timeout_s` (300) interrupts stragglers;
+  writes, run_command, memory writes, restarts…). A worker's file reads are
+  scoped by the owner-set `read_paths` (comma-separated absolute dirs, default
+  empty): workers run on the `internal` transport, which has no block in a
+  discord-only agent's `allowed_read_paths`, so WITHOUT `read_paths` a worker
+  can only read its agent dir + system temp (the default read fallback). Set
+  `read_paths` to the project dirs a worker needs (e.g. the repo root) and its
+  read_file / list_files see exactly those; writes stay denied regardless. Only
+  each worker's final text returns, so prompts must be self-contained. Gated on the turn's real
+  owner privilege (`owner=True`), NOT `Session.is_owner`: owner's own turns,
+  owner-created cron jobs, and peer chains rooted in an owner turn can all
+  spawn; non-owner turns cannot. Workers can NEVER spawn workers — a turn
+  inside an `internal:subagent-*` session is always refused, even if it
+  somehow carries owner privilege. Per-task `timeout_s` (300) interrupts stragglers;
   `max_inflight_per_agent` (6) caps workers across concurrent calls. Worker
   conversations (and their pre_reset backups) are deleted when the task
-  returns. Owner settings: `/toolset spawn_subagents <key> <value>`.
-  Plumbing: `run_synthetic_turn(result_future=…)` returns a turn's final
-  text without posting; `session.make_subagent_session()` builds the
-  non-owner worker session.
+  returns. Each task comes back headed `### <label> — ok|error (N calls, E
+  errors, D denied)`, and the report opens with `x/y workers ok`. A worker is
+  **ok** when it returned a non-empty reply AND did not make at least one tool
+  call with EVERY call failing; a worker whose every tool call failed (e.g.
+  all ACL-denied) is **error**. Scoring is structural (tool-outcome counts
+  carried back on the worker outcome), never string-matched on the reply — a
+  worker that called no tools and just replied with text is ok. Owner settings:
+  `/toolset spawn_subagents <key> <value>`. Plumbing:
+  `run_synthetic_turn(result_future=…)` settles a `WorkerOutcome` (final text +
+  calls/errors/denied counts) without posting; `session.make_subagent_session()`
+  builds the non-owner worker session.
 
 ## Cron
 

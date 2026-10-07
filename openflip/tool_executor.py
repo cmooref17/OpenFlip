@@ -19,6 +19,11 @@ from . import agent_state as _agent_state
 CURRENT_AGENT: contextvars.ContextVar[Agent] = contextvars.ContextVar("current_agent")
 CURRENT_CHANNEL_ID: contextvars.ContextVar[int] = contextvars.ContextVar("current_channel_id")
 CURRENT_SPEAKER_ID: contextvars.ContextVar[int] = contextvars.ContextVar("current_speaker_id")
+# Whether THIS turn carries owner privilege (owner=True in _run_turn). This is
+# distinct from Session.is_owner: an owner-created cron turn runs with owner
+# privilege but its synthesized Session has is_owner=False. Tools that gate on
+# the turn's real owner status (e.g. spawn_subagents) read this.
+CURRENT_TURN_OWNER: contextvars.ContextVar[bool] = contextvars.ContextVar("current_turn_owner", default=False)
 # Transport-agnostic session for the current turn. Set by runtime._run_turn
 # once Session objects exist (Phase 1 Discord-decouple). Tools that need
 # to know the session (transport, transport_id, conversation_id, etc.) read
@@ -239,7 +244,9 @@ async def execute_tool_calls(
                 await _send_text(_transport, _effective_session_id, channel,
                                  f"_(I can't use `{name}` for you here.)_")
             # Tell the model so it can adjust on the next turn.
-            out.append((name, ToolResult.fail(f"You don't have permission to call '{name}' for this user.")))
+            _denied = ToolResult.fail(f"You don't have permission to call '{name}' for this user.")
+            _denied.denied = True
+            out.append((name, _denied))
             continue
 
         key = _lock_key(agent, speaker_id, name)

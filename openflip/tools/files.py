@@ -123,6 +123,20 @@ def _effective_allowed(agent, mode: str) -> list:
     in v1: deny is `denied_paths` (flat, unconditional, checked first), and not
     granting a `users`/`all_users` entry already withholds access.
     """
+    # Session read-scope override (subagent workers). A worker session carries
+    # an independent `read_scope` (make_subagent_session); when present it
+    # REPLACES the agent's transport-keyed path ACLs entirely — a worker on the
+    # "internal" transport has no path block on a discord-only agent and would
+    # otherwise resolve to []. Read returns exactly that list (empty → the
+    # downstream default-deny / read-fallback, same as an unconfigured agent);
+    # write returns [] (this scope is read-only, workers never write). Checked
+    # BEFORE the transport lookup; `denied_paths` still wins in _check_access.
+    from ..tool_executor import CURRENT_SESSION
+    _sess = CURRENT_SESSION.get(None)
+    _scope = getattr(_sess, "read_scope", None) if _sess is not None else None
+    if _scope is not None:
+        return list(_scope) if mode == "read" else []
+
     raw = agent.allowed_read_paths if mode == "read" else agent.allowed_write_paths
     if not isinstance(raw, dict):
         return raw or []  # flat list (or None) — applies to everyone, unchanged

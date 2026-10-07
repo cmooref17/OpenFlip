@@ -89,6 +89,25 @@ def worker_conv_key(session) -> int:
         return abs(hash(session.transport_id)) % (2**31)
 
 
+def _parse_read_paths(raw: Any) -> list[str]:
+    """Split the owner-set `read_paths` setting (comma-separated absolute dirs)
+    into an expanduser'd list, order preserved, blanks dropped. Always returns
+    a list (possibly empty); the empty list still OVERRIDES the agent's path
+    ACLs for the worker — it just resolves to the default read fallback rather
+    than the worker inheriting a discord-only block it can't match."""
+    import os
+    items = str(raw or "").split(",")
+    out: list[str] = []
+    for part in items:
+        p = part.strip()
+        if not p:
+            continue
+        expanded = os.path.expanduser(p)
+        if expanded not in out:
+            out.append(expanded)
+    return out
+
+
 def compute_grants(requested: list[str] | None, ceiling: list[str]) -> list[str]:
     """(requested or ceiling) ∩ ceiling − SUBAGENT_DENIED_TOOLS, order kept."""
     allowed = [t for t in ceiling if t not in SUBAGENT_DENIED_TOOLS]
@@ -170,15 +189,19 @@ def _retrieve_silently(fut: asyncio.Future) -> None:
             pass
 
 
-def format_results(results: list[tuple[str, bool, str]], cap: int = _TOTAL_OUTPUT_CAP) -> str:
-    """'### <label> — ok|error\\n<body>' per task, bodies truncated so the
-    whole report stays within `cap` characters."""
+def format_results(results: list[tuple[str, bool, str, int, int, int]], cap: int = _TOTAL_OUTPUT_CAP) -> str:
+    """'### <label> — ok|error (N calls, E errors, D denied)\\n<body>' per task,
+    bodies truncated so the whole report stays within `cap` characters."""
     n = max(1, len(results))
-    heads = [f"### {label} — {'ok' if ok else 'error'}\n" for label, ok, _ in results]
+    heads = [
+        f"### {label} — {'ok' if ok else 'error'} "
+        f"({calls} calls, {errors} errors, {denied} denied)\n"
+        for label, ok, _, calls, errors, denied in results
+    ]
     budget = cap - sum(len(h) + 2 for h in heads)
     per = max(_MIN_PER_TASK_CAP, budget // n)
     chunks: list[str] = []
-    for head, (_, _, body) in zip(heads, results):
+    for head, (_, _, body, _, _, _) in zip(heads, results):
         body = (body or "").strip() or "(no output)"
         if len(body) > per:
             body = body[: per - 16].rstrip() + "\n…[truncated]"
@@ -198,16 +221,27 @@ async def spawn_subagents(tasks: list) -> ToolResult:
     Args:
         tasks: Array of task objects, one worker each. {"prompt": "<complete standalone instructions>", "label": "<short name, optional>", "tools": ["web_search", ...] (optional subset of the allowed worker tools), "model": "<model id, optional, defaults to the configured worker_model>"}.
     """
-    from ..tool_executor import CURRENT_SESSION, CURRENT_AGENT
+    from ..tool_executor import CURRENT_SESSION, CURRENT_AGENT, CURRENT_TURN_OWNER
     from ..registry import RUNNERS
 
-    # 1. Owner gate on the SESSION (not the speaker id): a worker session is
-    #    is_owner=False, so a worker calling this is refused → no recursion.
-    sess = CURRENT_SESSION.get(None)
-    if sess is None or not bool(getattr(sess, "is_owner", False)):
+    # 1. Owner gate on the TURN's real owner privilege (not Session.is_owner):
+    #    an owner-created cron turn runs with owner=True but its synthesized
+    #    Session has is_owner=False, so gating on the session would wrongly
+    #    refuse it. CURRENT_TURN_OWNER reflects the turn's `owner` value.
+    if not bool(CURRENT_TURN_OWNER.get()):
         return ToolResult.fail(
-            "spawn_subagents is only available on the owner's own turns "
-            "(this session is not an owner session; subagent workers can never spawn workers)."
+            "spawn_subagents is only available on owner-privileged turns "
+            "(this turn does not carry owner privilege)."
+        )
+    # Workers can NEVER spawn workers, regardless of turn privilege: refuse any
+    # turn running inside a subagent worker session (internal transport whose
+    # conversation_id is an "internal:subagent-" key).
+    sess = CURRENT_SESSION.get(None)
+    if sess is not None and str(getattr(sess, "transport", "")) == "internal" \
+            and str(getattr(sess, "conversation_id", "")).startswith("internal:subagent-"):
+        return ToolResult.fail(
+            "spawn_subagents is only available on owner-privileged turns "
+            "(subagent workers can never spawn workers)."
         )
     agent = CURRENT_AGENT.get(None)
     if agent is None:
@@ -227,6 +261,7 @@ async def spawn_subagents(tasks: list) -> ToolResult:
     worker_model = str(settings.get("worker_model") or "").strip()
     worker_effort = str(settings.get("worker_effort") or "").strip()
     ceiling = parse_tool_list(settings.get("allowed_tools"))
+    read_scope = _parse_read_paths(settings.get("read_paths"))
 
     # 3. Caps.
     if len(task_list) > max_parallel:
@@ -235,7 +270,8 @@ async def spawn_subagents(tasks: list) -> ToolResult:
             "Split into several calls (sequential batches) or merge tasks."
         )
     agent_provider = str(getattr(agent, "provider", "") or "ollama")
-    results: list[tuple[str, bool, str] | None] = [None] * len(task_list)
+    # Each slot: (label, ok, body, calls, errors, denied) once settled.
+    results: list[tuple[str, bool, str, int, int, int] | None] = [None] * len(task_list)
 
     # Inflight reservation — synchronous: nothing awaits between the count
     # read and the add, so two concurrent calls can't both see the same room.
@@ -249,6 +285,7 @@ async def spawn_subagents(tasks: list) -> ToolResult:
                 task_list[i]["label"], False,
                 f"not started: max_inflight_per_agent ({max_inflight}) reached — "
                 f"{inflight_count(agent.id)} workers already running for this agent; retry later",
+                0, 0, 0,
             )
     _reserve_inflight(agent.id, len(launch_idx))
 
@@ -266,7 +303,7 @@ async def spawn_subagents(tasks: list) -> ToolResult:
                 )
         model = task["model"] or worker_model
         task_uuid = str(uuid.uuid4())
-        session = make_subagent_session(agent.id, task_uuid, grants)
+        session = make_subagent_session(agent.id, task_uuid, grants, read_scope=read_scope)
         conv_key = worker_conv_key(session)
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
@@ -276,13 +313,13 @@ async def spawn_subagents(tasks: list) -> ToolResult:
             #    persisted — the conversation is deleted in `finally`).
             why = validate_worker_model(model, agent_provider)
             if why:
-                return label, False, f"invalid worker model: {why}"
+                return label, False, f"invalid worker model: {why}", 0, 0, 0
             conv = runner.get_conversation(
                 conv_key, session.conversation_id, native_key=session.conversation_id,
             )
             ok, msg = conv.set_override("model", model, persist=False)
             if not ok:
-                return label, False, f"invalid worker model `{model}`: {msg}"
+                return label, False, f"invalid worker model `{model}`: {msg}", 0, 0, 0
             if worker_effort:
                 ok_e, msg_e = conv.set_override("effort", worker_effort, persist=False)
                 if not ok_e:
@@ -320,22 +357,29 @@ async def spawn_subagents(tasks: list) -> ToolResult:
                     runner._hard_interrupt(conv_key)
                 except Exception as _ie:
                     print_ts(f"{COLOR_RED}[subagent {label}] interrupt failed: {_ie}{COLOR_END}", error=True, agent=agent.id)
-                return label, False, f"timed out after {int(timeout_s)}s; worker interrupted"
+                return label, False, f"timed out after {int(timeout_s)}s; worker interrupted", 0, 0, 0
             try:
-                text = fut.result()
+                outcome = fut.result()
             except asyncio.CancelledError:
                 # The worker's turn was interrupted under us (e.g. /stop or a
                 # reset on its conversation) — that is this task's failure,
                 # not a cancellation of the orchestrator's tool call.
-                return label, False, "worker turn was interrupted before it finished"
-            text = (text or "").strip()
+                return label, False, "worker turn was interrupted before it finished", 0, 0, 0
+            calls = int(getattr(outcome, "calls", 0))
+            errors = int(getattr(outcome, "errors", 0))
+            denied = int(getattr(outcome, "denied", 0))
+            text = (getattr(outcome, "text", "") or "").strip()
             if not text:
-                return label, False, "worker finished without a reply"
-            return label, True, text
+                return label, False, "worker finished without a reply", calls, errors, denied
+            # Structural success rule (no text matching): a worker that made at
+            # least one tool call where EVERY call failed did no real work ->
+            # error. Otherwise, a non-empty reply is ok.
+            ok = not (calls > 0 and errors == calls)
+            return label, ok, text, calls, errors, denied
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            return label, False, f"{type(e).__name__}: {e}"
+            return label, False, f"{type(e).__name__}: {e}", 0, 0, 0
         finally:
             # 6. Throw the worker conversation away (interrupt + drop queued +
             #    pop from memory + delete .jsonl/.meta.json) and free the slot.
@@ -358,12 +402,12 @@ async def spawn_subagents(tasks: list) -> ToolResult:
             if isinstance(r, BaseException):
                 if isinstance(r, asyncio.CancelledError):
                     raise r
-                results[i] = (task_list[i]["label"], False, f"{type(r).__name__}: {r}")
+                results[i] = (task_list[i]["label"], False, f"{type(r).__name__}: {r}", 0, 0, 0)
             else:
                 results[i] = r
 
     final = [r for r in results if r is not None]
-    n_ok = sum(1 for _, ok, _ in final if ok)
+    n_ok = sum(1 for r in final if r[1])
     # 7. Report.
     text = format_results(final)
     return ToolResult(

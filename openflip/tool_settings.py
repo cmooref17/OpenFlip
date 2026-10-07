@@ -309,6 +309,26 @@ def _validate_subagent_tools(value: Any) -> Optional[str]:
     return None
 
 
+def _validate_read_paths(value: Any) -> Optional[str]:
+    """Each comma-separated entry must be an absolute path to an existing
+    directory (expanduser'd). Empty string is allowed (no read scope → the
+    worker falls back to its default agent-dir + temp read scope)."""
+    import os
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    for part in raw.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        expanded = os.path.expanduser(p)
+        if not os.path.isabs(expanded):
+            return f"`{p}` is not an absolute path"
+        if not os.path.isdir(expanded):
+            return f"`{p}` is not an existing directory"
+    return None
+
+
 def _validate_worker_model(value: Any) -> Optional[str]:
     """Owner-time sanity only: the name must be a known config.json model.
     Provider compatibility with the CALLING agent is re-checked at call time
@@ -336,6 +356,13 @@ register("spawn_subagents", [
         "requested tools are intersected with this; the built-in deny list "
         "(spawn/restart/messaging/cron/shell/file+memory writes) always applies.",
         validator=_validate_subagent_tools),
+    SettingSchema("read_paths", "str", "",
+        "Comma-separated absolute directories a worker's file tools (read_file, "
+        "list_files) may read, overriding the agent's own allowed_read_paths for "
+        "the ephemeral worker. Each entry must be an existing directory. Empty = "
+        "no scope (worker falls back to its agent dir + system temp). Writes are "
+        "always denied for workers regardless of this setting.",
+        validator=_validate_read_paths),
     SettingSchema("max_parallel", "int", 4,
         "Maximum tasks in ONE spawn_subagents call (the call is rejected above this).",
         min=1, max=16),

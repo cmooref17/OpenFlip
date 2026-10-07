@@ -14,7 +14,7 @@ from .anthropic_conversation import AnthropicConversation, MalformedRequestError
 from .openai_conversation import OpenAIConversation
 from .providers import make_conversation, chat_message_class
 from .pipeline import build_user_prompt, should_respond, build_visible_tools, build_api_tool_funcs, extract_image_attachments, build_inbound_from_discord, strip_memory_tools
-from .session import InboundMessage, Session
+from .session import InboundMessage, Session, WorkerOutcome
 from .tool_executor import execute_tool_calls, build_model_feedback
 from .tools import TOOL_REGISTRY
 from .utils import print_ts, COLOR_YELLOW, COLOR_RED, COLOR_GREEN, COLOR_END, sanitize_outbound_text, log_task_exception
@@ -236,6 +236,9 @@ def _settle_result_future(
     result_future: "asyncio.Future | None",
     *,
     text: str | None = None,
+    calls: int = 0,
+    errors: int = 0,
+    denied: int = 0,
     cancelled: bool = False,
 ) -> None:
     """Resolve a subagent/worker `result_future` exactly once, never raising.
@@ -243,10 +246,11 @@ def _settle_result_future(
     Subagent foundation (2026-10-06): a caller that wants a turn's final text
     handed BACK (not posted) passes an `asyncio.Future` through
     `run_synthetic_turn(result_future=...)`. Every exit path of that turn calls
-    this: the post-loop final-text point sets the real text; the cancel branch
-    sets CancelledError; every other early exit / error path sets "" so an
-    awaiter can never hang. `done()`-guarded so the first settle wins and later
-    calls are no-ops. A None future (every pre-existing caller) is a no-op.
+    this: the post-loop final-text point sets the real `WorkerOutcome` (text +
+    tool-outcome counts); the cancel branch sets CancelledError; every other
+    early exit / error path sets an empty WorkerOutcome so an awaiter can never
+    hang. `done()`-guarded so the first settle wins and later calls are no-ops.
+    A None future (every pre-existing caller) is a no-op.
     """
     if result_future is None or result_future.done():
         return
@@ -254,7 +258,9 @@ def _settle_result_future(
         if cancelled:
             result_future.set_exception(asyncio.CancelledError())
         else:
-            result_future.set_result(text or "")
+            result_future.set_result(
+                WorkerOutcome(text=text or "", calls=calls, errors=errors, denied=denied)
+            )
     except Exception:
         pass
 
@@ -2161,7 +2167,7 @@ class AgentRunner:
                     f"{user_text}"
                 )
 
-        from .tool_executor import CURRENT_TURN_DEPTH, CURRENT_SPEAKER_ID, CURRENT_CHANNEL_ID, CURRENT_SESSION
+        from .tool_executor import CURRENT_TURN_DEPTH, CURRENT_SPEAKER_ID, CURRENT_CHANNEL_ID, CURRENT_SESSION, CURRENT_TURN_OWNER
         CURRENT_TURN_DEPTH.set(int(depth))
         # Phase 1 of discord-decouple: set CURRENT_SESSION so tools that prefer
         # Session-based routing (send_message, talk_to_agent, fetch_discord_message)
@@ -2206,6 +2212,10 @@ class AgentRunner:
         # dispatches and downstream IPC calls see the real speaker ID.
         # Default (0) breaks talk_to_agent's DM-resolution path.
         CURRENT_SPEAKER_ID.set(int(speaker_id))
+        # The turn's REAL owner privilege (not Session.is_owner): an owner-created
+        # cron turn has owner=True but a synthesized Session with is_owner=False.
+        # spawn_subagents gates on this.
+        CURRENT_TURN_OWNER.set(bool(owner))
         try:
             CURRENT_CHANNEL_ID.set(int(getattr(channel, "id", 0) or 0))
         except Exception:
@@ -2567,6 +2577,13 @@ class AgentRunner:
         media_only = (agent.tool_response_mode == "media_only")
         any_attachments_this_turn = False
         any_tool_called = False
+        # Running tool-outcome tallies for a worker turn (result_future set).
+        # Settled into the WorkerOutcome so the spawner scores success on
+        # structured counts, not text matching. Accumulated after every
+        # execute_tool_calls batch; harmless (unused) on non-worker turns.
+        _worker_calls = 0
+        _worker_errors = 0
+        _worker_denied = 0
         # Tracks whether any reply-equivalent tool (send_message, end_chain)
         # has already dispatched. If so, the post-loop final-text path knows
         # the reply IS the tool call and doesn't double-emit.
@@ -3256,6 +3273,17 @@ class AgentRunner:
 
                     if tool_results:
                         any_tool_called = True
+
+                    # Tally this batch's tool outcomes for the worker outcome.
+                    # One entry per processed call (incl. ACL-blocked / lock-
+                    # held / dry-run). `not ok` = any failure (error set);
+                    # `denied` = the ACL-deny subset (tool_executor flags it).
+                    for _wname, _wres in tool_results:
+                        _worker_calls += 1
+                        if not _wres.ok:
+                            _worker_errors += 1
+                        if getattr(_wres, "denied", False):
+                            _worker_denied += 1
 
                     # Track reply-equivalent tools (send_message routes text
                     # to the operator, end_chain terminates the chain). The
@@ -4143,7 +4171,10 @@ class AgentRunner:
             _rf_text = ""
             if last_ai_message is not None and not final_calls:
                 _rf_text = final_text or ""
-            _settle_result_future(result_future, text=_rf_text)
+            _settle_result_future(
+                result_future, text=_rf_text,
+                calls=_worker_calls, errors=_worker_errors, denied=_worker_denied,
+            )
 
         # Chain consumed: clear tracker for this peer if it still holds the
         # chain_id we came in with. If the agent dispatched a NEW chain to

@@ -42,7 +42,7 @@ from openflip import config_global as _cfg
 from openflip import registry
 from openflip.runtime import _settle_result_future
 from openflip.session import Session
-from openflip.tool_executor import CURRENT_SESSION, CURRENT_AGENT
+from openflip.tool_executor import CURRENT_SESSION, CURRENT_AGENT, CURRENT_TURN_OWNER
 from openflip.tools import subagent as sa
 from openflip.tools.subagent import spawn_subagents, compute_grants, format_results, worker_conv_key
 from openflip.tool_settings import SUBAGENT_DENIED_TOOLS
@@ -108,6 +108,9 @@ class FakeRunner:
         delay = float(beh.get("delay", 0.05))
         text = beh.get("text", f"summary for {task_line}")
         hang = bool(beh.get("hang", False))
+        calls = int(beh.get("calls", 0))
+        errors = int(beh.get("errors", 0))
+        denied = int(beh.get("denied", 0))
 
         async def _turn():
             t0 = time.monotonic()
@@ -116,7 +119,7 @@ class FakeRunner:
                     await asyncio.sleep(3600)
                 else:
                     await asyncio.sleep(delay)
-                _settle_result_future(result_future, text=text)
+                _settle_result_future(result_future, text=text, calls=calls, errors=errors, denied=denied)
             except asyncio.CancelledError:
                 _settle_result_future(result_future, cancelled=True)
                 raise
@@ -146,7 +149,7 @@ def _agent(provider="anthropic"):
 def _session(is_owner: bool) -> Session:
     return Session(
         transport="discord", transport_id="123", conversation_id="discord:123",
-        speaker_id=999, speaker_role_ids=[], is_owner=is_owner, is_dm=True, display_name="flip",
+        speaker_id=999, speaker_role_ids=[], is_owner=is_owner, is_dm=True, display_name="owner",
     )
 
 
@@ -173,15 +176,21 @@ def _fake_config(*_a, **_k):
     }}
 
 
-async def _call(runner, tasks, *, is_owner=True):
+async def _call(runner, tasks, *, is_owner=True, turn_owner=None):
+    # turn_owner defaults to the session's is_owner when not given, so legacy
+    # callsites keep their behavior; the gate reads CURRENT_TURN_OWNER.
+    if turn_owner is None:
+        turn_owner = is_owner
     registry.RUNNERS[runner.agent.id] = runner
     tok_a = CURRENT_AGENT.set(runner.agent)
     tok_s = CURRENT_SESSION.set(_session(is_owner))
+    tok_o = CURRENT_TURN_OWNER.set(bool(turn_owner))
     try:
         return await spawn_subagents(tasks)
     finally:
         CURRENT_AGENT.reset(tok_a)
         CURRENT_SESSION.reset(tok_s)
+        CURRENT_TURN_OWNER.reset(tok_o)
         registry.RUNNERS.pop(runner.agent.id, None)
 
 
@@ -191,19 +200,30 @@ async def test_owner_gate():
     print("(1) owner gate")
     _settings()
     r = FakeRunner(_agent())
-    res = await _call(r, [{"prompt": "p"}], is_owner=False)
-    check("non-owner session is refused", res.error is not None and "owner" in res.error)
+    # Non-owner turn is refused.
+    res = await _call(r, [{"prompt": "p"}], is_owner=False, turn_owner=False)
+    check("non-owner turn is refused", res.error is not None and "owner" in res.error)
     check("nothing launched", not r.turns and sa.inflight_count("orch") == 0)
-    # A worker session itself (is_owner False, internal transport) is refused too.
+    # Owner-PRIVILEGED turn with a NON-owner session (e.g. owner-created cron:
+    # owner=True but the synthesized Session is is_owner=False) is allowed.
+    r2 = FakeRunner(_agent())
+    res_cron = await _call(r2, [{"prompt": "p"}], is_owner=False, turn_owner=True)
+    check("owner-privileged turn with is_owner=False session is allowed",
+          res_cron.error is None)
+    # A worker session itself (internal:subagent-*) is refused even when the
+    # turn carries owner privilege — workers can never spawn workers.
     registry.RUNNERS["orch"] = r
     from openflip.session import make_subagent_session
     tok_a = CURRENT_AGENT.set(r.agent)
     tok_s = CURRENT_SESSION.set(make_subagent_session("orch", "u-1", ["read_file"]))
+    tok_o = CURRENT_TURN_OWNER.set(True)
     try:
         res2 = await spawn_subagents([{"prompt": "p"}])
     finally:
-        CURRENT_AGENT.reset(tok_a); CURRENT_SESSION.reset(tok_s); registry.RUNNERS.pop("orch", None)
-    check("a worker session cannot spawn workers (no recursion)", res2.error is not None)
+        CURRENT_AGENT.reset(tok_a); CURRENT_SESSION.reset(tok_s)
+        CURRENT_TURN_OWNER.reset(tok_o); registry.RUNNERS.pop("orch", None)
+    check("a worker session cannot spawn workers even with owner privilege",
+          res2.error is not None and "worker" in res2.error)
     res3 = await _call(FakeRunner(_agent()), "not json at all")
     check("malformed tasks rejected", res3.error is not None)
 
@@ -266,7 +286,9 @@ async def test_concurrent_success():
           a is not None and b is not None and b[0] < a[1] and a[0] < b[1])
     check("wall time ~one delay, not two", elapsed < 0.55)
     text = res.text or ""
-    check("report has both ok entries", "### A — ok\nALPHA RESULT" in text and "### B — ok\nBETA RESULT" in text)
+    check("report has both ok entries",
+          "### A — ok (0 calls, 0 errors, 0 denied)\nALPHA RESULT" in text
+          and "### B — ok (0 calls, 0 errors, 0 denied)\nBETA RESULT" in text)
     check("model_feedback counts workers", (res.model_feedback or "").startswith("2/2 workers ok"))
     check("prompt framed as worker task + user prompt",
           all(sa.WORKER_PREAMBLE in t["prompt"] and "## Task\n" in t["prompt"] for t in r.turns))
@@ -298,7 +320,8 @@ async def test_overrides_and_model_validation():
           and convs[0].overrides.get("model") == "claude-sonnet-5-5" and convs[1].overrides.get("model") == "claude-opus-5-5")
     r2 = FakeRunner(_agent())
     res2 = await _call(r2, [{"prompt": "bad", "model": "claude-nope-1", "label": "bad"}, {"prompt": "good", "label": "good"}])
-    check("unknown model fails only that task", "### bad — error\ninvalid worker model" in (res2.text or "")
+    check("unknown model fails only that task",
+          "### bad — error (0 calls, 0 errors, 0 denied)\ninvalid worker model" in (res2.text or "")
           and "### good — ok" in (res2.text or ""))
     check("failed task never launched; good one did", len(r2.turns) == 1)
     r3 = FakeRunner(_agent(provider="ollama"))
@@ -319,8 +342,8 @@ async def test_timeout():
     t0 = time.monotonic()
     res = await _call(r, [{"prompt": "slow", "label": "S"}, {"prompt": "fast", "label": "F"}])
     check("returned promptly", time.monotonic() - t0 < 1.5)
-    check("timeout yields an error entry", "### S — error\ntimed out after 0s" in (res.text or "") or "### S — error\ntimed out" in (res.text or ""))
-    check("fast task still ok", "### F — ok\nFAST" in (res.text or ""))
+    check("timeout yields an error entry", "### S — error (0 calls, 0 errors, 0 denied)\ntimed out" in (res.text or ""))
+    check("fast task still ok", "### F — ok (0 calls, 0 errors, 0 denied)\nFAST" in (res.text or ""))
     slow_key = next(worker_conv_key(t["session"]) for t in r.turns if "slow" in t["prompt"])
     check("interrupt fired on the slow worker's conv key", slow_key in r.interrupts)
     check("slow worker task actually cancelled", r._active[slow_key].cancelled() or r._active[slow_key].done())
@@ -334,7 +357,7 @@ async def test_exception():
     r = FakeRunner(_agent(), raise_on_get_conv=True)
     res = await _call(r, [{"prompt": "e", "label": "E"}])
     check("tool itself does not raise", res.error is None)
-    check("error entry carries the exception", "### E — error\nRuntimeError: boom" in (res.text or ""))
+    check("error entry carries the exception", "### E — error (0 calls, 0 errors, 0 denied)\nRuntimeError: boom" in (res.text or ""))
     check("cleanup ran", len(r.resets) == 1)
     check("inflight back to 0 after exception", sa.inflight_count("orch") == 0)
 
@@ -349,7 +372,7 @@ async def test_inflight_cap():
     r2 = FakeRunner(_agent(), r.behaviors)
     res2 = await _call(r2, [{"prompt": "c3", "label": "c3"}, {"prompt": "c4", "label": "c4"}])
     check("second call: one slot free → one launched, the excess fails fast",
-          "### c3 — ok" in (res2.text or "") and "### c4 — error\nnot started: max_inflight_per_agent" in (res2.text or "")
+          "### c3 — ok" in (res2.text or "") and "### c4 — error (0 calls, 0 errors, 0 denied)\nnot started: max_inflight_per_agent" in (res2.text or "")
           and len(r2.turns) == 1)
     res1 = await first
     check("first call completed normally", "### c1 — ok" in (res1.text or "") and "### c2 — ok" in (res1.text or ""))
@@ -377,12 +400,37 @@ async def test_tool_cancelled():
 
 def test_format_cap():
     print("(9) report cap")
-    big = [(f"t{i}", True, "x" * 10_000) for i in range(4)]
+    big = [(f"t{i}", True, "x" * 10_000, 0, 0, 0) for i in range(4)]
     out = format_results(big)
     check("total report ≤ 12k", len(out) <= 12_000)
     check("every entry present + truncated marker", all(f"### t{i} — ok" in out for i in range(4)) and "…[truncated]" in out)
-    small = format_results([("a", True, "fine"), ("b", False, "nope")])
-    check("small report verbatim", small == "### a — ok\nfine\n\n### b — error\nnope")
+    small = format_results([("a", True, "fine", 2, 1, 0), ("b", False, "nope", 2, 2, 1)])
+    check("small report verbatim with counts",
+          small == "### a — ok (2 calls, 1 errors, 0 denied)\nfine\n\n"
+                   "### b — error (2 calls, 2 errors, 1 denied)\nnope")
+
+
+async def test_outcome_scoring():
+    print("(10) worker scoring from structured tool-outcome counts")
+    _settings()
+    # Two calls, both failed (all ACL-denied) → error, counts shown.
+    r = FakeRunner(_agent(), {"alldenied": {"text": "I could not do anything", "calls": 2, "errors": 2, "denied": 2}})
+    res = await _call(r, [{"prompt": "alldenied", "label": "D"}])
+    check("every-call-failed worker scored error",
+          "### D — error (2 calls, 2 errors, 2 denied)" in (res.text or ""))
+    check("model_feedback counts it as 0 ok", (res.model_feedback or "").startswith("0/1 workers ok"))
+    # Two calls, one failed → ok, counts shown.
+    r2 = FakeRunner(_agent(), {"partial": {"text": "got most of it", "calls": 2, "errors": 1, "denied": 0}})
+    res2 = await _call(r2, [{"prompt": "partial", "label": "P"}])
+    check("partial-failure worker scored ok with counts",
+          "### P — ok (2 calls, 1 errors, 0 denied)\ngot most of it" in (res2.text or ""))
+    check("model_feedback counts it ok", (res2.model_feedback or "").startswith("1/1 workers ok"))
+    # Zero calls + text → ok (text-only worker is not an error).
+    r3 = FakeRunner(_agent(), {"notools": {"text": "here is my answer", "calls": 0, "errors": 0, "denied": 0}})
+    res3 = await _call(r3, [{"prompt": "notools", "label": "N"}])
+    check("no-tool-call worker with text scored ok",
+          "### N — ok (0 calls, 0 errors, 0 denied)\nhere is my answer" in (res3.text or ""))
+    check("inflight back to 0 after scoring cases", sa.inflight_count("orch") == 0)
 
 
 async def _main_async():
@@ -395,6 +443,7 @@ async def _main_async():
     await test_exception()
     await test_inflight_cap()
     await test_tool_cancelled()
+    await test_outcome_scoring()
     test_format_cap()
 
 

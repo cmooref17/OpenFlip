@@ -37,6 +37,11 @@ class ToolResult:
     #           to post).
     posted_ok: Optional[bool] = None
     post_fail_reason: Optional[str] = None
+    # True when this failure is an ACL denial (tool_executor sets it on the
+    # fail result it returns for a blocked call). Lets callers that tally
+    # tool outcomes — e.g. spawn_subagents' worker scoring — count denials
+    # separately from other failures without matching the error string.
+    denied: bool = False
 
     @property
     def ok(self) -> bool:

@@ -105,8 +105,8 @@ def test_a_default_none() -> None:
 def test_b_make_subagent_session() -> None:
     print("(b) make_subagent_session")
     grants = ["read_file", "web_search"]
-    s1 = make_subagent_session("rhea", "aaaa-1111", grants)
-    s2 = make_subagent_session("rhea", "bbbb-2222", grants)
+    s1 = make_subagent_session("agent1", "aaaa-1111", grants)
+    s2 = make_subagent_session("agent1", "bbbb-2222", grants)
     check("returns a Session", isinstance(s1, Session))
     check("is_owner is False", s1.is_owner is False and s2.is_owner is False)
     check("transport is internal", s1.transport == "internal")
@@ -117,13 +117,13 @@ def test_b_make_subagent_session() -> None:
     check("speaker_id is a positive int (non-zero, hashable lock key)",
           isinstance(s1.speaker_id, int) and s1.speaker_id > 0)
     check("same uuid → same speaker_id within a process",
-          make_subagent_session("rhea", "aaaa-1111", grants).speaker_id == s1.speaker_id)
+          make_subagent_session("agent1", "aaaa-1111", grants).speaker_id == s1.speaker_id)
     check("grants == allowlist == caller list",
           s1.tool_grants == grants and s1.tool_allowlist == grants)
     check("grants/allowlist are copies, not the caller's list object",
           s1.tool_grants is not grants and s1.tool_allowlist is not grants
           and s1.tool_grants is not s1.tool_allowlist)
-    s3 = make_subagent_session("rhea", "cccc-3333", [])
+    s3 = make_subagent_session("agent1", "cccc-3333", [])
     check("empty grants → empty allowlist (deny-all, not None)",
           s3.tool_grants == [] and s3.tool_allowlist == [] and s3.tool_allowlist is not None)
     check("no handle, no roles", s1.handle == "" and s1.speaker_role_ids == [])
@@ -137,10 +137,12 @@ def test_c_never_hangs() -> None:
 
         # -- settle helper semantics --
         f = loop.create_future()
-        _settle_result_future(f, text="hi")
-        check("settle sets the text", f.done() and f.result() == "hi")
+        _settle_result_future(f, text="hi", calls=3, errors=1, denied=1)
+        check("settle sets the text", f.done() and f.result().text == "hi")
+        check("settle carries the tool-outcome counts",
+              (f.result().calls, f.result().errors, f.result().denied) == (3, 1, 1))
         _settle_result_future(f, text="later")
-        check("second settle is a no-op (first wins)", f.result() == "hi")
+        check("second settle is a no-op (first wins)", f.result().text == "hi")
         f2 = loop.create_future()
         _settle_result_future(f2, cancelled=True)
         try:
@@ -150,7 +152,8 @@ def test_c_never_hangs() -> None:
             check("cancel-settle raises CancelledError to the awaiter", True)
         f3 = loop.create_future()
         _settle_result_future(f3)
-        check("settle with no text resolves to empty string", f3.result() == "")
+        check("settle with no text resolves to an empty WorkerOutcome",
+              f3.result().text == "" and f3.result().calls == 0)
         _settle_result_future(None, text="x")
         check("settle(None) is a harmless no-op", True)
         f4 = loop.create_future()
@@ -202,7 +205,7 @@ def test_c_never_hangs() -> None:
         AgentRunner._on_turn_done(fake, t2)
         try:
             r = await asyncio.wait_for(pending2, timeout=1.0)
-            check("backstop: finished supervisor with unsettled future → \"\"", r == "")
+            check("backstop: finished supervisor with unsettled future → empty outcome", r.text == "")
         except asyncio.TimeoutError:
             check("backstop: finished supervisor with unsettled future → \"\" (HUNG)", False)
 
@@ -237,7 +240,7 @@ def test_c_never_hangs() -> None:
         finally:
             _cfg.get_owner_id = _orig
         check("no owner_id → future settled \"\", nothing queued",
-              f5.done() and f5.result() == "" and not fake_r._inbound_queue.items)
+              f5.done() and f5.result().text == "" and not fake_r._inbound_queue.items)
 
         _cfg.get_owner_id = lambda transport="discord": 111
         fake_r2 = _fake_runner(None)  # channel not found
@@ -247,7 +250,7 @@ def test_c_never_hangs() -> None:
         finally:
             _cfg.get_owner_id = _orig
         check("channel not found → future settled \"\", nothing queued",
-              f6.done() and f6.result() == "" and not fake_r2._inbound_queue.items)
+              f6.done() and f6.result().text == "" and not fake_r2._inbound_queue.items)
 
         # -- happy path: the future rides the queue dict and the task attr --
         _cfg.get_owner_id = lambda transport="discord": 111
