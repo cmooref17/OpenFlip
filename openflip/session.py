@@ -93,11 +93,26 @@ class Session:
     #                 fallback (agent dir + system temp) applies, same as an
     #                 agent with no allowed_read_paths configured.
     #   [dir, …]    → reads are confined to exactly these dirs.
-    # In every non-None case WRITES resolve to [] (writes denied) — this scope
-    # is read-only. `denied_paths` still wins (checked first in _check_access).
+    # Writes are governed separately by `write_scope` below (a worker with a
+    # read_scope but no write_scope cannot write anywhere). `denied_paths`
+    # still wins (checked first in _check_access).
     # Set by `make_subagent_session` so an ephemeral worker (transport
     # "internal", whose agent may only have a "discord" path block) can read the
     # project dirs the owner scopes it to via spawn_subagents `read_paths`.
+    write_scope: Optional[list[str]] = None
+    # Independent FILE-WRITE scope for this session, the write-side twin of
+    # `read_scope` (files.py `_effective_allowed`). Semantics (fail-closed):
+    #   None        → no override on its own. For a NON-worker session (both
+    #                 scopes None) path ACLs resolve normally. For a worker
+    #                 (read_scope set, write_scope None) writes resolve to []
+    #                 → write_file / edit_file are denied everywhere.
+    #   [] (empty)  → writes denied (no write fallback exists; an empty write
+    #                 allow list is a default-deny).
+    #   [dir, …]    → write_file / edit_file are confined to exactly these
+    #                 dirs. delete_file / restore_snapshot stay in
+    #                 SUBAGENT_DENIED_TOOLS regardless of this scope.
+    # `denied_paths` still wins. Set by `make_subagent_session` from the
+    # spawn_subagents `write_paths` setting.
 
     @property
     def channel_id_int(self) -> int:
@@ -246,6 +261,7 @@ def make_subagent_session(
     task_uuid: str,
     grants: list[str],
     read_scope: Optional[list[str]] = None,
+    write_scope: Optional[list[str]] = None,
 ) -> Session:
     """Build a Session for one ephemeral subagent/worker task.
 
@@ -273,6 +289,12 @@ def make_subagent_session(
         worker resolves path ACLs normally; a list (possibly empty) confines
         its file reads per Session.read_scope. See the spawn_subagents
         `read_paths` setting.
+      - `write_scope` is likewise an INDEPENDENT copy. None or [] = the
+        worker cannot write anywhere (write_file / edit_file denied); a
+        non-empty list confines its writes to exactly those dirs per
+        Session.write_scope. See the spawn_subagents `write_paths` setting.
+        delete_file / restore_snapshot are hard-denied for workers whatever
+        this says (SUBAGENT_DENIED_TOOLS).
     """
     speaker_id = abs(hash(f"internal:subagent:{agent_id}:{task_uuid}")) % (2**31)
     return Session(
@@ -288,4 +310,5 @@ def make_subagent_session(
         tool_grants=list(grants),
         tool_allowlist=list(grants),
         read_scope=None if read_scope is None else list(read_scope),
+        write_scope=None if write_scope is None else list(write_scope),
     )

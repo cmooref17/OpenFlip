@@ -56,7 +56,9 @@ WORKER_PREAMBLE = (
     "so make reasonable assumptions and state them. Do not address a human and do "
     "not try to message anyone. When you are done, reply with a concise, "
     "self-contained summary of your results (findings, facts, excerpts, paths, "
-    "URLs — whatever the orchestrator needs to use your work), and nothing else."
+    "URLs — whatever the orchestrator needs to use your work), and nothing else. "
+    "If you changed any files, end your summary with a 'Files changed:' list of "
+    "absolute paths."
 )
 
 
@@ -89,12 +91,13 @@ def worker_conv_key(session) -> int:
         return abs(hash(session.transport_id)) % (2**31)
 
 
-def _parse_read_paths(raw: Any) -> list[str]:
-    """Split the owner-set `read_paths` setting (comma-separated absolute dirs)
-    into an expanduser'd list, order preserved, blanks dropped. Always returns
-    a list (possibly empty); the empty list still OVERRIDES the agent's path
-    ACLs for the worker — it just resolves to the default read fallback rather
-    than the worker inheriting a discord-only block it can't match."""
+def _parse_paths(raw: Any) -> list[str]:
+    """Split an owner-set path-list setting (`read_paths` / `write_paths`:
+    comma-separated absolute dirs) into an expanduser'd list, order preserved,
+    blanks dropped. Always returns a list (possibly empty); the empty list
+    still OVERRIDES the agent's path ACLs for the worker — for reads it
+    resolves to the default read fallback rather than the worker inheriting a
+    discord-only block it can't match; for writes it means "nowhere"."""
     import os
     items = str(raw or "").split(",")
     out: list[str] = []
@@ -108,9 +111,45 @@ def _parse_read_paths(raw: Any) -> list[str]:
     return out
 
 
-def compute_grants(requested: list[str] | None, ceiling: list[str]) -> list[str]:
-    """(requested or ceiling) ∩ ceiling − SUBAGENT_DENIED_TOOLS, order kept."""
-    allowed = [t for t in ceiling if t not in SUBAGENT_DENIED_TOOLS]
+# Back-compat name (tests / older callers).
+_parse_read_paths = _parse_paths
+
+# Write-side tools that are not hard-denied but only granted when the owner
+# gave workers somewhere to write (`write_paths` non-empty) — and, for the
+# host shell, additionally opted in via `allow_shell`.
+_WRITE_SCOPED_TOOLS = ("write_file", "edit_file")
+_SHELL_TOOLS = ("run_command",)
+
+
+def compute_grants(
+    requested: list[str] | None,
+    ceiling: list[str],
+    *,
+    write_paths: list[str] | None = None,
+    allow_shell: bool = False,
+) -> list[str]:
+    """(requested or ceiling) ∩ ceiling − SUBAGENT_DENIED_TOOLS, order kept.
+
+    Conditional drops on top of the hard deny set:
+      * write_file / edit_file are dropped unless `write_paths` is non-empty
+        (files.py would refuse every write anyway via Session.write_scope,
+        but a tool the worker cannot use should not be in its tool list);
+      * run_command is dropped unless `allow_shell` is true AND `write_paths`
+        is non-empty (a worker with nowhere to write gets no shell either).
+    """
+    has_write = bool(write_paths)
+    shell_ok = bool(allow_shell) and has_write
+
+    def _ok(t: str) -> bool:
+        if t in SUBAGENT_DENIED_TOOLS:
+            return False
+        if t in _WRITE_SCOPED_TOOLS and not has_write:
+            return False
+        if t in _SHELL_TOOLS and not shell_ok:
+            return False
+        return True
+
+    allowed = [t for t in ceiling if _ok(t)]
     if not requested:
         return list(allowed)
     allowed_set = set(allowed)
@@ -216,10 +255,10 @@ def format_results(results: list[tuple[str, bool, str, int, int, int]], cap: int
 
 @tool
 async def spawn_subagents(tasks: list) -> ToolResult:
-    """Fan a batch of self-contained tasks out to parallel subagent workers and get back only their summaries. ONE call runs ALL the tasks at once (up to max_parallel), each in a brand-new isolated worker with a fresh context that knows NOTHING about this conversation — not the user, not earlier messages, not files you looked at — so every prompt must be fully self-contained: include every fact, path, URL, constraint and the exact shape of answer you want. Workers run on the configured cheaper worker model with a read-only tool set (see the spawn_subagents settings; tools you request are intersected with that ceiling), cannot ask questions, cannot message anyone, cannot write files or memory, and cannot spawn workers themselves. When all finish you receive one summary per task (ok or error); you then verify and assemble the results yourself. Plan first, delegate the independent read/search chunks, keep the synthesis.
+    """Fan a batch of self-contained tasks out to parallel subagent workers and get back only their summaries. ONE call runs ALL the tasks at once (up to max_parallel), each in a brand-new isolated worker with a fresh context that knows NOTHING about this conversation — not the user, not earlier messages, not files you looked at — so every prompt must be fully self-contained: include every fact, path, URL, constraint and the exact shape of answer you want. Workers run on the configured cheaper worker model with a restricted tool set (see the spawn_subagents settings; tools you request are intersected with that ceiling): they can read and search, can create/edit files ONLY inside the owner-configured write folders (write_paths; none configured = read-only), and can run shell commands only if the owner enabled allow_shell. Workers cannot ask questions, cannot message anyone, cannot delete or restore files, cannot write memory, and cannot spawn workers themselves. When delegating edits, give parallel workers DISJOINT sets of files — never let two workers touch the same file — and require each worker's summary to list every file it changed (absolute paths). When all finish you receive one summary per task (ok or error); you then verify and assemble the results yourself (re-read any file a worker claims to have changed). Plan first, delegate the independent read/search/edit chunks, keep the synthesis.
 
     Args:
-        tasks: Array of task objects, one worker each. {"prompt": "<complete standalone instructions>", "label": "<short name, optional>", "tools": ["web_search", ...] (optional subset of the allowed worker tools), "model": "<model id, optional, defaults to the configured worker_model>"}.
+        tasks: Array of task objects, one worker each. {"prompt": "<complete standalone instructions, naming exactly which files this worker owns if it edits any>", "label": "<short name, optional>", "tools": ["web_search", ...] (optional subset of the allowed worker tools), "model": "<model id, optional, defaults to the configured worker_model>"}.
     """
     from ..tool_executor import CURRENT_SESSION, CURRENT_AGENT, CURRENT_TURN_OWNER
     from ..registry import RUNNERS
@@ -261,7 +300,9 @@ async def spawn_subagents(tasks: list) -> ToolResult:
     worker_model = str(settings.get("worker_model") or "").strip()
     worker_effort = str(settings.get("worker_effort") or "").strip()
     ceiling = parse_tool_list(settings.get("allowed_tools"))
-    read_scope = _parse_read_paths(settings.get("read_paths"))
+    read_scope = _parse_paths(settings.get("read_paths"))
+    write_scope = _parse_paths(settings.get("write_paths"))
+    allow_shell = bool(settings.get("allow_shell", False))
 
     # 3. Caps.
     if len(task_list) > max_parallel:
@@ -292,18 +333,22 @@ async def spawn_subagents(tasks: list) -> ToolResult:
     async def _run_one(i: int) -> tuple[str, bool, str]:
         task = task_list[i]
         label = task["label"]
-        # 2. Grants: (requested or ceiling) ∩ ceiling − denied.
-        grants = compute_grants(task["tools"], ceiling)
+        # 2. Grants: (requested or ceiling) ∩ ceiling − denied, with the
+        #    write/shell tools conditional on write_paths / allow_shell.
+        grants = compute_grants(task["tools"], ceiling, write_paths=write_scope, allow_shell=allow_shell)
         if task["tools"]:
             stripped = [t for t in task["tools"] if t not in grants]
             if stripped:
                 print_ts(
-                    f"{COLOR_YELLOW}[subagent {label}] stripped tools not in the worker ceiling / denied: "
+                    f"{COLOR_YELLOW}[subagent {label}] stripped tools not in the worker ceiling / denied / "
+                    f"unscoped (write_paths, allow_shell): "
                     f"{', '.join(stripped)}{COLOR_END}", agent=agent.id,
                 )
         model = task["model"] or worker_model
         task_uuid = str(uuid.uuid4())
-        session = make_subagent_session(agent.id, task_uuid, grants, read_scope=read_scope)
+        session = make_subagent_session(
+            agent.id, task_uuid, grants, read_scope=read_scope, write_scope=write_scope,
+        )
         conv_key = worker_conv_key(session)
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
@@ -331,7 +376,7 @@ async def spawn_subagents(tasks: list) -> ToolResult:
             prompt = f"{WORKER_PREAMBLE}\n\n## Task\n{task['prompt']}"
             print_ts(
                 f"[subagent {label}] launching worker {task_uuid[:8]} model={model} "
-                f"tools={','.join(grants) or '-'}", agent=agent.id,
+                f"tools={','.join(grants) or '-'} write={','.join(write_scope) or '-'}", agent=agent.id,
             )
             await runner.run_synthetic_turn(
                 session, prompt,

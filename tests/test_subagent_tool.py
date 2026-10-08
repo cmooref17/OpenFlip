@@ -25,7 +25,11 @@ What this guards:
   (8) worker session/override shape: is_owner False, allowlist == grants,
       model/effort/memory overrides applied non-persistently, invalid
       models fail that task cleanly;
-  (9) the report is capped.
+  (9) the report is capped;
+ (10) write scope + shell: write_file/edit_file granted only with a non-empty
+      write_paths; run_command only with allow_shell AND write_paths; the
+      worker session carries write_scope; worker sessions are exempt from
+      tool-result path redaction while other non-owner sessions still redact.
 """
 from __future__ import annotations
 
@@ -249,15 +253,21 @@ async def test_grants():
           compute_grants(None, sorted(SUBAGENT_DENIED_TOOLS) + ["read_memory"]) == ["read_memory"])
     for must in ("spawn_subagents", "restart_gateway", "claude_code", "force_reply", "resolve_approval",
                  "talk_to_agent", "send_message", "send_file", "inject_context", "add_cron_job",
-                 "cancel_cron_job", "list_cron_jobs", "run_command", "write_file", "edit_file",
-                 "delete_file", "restore_snapshot", "save_memory", "update_core_memory",
+                 "cancel_cron_job", "list_cron_jobs", "run_command_sandbox",
+                 "write_file_sandbox", "delete_file", "restore_snapshot", "save_memory", "update_core_memory",
                  "delete_memory", "dream", "reindex_memory", "discord_post", "discord_manage",
                  "flip_send", "flip_voice"):
         if must not in SUBAGENT_DENIED_TOOLS:
             check(f"deny list contains {must}", False)
     check("deny list covers the required set", True)
+    check("write_file/edit_file are NOT hard-denied (write_paths-scoped instead)",
+          "write_file" not in SUBAGENT_DENIED_TOOLS and "edit_file" not in SUBAGENT_DENIED_TOOLS)
+    check("run_command is NOT hard-denied (allow_shell + write_paths gated instead)",
+          "run_command" not in SUBAGENT_DENIED_TOOLS)
     check("/toolset validator rejects denied tools in allowed_tools",
-          ts.coerce_and_validate("spawn_subagents", "allowed_tools", "read_file,run_command")[1] is not None)
+          ts.coerce_and_validate("spawn_subagents", "allowed_tools", "read_file,delete_file")[1] is not None)
+    check("/toolset validator accepts run_command/write_file in allowed_tools (call-time gated)",
+          ts.coerce_and_validate("spawn_subagents", "allowed_tools", "read_file,run_command,write_file")[1] is None)
     check("/toolset validator accepts the default list",
           ts.coerce_and_validate("spawn_subagents", "allowed_tools", ts.SUBAGENT_DEFAULT_TOOLS)[1] is None)
 
@@ -445,6 +455,131 @@ async def _main_async():
     await test_tool_cancelled()
     await test_outcome_scoring()
     test_format_cap()
+    await test_write_scope_and_shell()
+
+
+async def test_write_scope_and_shell():
+    print("(10) write scope + shell grants, write_scope plumbing, redaction exemption")
+    import tempfile
+    from openflip.tool_executor import build_model_feedback
+    from openflip.tools._base import ToolResult
+    from openflip.session import make_subagent_session
+
+    ceiling = ["read_file", "write_file", "edit_file", "run_command", "web_search"]
+    # -- compute_grants: write tools conditional on write_paths
+    check("compute_grants drops write_file/edit_file with empty write_paths",
+          compute_grants(None, ceiling) == ["read_file", "web_search"])
+    check("compute_grants drops write tools with write_paths=[] explicitly",
+          compute_grants(None, ceiling, write_paths=[]) == ["read_file", "web_search"])
+    check("compute_grants keeps write_file/edit_file with non-empty write_paths",
+          compute_grants(None, ceiling, write_paths=["/tmp"]) == ["read_file", "write_file", "edit_file", "web_search"])
+    check("requested write tool dropped when write_paths empty",
+          compute_grants(["write_file", "read_file"], ceiling) == ["read_file"])
+    check("requested write tool kept when write_paths set",
+          compute_grants(["write_file", "read_file"], ceiling, write_paths=["/tmp"]) == ["write_file", "read_file"])
+    # -- compute_grants: run_command conditional on allow_shell AND write_paths
+    check("run_command dropped when allow_shell False (write_paths set)",
+          "run_command" not in compute_grants(None, ceiling, write_paths=["/tmp"], allow_shell=False))
+    check("run_command dropped when allow_shell True but write_paths empty",
+          "run_command" not in compute_grants(None, ceiling, write_paths=[], allow_shell=True))
+    check("run_command kept when allow_shell True AND write_paths set",
+          compute_grants(None, ceiling, write_paths=["/tmp"], allow_shell=True)
+          == ["read_file", "write_file", "edit_file", "run_command", "web_search"])
+    check("run_command still dropped when requested but unscoped",
+          compute_grants(["run_command"], ceiling, allow_shell=True) == [])
+    check("hard-denied tools stay denied even with shell + write scope",
+          compute_grants(None, ["delete_file", "restore_snapshot", "run_command_sandbox", "write_file_sandbox", "read_file"],
+                         write_paths=["/tmp"], allow_shell=True) == ["read_file"])
+
+    # -- worker session receives write_scope (and grants reflect it)
+    wdir = tempfile.mkdtemp(prefix="sa-write-")
+    try:
+        _settings(allowed_tools="read_file,write_file,edit_file,run_command", write_paths=wdir, allow_shell=True)
+        r = FakeRunner(_agent())
+        res = await _call(r, [{"prompt": "w"}])
+        check("call with write_paths + allow_shell succeeded", res.error is None)
+        sess = r.turns[0]["session"]
+        check("worker session carries write_scope == parsed write_paths",
+              sess.write_scope == [wdir])
+        check("write_scope is an independent copy (not the same list object)",
+              sess.write_scope is not None and sess.write_scope == [wdir])
+        check("worker grants include write tools + run_command",
+              sess.tool_allowlist == ["read_file", "write_file", "edit_file", "run_command"])
+        check("worker preamble asks for a 'Files changed:' list",
+              "Files changed:" in r.turns[0]["prompt"])
+
+        _settings(allowed_tools="read_file,write_file,edit_file,run_command", write_paths=wdir, allow_shell=False)
+        r2 = FakeRunner(_agent())
+        await _call(r2, [{"prompt": "w"}])
+        check("allow_shell False → run_command absent, write tools present",
+              r2.turns[0]["session"].tool_allowlist == ["read_file", "write_file", "edit_file"])
+
+        _settings(allowed_tools="read_file,write_file,edit_file,run_command", write_paths="", allow_shell=True)
+        r3 = FakeRunner(_agent())
+        await _call(r3, [{"prompt": "w"}])
+        s3 = r3.turns[0]["session"]
+        check("empty write_paths → no write tools, no run_command, write_scope == []",
+              s3.tool_allowlist == ["read_file"] and s3.write_scope == [])
+
+        _settings(allowed_tools="read_file,write_file", write_paths=f"{wdir}, {wdir}/,", allow_shell=False)
+        r4 = FakeRunner(_agent())
+        await _call(r4, [{"prompt": "w"}])
+        check("write_paths parsing dedupes + drops blanks (same rules as read_paths)",
+              r4.turns[0]["session"].write_scope == [wdir, f"{wdir}/"])
+    finally:
+        import shutil
+        shutil.rmtree(wdir, ignore_errors=True)
+
+    # -- redaction exemption: worker sessions see real paths; other non-owner sessions don't
+    # The fake config has no owner_id (→ 0), so an UNSET speaker id (also 0)
+    # would read as owner; pin a real non-owner speaker id for these checks.
+    from openflip.tool_executor import CURRENT_SPEAKER_ID
+    home_path = os.path.join(os.path.expanduser("~"), "some", "file.txt")
+    res_t = ToolResult(text=f"wrote {home_path}")
+    tok_sp = CURRENT_SPEAKER_ID.set(999)
+    try:
+        worker_sess = make_subagent_session("orch", "u-redact", ["read_file"])
+        tok = CURRENT_SESSION.set(worker_sess)
+        try:
+            fb_worker = build_model_feedback("write_file", res_t)
+        finally:
+            CURRENT_SESSION.reset(tok)
+        check("worker session is non-owner (exemption is not via ownership)", worker_sess.is_owner is False)
+        check("worker session: feedback keeps the real path", home_path in fb_worker)
+
+        tok = CURRENT_SESSION.set(_session(False))
+        try:
+            fb_user = build_model_feedback("write_file", res_t)
+        finally:
+            CURRENT_SESSION.reset(tok)
+        check("non-owner discord session: feedback is redacted",
+              home_path not in fb_user and "<path>" in fb_user)
+    finally:
+        CURRENT_SPEAKER_ID.reset(tok_sp)
+
+    # An `internal` session that is NOT a subagent worker (e.g. a cron turn)
+    # must still be redacted — the exemption keys on the subagent conv id.
+    other_internal = Session(
+        transport="internal", transport_id="cron-x", conversation_id="internal:cron-x",
+        speaker_id=5, speaker_role_ids=[], is_owner=False, is_dm=False, display_name="cron",
+    )
+    tok = CURRENT_SESSION.set(other_internal)
+    try:
+        fb_internal = build_model_feedback("write_file", res_t)
+    finally:
+        CURRENT_SESSION.reset(tok)
+    check("non-worker internal session: feedback is redacted",
+          home_path not in fb_internal and "<path>" in fb_internal)
+
+    tok_sp = CURRENT_SPEAKER_ID.set(999)
+    tok = CURRENT_SESSION.set(None)
+    try:
+        fb_none = build_model_feedback("write_file", res_t)
+    finally:
+        CURRENT_SESSION.reset(tok)
+        CURRENT_SPEAKER_ID.reset(tok_sp)
+    check("no session at all (non-owner speaker): feedback is redacted",
+          home_path not in fb_none)
 
 
 def main() -> int:

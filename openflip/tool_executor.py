@@ -229,6 +229,24 @@ async def execute_tool_calls(
 
     media_only = (agent.tool_response_mode == "media_only")
 
+    # Lock identity. The `_inflight` key is (agent, speaker, tool) and a held
+    # lock is REJECTED, not awaited. A spawn_subagents worker turn carries the
+    # OWNER's speaker_id (the orchestrator's turn speaker), so two parallel
+    # workers — or a worker and the orchestrator — calling the same tool at
+    # once would collide as "Already running". Workers therefore lock under
+    # their session's own hashed `speaker_id` (distinct per task_uuid, see
+    # make_subagent_session). Only the lock key changes: speaker attribution
+    # (CURRENT_SPEAKER_ID), ACL evaluation and owner checks are untouched,
+    # and non-worker sessions keep the turn speaker exactly as before.
+    _lock_speaker = int(speaker_id)
+    if _caller_is_subagent_worker():
+        try:
+            _own = int(getattr(CURRENT_SESSION.get(None), "speaker_id", 0) or 0)
+        except Exception:
+            _own = 0
+        if _own:
+            _lock_speaker = _own
+
     for _tc_idx, tc in enumerate(tool_calls):
         name = tc.function_name
         args = tc.args or {}
@@ -249,7 +267,7 @@ async def execute_tool_calls(
             out.append((name, _denied))
             continue
 
-        key = _lock_key(agent, speaker_id, name)
+        key = _lock_key(agent, _lock_speaker, name)
         lock = _inflight[key]
         if lock.locked():
             if not silent:
@@ -417,7 +435,7 @@ async def _post_tool_result(
         # The owner (operating their own tools) is exempt so diagnostics stay
         # intact; everyone else gets paths scrubbed. redact_paths only touches
         # home/project paths, so legitimate text/URLs are preserved.
-        if not _caller_is_owner_safe():
+        if not _redaction_exempt():
             text = redact_paths(text)
 
     attachment_paths = []
@@ -507,6 +525,33 @@ def _caller_is_owner_safe() -> bool:
         return False
 
 
+def _caller_is_subagent_worker() -> bool:
+    """True only inside a spawn_subagents worker turn: CURRENT_SESSION is on
+    the `internal` transport AND its conversation_id is an
+    `internal:subagent-<uuid>` key (the exact shape make_subagent_session
+    builds). Never raises; anything unclear → False."""
+    try:
+        sess = CURRENT_SESSION.get(None)
+        if sess is None:
+            return False
+        return str(getattr(sess, "transport", "")) == "internal" and \
+            str(getattr(sess, "conversation_id", "")).startswith("internal:subagent-")
+    except Exception:
+        return False
+
+
+def _redaction_exempt() -> bool:
+    """Whether tool output for the CURRENT caller may carry real absolute
+    paths. The owner is exempt (their own diagnostics). A spawn_subagents
+    worker is ALSO exempt even though its session is non-owner: it only ever
+    runs on owner-privileged turns, nothing it sees reaches a human directly
+    (its final text goes back to the orchestrator, which is itself
+    owner-gated), and a worker that edits files must be able to report —
+    and re-open — the real paths it touched. Every other non-owner session
+    keeps full redaction."""
+    return _caller_is_owner_safe() or _caller_is_subagent_worker()
+
+
 def build_model_feedback(name: str, result: ToolResult) -> str:
     """The string the model sees as the tool's output on the next turn.
 
@@ -515,9 +560,11 @@ def build_model_feedback(name: str, result: ToolResult) -> str:
     model_feedback / text / error string (including the generic exception
     wrapper in _invoke_tool) from leaking the operator's home dir or layout to
     a non-owner user. The owner is exempt so their own diagnostic tools
-    (run_command, etc.) still surface real paths."""
+    (run_command, etc.) still surface real paths; so is a spawn_subagents
+    worker session (see _redaction_exempt) so it can act on and report real
+    paths back to its owner-gated orchestrator."""
     raw = _build_model_feedback_raw(name, result)
-    if _caller_is_owner_safe():
+    if _redaction_exempt():
         return raw
     return redact_paths(raw)
 

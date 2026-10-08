@@ -255,9 +255,20 @@ def render_summary_for_command(tool_name: Optional[str] = None) -> str:
 # ---------------------------------------------------------------------------
 
 # Tools a worker can NEVER be granted, whatever `allowed_tools` says. Workers
-# are ephemeral, unattended and non-owner: nothing that mutates state outside
-# its own context, reaches a human/agent, re-enters the agent loop, or spawns
-# further work is allowed. Enforced in code at call time (never by prompt).
+# are ephemeral, unattended and non-owner: nothing that reaches a human/agent,
+# re-enters the agent loop, spawns further work, runs a SANDBOXED shell, or
+# destroys / rolls back files is allowed. Three write-side tools are NOT in
+# this set and are gated at call time instead (compute_grants in
+# tools/subagent.py):
+#   * write_file / edit_file — opt-in via `allowed_tools`, granted only when
+#     `write_paths` is non-empty, and confined to that scope by
+#     Session.write_scope (files.py denies every write when it is empty);
+#   * run_command — the HOST shell (runs as the bot's system user, unsandboxed,
+#     120s cap): opt-in via `allowed_tools`, granted only when `allow_shell`
+#     is true AND `write_paths` is non-empty. The tool's own admin gate still
+#     applies on top: with config `run_command_admin_only: true` a non-admin
+#     worker session is refused by run_command itself.
+# Enforced in code at call time (never by prompt).
 SUBAGENT_DENIED_TOOLS: frozenset[str] = frozenset({
     # recursion / control plane
     "spawn_subagents", "restart_gateway", "restart_flask_app", "claude_code",
@@ -267,9 +278,11 @@ SUBAGENT_DENIED_TOOLS: frozenset[str] = frozenset({
     "delete_message", "discord_post", "discord_manage", "flip_send", "flip_voice",
     # cron
     "add_cron_job", "cancel_cron_job", "list_cron_jobs",
-    # shell + file writes (host and sandbox)
-    "run_command", "run_command_sandbox", "write_file", "write_file_sandbox",
-    "edit_file", "delete_file", "restore_snapshot",
+    # sandboxed shell / sandboxed writes + destructive / rollback file ops.
+    # Plain write_file / edit_file and the host run_command are NOT here —
+    # they are conditionally granted under write_paths / allow_shell (above).
+    "run_command_sandbox", "write_file_sandbox",
+    "delete_file", "restore_snapshot",
     # memory WRITES (reads stay allowed)
     "save_memory", "update_core_memory", "delete_memory", "dream", "reindex_memory",
 })
@@ -310,9 +323,11 @@ def _validate_subagent_tools(value: Any) -> Optional[str]:
 
 
 def _validate_read_paths(value: Any) -> Optional[str]:
-    """Each comma-separated entry must be an absolute path to an existing
+    """Shared validator for spawn_subagents `read_paths` and `write_paths`.
+    Each comma-separated entry must be an absolute path to an existing
     directory (expanduser'd). Empty string is allowed (no read scope → the
-    worker falls back to its default agent-dir + temp read scope)."""
+    worker falls back to its default agent-dir + temp read scope; no write
+    scope → the worker cannot write)."""
     import os
     raw = str(value or "").strip()
     if not raw:
@@ -354,15 +369,34 @@ register("spawn_subagents", [
     SettingSchema("allowed_tools", "str", SUBAGENT_DEFAULT_TOOLS,
         "Comma-separated CEILING of tools a worker may be granted. A task's "
         "requested tools are intersected with this; the built-in deny list "
-        "(spawn/restart/messaging/cron/shell/file+memory writes) always applies.",
+        "(spawn/restart/messaging/cron/sandboxed shell/delete+restore/memory "
+        "writes) always applies. write_file/edit_file may be added here but are "
+        "only granted when `write_paths` is non-empty (and act only inside it); "
+        "run_command may be added here but is only granted when `allow_shell` "
+        "is true AND `write_paths` is non-empty.",
         validator=_validate_subagent_tools),
     SettingSchema("read_paths", "str", "",
         "Comma-separated absolute directories a worker's file tools (read_file, "
         "list_files) may read, overriding the agent's own allowed_read_paths for "
         "the ephemeral worker. Each entry must be an existing directory. Empty = "
-        "no scope (worker falls back to its agent dir + system temp). Writes are "
-        "always denied for workers regardless of this setting.",
+        "no scope (worker falls back to its agent dir + system temp). Reads only; "
+        "writes are governed by `write_paths`.",
         validator=_validate_read_paths),
+    SettingSchema("write_paths", "str", "",
+        "Comma-separated absolute directories a worker's write_file / edit_file "
+        "may write inside (those tools must also be in `allowed_tools`). Each "
+        "entry must be an existing directory. Empty = workers cannot write "
+        "anywhere. delete_file and restore_snapshot stay hard-denied for workers "
+        "regardless of this setting; the agent's denied_paths still apply.",
+        validator=_validate_read_paths),
+    SettingSchema("allow_shell", "bool", False,
+        "Let workers call run_command (if it is also in `allowed_tools`). "
+        "run_command is the HOST shell: it runs as the bot's system user, "
+        "unsandboxed, with a 120s cap, and ignores path ACLs. Only honored when "
+        "`write_paths` is non-empty — a worker with nowhere to write gets no "
+        "shell either. Config `run_command_admin_only: true` (the default) "
+        "still blocks it at the tool: workers are non-admin sessions, so set "
+        "that to false for this to take effect."),
     SettingSchema("max_parallel", "int", 4,
         "Maximum tasks in ONE spawn_subagents call (the call is rejected above this).",
         min=1, max=16),

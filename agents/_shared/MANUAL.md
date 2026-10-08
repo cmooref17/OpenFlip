@@ -911,13 +911,50 @@ problem.
   tool set = requested ∩ `allowed_tools` (owner ceiling, default read-only:
   web_search, fetch_url, read_file, list_files, search_memory, read_memory)
   minus a hard-coded deny set (spawn_subagents itself, messaging, cron,
-  writes, run_command, memory writes, restarts…). A worker's file reads are
+  sandboxed shell/writes, delete_file, restore_snapshot, memory writes,
+  restarts…). A worker's file reads are
   scoped by the owner-set `read_paths` (comma-separated absolute dirs, default
   empty): workers run on the `internal` transport, which has no block in a
   discord-only agent's `allowed_read_paths`, so WITHOUT `read_paths` a worker
   can only read its agent dir + system temp (the default read fallback). Set
   `read_paths` to the project dirs a worker needs (e.g. the repo root) and its
-  read_file / list_files see exactly those; writes stay denied regardless. Only
+  read_file / list_files see exactly those.
+  **Worker writes** are opt-in via `write_paths` (same shape as `read_paths`,
+  default empty): with it set AND write_file/edit_file in `allowed_tools`, a
+  worker can create/edit files inside exactly those dirs (Session.write_scope;
+  the agent's `denied_paths` still win). With `write_paths` empty the write
+  tools are dropped from every worker's grants, whatever `allowed_tools` says.
+  `delete_file` and `restore_snapshot` stay hard-denied for workers
+  regardless. Note that snapshots only cover framework dirs (openflip/, cron/,
+  agents/_shared/, agent identity + memory topic files): a worker edit
+  anywhere else — a project repo under `write_paths`, say — is NOT snapshotted
+  and cannot be rolled back with restore_snapshot, so use git or your own
+  backups there.
+  **Worker shell** is a second opt-in: `allow_shell` (bool, default false)
+  lets workers call `run_command` — but only when `write_paths` is also
+  non-empty (a worker with nowhere to write gets no shell) and only if
+  `run_command` is in `allowed_tools`. Caveats: run_command is the HOST shell
+  — it runs as the bot's system user, unsandboxed, ignores every path ACL
+  (read_paths/write_paths do not confine it), with a 120s per-command cap.
+  The config key `run_command_admin_only` still applies on top: workers are
+  non-admin sessions, so flipping it to `true` removes run_command from
+  workers entirely (it is `false` on this deployment). The sandboxed
+  `run_command_sandbox` / `write_file_sandbox` remain hard-denied.
+  **Editing rules for the orchestrator:** give parallel workers DISJOINT
+  files — never let two workers touch the same file. Each worker holds the
+  per-tool executor lock under its OWN session id, so parallel workers (and
+  the orchestrator) can call the same tool at once without an "Already
+  running" refusal; and write_file/edit_file serialize per real path, so two
+  edits of one file never clobber each other — but the second edit still
+  runs against the changed file (its exact-match can fail, and the result is
+  whatever order they landed in), so still assign disjoint files. Tell each
+  worker exactly which files it owns,
+  and require its summary to end with a `Files changed:` list of absolute
+  paths (the worker preamble already asks for this); re-read anything a
+  worker claims to have changed before building on it. Worker sessions are
+  exempt from tool-result path redaction (they only exist on owner-gated
+  turns and their text goes back to the orchestrator, not a human), so the
+  paths they report are real. Only
   each worker's final text returns, so prompts must be self-contained. Gated on the turn's real
   owner privilege (`owner=True`), NOT `Session.is_owner`: owner's own turns,
   owner-created cron jobs, and peer chains rooted in an owner turn can all

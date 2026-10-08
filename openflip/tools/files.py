@@ -19,9 +19,13 @@ Design notes (post-2026-05-07 catastrophe):
   * Both write_file and edit_file write atomically (tempfile + os.replace) so
     a crash mid-write leaves either the old file or the new file, never a
     half-written one.
+  * Both hold a per-file (realpath) asyncio lock across their check-and-write,
+    so concurrent callers (parallel subagent workers, a worker racing the
+    orchestrator) serialize instead of silently clobbering each other.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 
@@ -123,19 +127,23 @@ def _effective_allowed(agent, mode: str) -> list:
     in v1: deny is `denied_paths` (flat, unconditional, checked first), and not
     granting a `users`/`all_users` entry already withholds access.
     """
-    # Session read-scope override (subagent workers). A worker session carries
-    # an independent `read_scope` (make_subagent_session); when present it
-    # REPLACES the agent's transport-keyed path ACLs entirely — a worker on the
-    # "internal" transport has no path block on a discord-only agent and would
-    # otherwise resolve to []. Read returns exactly that list (empty → the
-    # downstream default-deny / read-fallback, same as an unconfigured agent);
-    # write returns [] (this scope is read-only, workers never write). Checked
-    # BEFORE the transport lookup; `denied_paths` still wins in _check_access.
+    # Session scope override (subagent workers). A worker session carries
+    # independent `read_scope` / `write_scope` lists (make_subagent_session);
+    # when EITHER is set they REPLACE the agent's transport-keyed path ACLs
+    # entirely — a worker on the "internal" transport has no path block on a
+    # discord-only agent and would otherwise resolve to []. Read returns
+    # read_scope (None/empty → the downstream default-deny / read-fallback,
+    # same as an unconfigured agent); write returns write_scope (None/empty →
+    # [] → writes denied, there is no write fallback). Checked BEFORE the
+    # transport lookup; `denied_paths` still wins in _check_access.
     from ..tool_executor import CURRENT_SESSION
     _sess = CURRENT_SESSION.get(None)
-    _scope = getattr(_sess, "read_scope", None) if _sess is not None else None
-    if _scope is not None:
-        return list(_scope) if mode == "read" else []
+    _rscope = getattr(_sess, "read_scope", None) if _sess is not None else None
+    _wscope = getattr(_sess, "write_scope", None) if _sess is not None else None
+    if _rscope is not None or _wscope is not None:
+        if mode == "read":
+            return list(_rscope or [])
+        return list(_wscope or [])
 
     raw = agent.allowed_read_paths if mode == "read" else agent.allowed_write_paths
     if not isinstance(raw, dict):
@@ -408,6 +416,27 @@ async def send_file(path: str, caption: str = "", channel_id: int = 0) -> ToolRe
     return ToolResult(model_feedback=f"Posted {os.path.basename(full)} to channel {target_channel}. URL: {url}")
 
 
+# Per-file mutation locks. write_file and edit_file are async tools awaited
+# on the event loop, so two concurrent callers (parallel spawn_subagents
+# workers, or a worker racing the orchestrator) can interleave their
+# read → check → modify → replace steps and the second writer silently
+# clobbers the first — edit_file reports success for an edit that is no
+# longer on disk. Keyed by os.path.realpath of the resolved target so two
+# spellings (or a symlink) of one file share a lock; created lazily and
+# never pruned (the set of distinct files edited per process is small).
+# asyncio.Lock (not threading) because the tools run on the loop itself.
+_path_locks: dict[str, asyncio.Lock] = {}
+
+
+def _path_lock(full_path: str) -> asyncio.Lock:
+    key = os.path.realpath(full_path)
+    lock = _path_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _path_locks[key] = lock
+    return lock
+
+
 @tool
 async def write_file(path: str, content: str) -> ToolResult:
     """Create a new file with the given content. CREATE-ONLY — refuses to overwrite an existing file.
@@ -469,17 +498,20 @@ async def write_file(path: str, content: str) -> ToolResult:
     err = _check_access(full, "write")
     if err:
         return ToolResult.fail(err)
-    if os.path.exists(full):
-        return ToolResult.fail(
-            f"File already exists: {path}. write_file is create-only. "
-            f"Use edit_file to modify it, or delete_file first if you really intend to replace it entirely."
-        )
-    try:
-        os.makedirs(os.path.dirname(full), exist_ok=True)
-        _atomic_write_bytes(full, content.encode("utf-8"))
-        return ToolResult(model_feedback=f"Written: {safe_path_display(full)}")
-    except Exception as e:
-        return ToolResult.fail(f"Failed to write: {redact_paths(str(e))}")
+    # Hold the per-file lock across exists-check + write so a concurrent
+    # write_file on the same new path cannot both pass the check.
+    async with _path_lock(full):
+        if os.path.exists(full):
+            return ToolResult.fail(
+                f"File already exists: {path}. write_file is create-only. "
+                f"Use edit_file to modify it, or delete_file first if you really intend to replace it entirely."
+            )
+        try:
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            _atomic_write_bytes(full, content.encode("utf-8"))
+            return ToolResult(model_feedback=f"Written: {safe_path_display(full)}")
+        except Exception as e:
+            return ToolResult.fail(f"Failed to write: {redact_paths(str(e))}")
 
 
 @tool
@@ -510,66 +542,70 @@ async def edit_file(path: str, old_string: str, new_string: str) -> ToolResult:
     err = _check_access(full, "write")
     if err:
         return ToolResult.fail(err)
-    if not os.path.exists(full):
-        return ToolResult.fail(
-            f"File not found: {path}. edit_file modifies existing files only — use write_file to create."
-        )
-    if os.path.isdir(full):
-        return ToolResult.fail(f"'{path}' is a directory, not a file.")
-    if old_string == new_string:
-        return ToolResult.fail("old_string and new_string are identical — nothing to change.")
-    if not old_string:
-        return ToolResult.fail("old_string cannot be empty. Provide the exact text to replace.")
+    # Hold the per-file lock for the whole read → match → replace so two
+    # concurrent edits of one file serialize instead of the second one
+    # clobbering the first (lost update reported as success).
+    async with _path_lock(full):
+        if not os.path.exists(full):
+            return ToolResult.fail(
+                f"File not found: {path}. edit_file modifies existing files only — use write_file to create."
+            )
+        if os.path.isdir(full):
+            return ToolResult.fail(f"'{path}' is a directory, not a file.")
+        if old_string == new_string:
+            return ToolResult.fail("old_string and new_string are identical — nothing to change.")
+        if not old_string:
+            return ToolResult.fail("old_string cannot be empty. Provide the exact text to replace.")
 
-    try:
-        with open(full, "rb") as f:
-            raw_bytes = f.read()
-    except Exception as e:
-        return ToolResult.fail(f"Failed to read for edit: {redact_paths(str(e))}")
+        try:
+            with open(full, "rb") as f:
+                raw_bytes = f.read()
+        except Exception as e:
+            return ToolResult.fail(f"Failed to read for edit: {redact_paths(str(e))}")
 
-    # Snapshot the current state before any destructive change, in case the
-    # edit produces a regression we need to roll back. Reuses raw_bytes we
-    # just read - no extra disk hit. Failure is non-fatal (logged inside).
-    snapshot_file(full, content_bytes=raw_bytes)
+        # Snapshot the current state before any destructive change, in case the
+        # edit produces a regression we need to roll back. Reuses raw_bytes we
+        # just read - no extra disk hit. Failure is non-fatal (logged inside).
+        snapshot_file(full, content_bytes=raw_bytes)
 
-    # Preserve the file’s line-ending convention through the edit. Detect CRLF
-    # vs LF on the source bytes, then normalize old_string and new_string to
-    # match before doing the byte-level replace. The model typically supplies
-    # \n-only strings (because read_file returns text-mode content) which would
-    # never match a CRLF file without this conversion.
-    file_has_crlf = b"\r\n" in raw_bytes
-    file_eol = b"\r\n" if file_has_crlf else b"\n"
+        # Preserve the file’s line-ending convention through the edit. Detect CRLF
+        # vs LF on the source bytes, then normalize old_string and new_string to
+        # match before doing the byte-level replace. The model typically supplies
+        # \n-only strings (because read_file returns text-mode content) which would
+        # never match a CRLF file without this conversion.
+        file_has_crlf = b"\r\n" in raw_bytes
+        file_eol = b"\r\n" if file_has_crlf else b"\n"
 
-    def _to_file_eol(s: str) -> bytes:
-        b = s.encode("utf-8")
-        # Normalize any CRLF in the supplied string back to LF first, then convert
-        # to the file’s convention. Avoids \r\r\n double-encoding when the model
-        # already supplied CRLF in the args.
-        b = b.replace(b"\r\n", b"\n").replace(b"\n", file_eol)
-        return b
+        def _to_file_eol(s: str) -> bytes:
+            b = s.encode("utf-8")
+            # Normalize any CRLF in the supplied string back to LF first, then convert
+            # to the file’s convention. Avoids \r\r\n double-encoding when the model
+            # already supplied CRLF in the args.
+            b = b.replace(b"\r\n", b"\n").replace(b"\n", file_eol)
+            return b
 
-    old_bytes = _to_file_eol(old_string)
-    new_bytes = _to_file_eol(new_string)
+        old_bytes = _to_file_eol(old_string)
+        new_bytes = _to_file_eol(new_string)
 
-    count = raw_bytes.count(old_bytes)
-    if count == 0:
-        return ToolResult.fail(
-            f"old_string not found in {path}. Read the file first to confirm the exact text "
-            f"(including whitespace and indentation)."
-        )
-    if count > 1:
-        return ToolResult.fail(
-            f"old_string matches {count} places in {path}. Add surrounding context to make it unique."
-        )
+        count = raw_bytes.count(old_bytes)
+        if count == 0:
+            return ToolResult.fail(
+                f"old_string not found in {path}. Read the file first to confirm the exact text "
+                f"(including whitespace and indentation)."
+            )
+        if count > 1:
+            return ToolResult.fail(
+                f"old_string matches {count} places in {path}. Add surrounding context to make it unique."
+            )
 
-    new_raw = raw_bytes.replace(old_bytes, new_bytes, 1)
-    try:
-        _atomic_write_bytes(full, new_raw)
-        size_delta = len(new_raw) - len(raw_bytes)
-        sign = "+" if size_delta >= 0 else ""
-        return ToolResult(model_feedback=f"Edited: {safe_path_display(full)} ({sign}{size_delta} bytes)")
-    except Exception as e:
-        return ToolResult.fail(f"Failed to write edit: {redact_paths(str(e))}")
+        new_raw = raw_bytes.replace(old_bytes, new_bytes, 1)
+        try:
+            _atomic_write_bytes(full, new_raw)
+            size_delta = len(new_raw) - len(raw_bytes)
+            sign = "+" if size_delta >= 0 else ""
+            return ToolResult(model_feedback=f"Edited: {safe_path_display(full)} ({sign}{size_delta} bytes)")
+        except Exception as e:
+            return ToolResult.fail(f"Failed to write edit: {redact_paths(str(e))}")
 
 
 @tool
