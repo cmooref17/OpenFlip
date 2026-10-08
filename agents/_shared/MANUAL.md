@@ -955,7 +955,15 @@ problem.
   worker claims to have changed before building on it. Worker sessions are
   exempt from tool-result path redaction (they only exist on owner-gated
   turns and their text goes back to the orchestrator, not a human), so the
-  paths they report are real. Only
+  paths they report are real. **Project docs:** when a task prompt names
+  an absolute path inside a configured `read_paths`/`write_paths` root, the
+  worker automatically gets every `CLAUDE.md` found walking up from that
+  path to the outermost enclosing root (outermost first, never above a
+  root, never scanning subtrees), wrapped as untrusted project-convention
+  content, inserted before the `## Task` section. Caps: 10,000 chars per
+  file (truncated with a read_file pointer), 20,000 total, 3 files. A task
+  that names no scoped path gets none. Paths containing spaces aren't
+  detected. The launch log line lists what was injected. Only
   each worker's final text returns, so prompts must be self-contained. Gated on the turn's real
   owner privilege (`owner=True`), NOT `Session.is_owner`: owner's own turns,
   owner-created cron jobs, and peer chains rooted in an owner turn can all
