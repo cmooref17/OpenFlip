@@ -2245,7 +2245,7 @@ class AgentRunner:
         except Exception:
             pass
         # Pre-turn self-edit hot-reload. Hash-based fingerprint over agent.json
-        # + all system_files (per-agent + _shared/ + CLAUDE.md). If anything
+        # + all system_files (per-agent + _shared/). If anything
         # changed since last load — whether from this agent's own tool call
         # last turn, another agent editing _shared/, or the owner editing files in
         # his editor — reload_if_changed rebuilds agent.system_message and

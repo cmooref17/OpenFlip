@@ -9,8 +9,7 @@ calls the model, and hands tool calls off to the executor.
 # busts the cached prefix.
 #
 #  ┌─ agent.system_message (assembled at agent load) ────────────────┐
-#  │   0. project CLAUDE.md        (prepended by _load_system_files)  │
-#  │   then agent.json's system_files IN LISTED ORDER — currently     │
+#  │   agent.json's system_files IN LISTED ORDER — currently          │
 #  │   SOUL.md → _shared/FRAMEWORK.md → AGENT.md → _shared/TOOLS.md   │
 #  │   → TOOLS.md for most agents (template substitution for          │
 #  │   {agent_id}/{agent_dir}/{display_name} applies to each file)    │

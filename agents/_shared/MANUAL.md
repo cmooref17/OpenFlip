@@ -54,9 +54,10 @@ agents/<id>/
 
 Auto-load decisions are driven by `system_files` in `agent.json`. Files
 not listed there don't enter the system prompt no matter what they
-contain. The project-level `~/.openflip/CLAUDE.md` is *always*
-injected first regardless of `system_files` (see `_load_system_files` in
-`openflip/agent.py`).
+contain. The project-level `~/.openflip/CLAUDE.md` is NOT auto-loaded:
+it's developer documentation that Claude Code reads from its own working
+directory and agents read on demand with `read_file`. An agent that
+should always carry it can list it in `system_files` like any other file.
 
 Files under `agents/_shared/` (the SHARED tier — identical bytes for
 every agent):
@@ -2414,14 +2415,13 @@ top of this file.
 ## Auto-reload (no restart)
 
 `Agent.reload_if_changed()` runs on every turn. Hash-based fingerprint
-over `agent.json` + every file in `system_files` + project `CLAUDE.md`.
+over `agent.json` + every file in `system_files`.
 If any byte differs, the agent reloads and the next turn picks up:
 
 - `agent.json` field changes (tools, channels, model… everything).
 - Edits to any file listed in `system_files` — `SOUL.md`, `AGENT.md`,
   personal `TOOLS.md`, `_shared/FRAMEWORK.md`, `_shared/TOOLS.md`, and
   a legacy `REMINDER.md` if an agent still lists it there.
-- Project-level `CLAUDE.md` edits (it's in the fingerprint too).
 - New files added to `system_files`.
 
 The `/reload` slash command forces it explicitly. Its report is honest

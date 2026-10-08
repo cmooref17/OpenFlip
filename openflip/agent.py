@@ -434,27 +434,10 @@ def _load_system_files(
     display_name: str = "",
 ) -> str:
     parts = []
-    # Phase 7.2 (ISSUES.md 7.2): always include the project-level CLAUDE.md
-    # from openflip root as read-only context. Provides project rules and
-    # architecture overview to every agent without per-agent configuration.
-    # Missing file is fine — silently skipped (don't force users to have one).
-    project_claude_md = os.path.join(project_root(), "CLAUDE.md")
-    try:
-        with open(project_claude_md, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-        if content:
-            parts.append(_apply_template_vars(
-                content,
-                agent_id=agent_id,
-                agent_dir=agent_dir,
-                display_name=display_name,
-            ))
-    except FileNotFoundError:
-        pass  # optional file — absence is fine
-    except OSError as e:
-        # Present but unreadable (permissions, I/O error) is NOT fine —
-        # loading without it silently changes the agent. Warn loudly.
-        _warn_unreadable_system_file(project_claude_md, e)
+    # The project-root CLAUDE.md is NOT injected here. It's developer docs for
+    # Claude Code (which reads it from its own cwd) and for agents to read on
+    # demand; auto-prepending it put ~6k tokens of framework internals into
+    # every agent's prompt. An agent that wants it can list it in system_files.
     for fname in filenames:
         fpath = _resolve_system_file(agent_dir, fname)
         try:
@@ -481,12 +464,11 @@ def _get_fingerprint(path: str, agent_dir: str, system_files: list[str]) -> str:
     byte-accurate, unlike mtime which lies on `touch` or identical-rewrite saves.
     Cost: ~1ms for the 5–10 small text files an agent loads.
 
-    Includes the project-level CLAUDE.md too (loaded by _load_system_files).
     Missing files contribute their path with empty content (so deleting a
     file changes the fingerprint).
     """
     h = hashlib.sha256()
-    files = [path, os.path.join(project_root(), "CLAUDE.md")]
+    files = [path]
     for fname in system_files:
         files.append(_resolve_system_file(agent_dir, fname))
     for fpath in files:
