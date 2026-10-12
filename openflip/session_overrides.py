@@ -53,9 +53,9 @@ _OPENAI_SESSION_EFFORT = ("minimal", "low", "medium", "high", "xhigh")
 # Which override keys each provider honors. Anything else is rejected at set
 # time with a message naming the valid keys, so a typo can't silently persist.
 PROVIDER_KEYS: dict[str, tuple[str, ...]] = {
-    "anthropic": ("model", "context_window", "compaction_trigger", "max_tokens", "effort", "memory"),
-    "openai": ("model", "context_window", "max_tokens", "effort", "memory"),
-    "ollama": ("model", "context_window", "options", "memory"),
+    "anthropic": ("model", "context_window", "compaction_trigger", "max_tokens", "effort", "memory", "activity_status"),
+    "openai": ("model", "context_window", "max_tokens", "effort", "memory", "activity_status"),
+    "ollama": ("model", "context_window", "options", "memory", "activity_status"),
 }
 
 # Meta sidecar key. Legacy `effort_override` (pre-overrides layout) is still
@@ -211,6 +211,12 @@ def normalize_override(provider: str, key: str, raw: Any) -> tuple[Any, str]:
             return None, "memory must be on/off (true/false)"
         return b, ""
 
+    if key == "activity_status":
+        b = _coerce_bool(raw)
+        if b is None:
+            return None, "activity_status must be on/off (true/false)"
+        return b, ""
+
     if key == "options":
         opts = _coerce_options(raw)
         if not opts:
@@ -221,7 +227,7 @@ def normalize_override(provider: str, key: str, raw: Any) -> tuple[Any, str]:
 
 
 def format_override_value(key: str, value: Any) -> str:
-    if key == "memory":
+    if key in ("memory", "activity_status"):
         return "on" if value else "off"
     if key == "options":
         return " ".join(f"{k}={json.dumps(v)}" for k, v in value.items())
@@ -287,6 +293,16 @@ class SessionOverridesMixin:
         if isinstance(ov, bool):
             return ov
         return bool(getattr(self.agent, "memory_enabled", True))
+
+    def effective_activity_status_enabled(self) -> bool:
+        """Session override → agent (agent.json) → global (config.json) →
+        False. Delegates the whole cascade to get_activity_status_enabled so
+        the bool coercion lives in one place."""
+        from .config_global import get_activity_status_enabled
+        return get_activity_status_enabled(
+            agent_value=getattr(self.agent, "activity_status_enabled", None),
+            session_value=self.overrides.get("activity_status"),
+        )
 
     # `effort_override` compatibility surface — /effort (slash + text) and the
     # legacy meta key all speak this attribute. Backed by overrides["effort"].
@@ -426,6 +442,14 @@ class SessionOverridesMixin:
             rows.append(("options", format_override_value("options", opts) if opts else "(agent.json only)", "session" if opts else "agent.json"))
 
         rows.append(("memory", "on" if self.effective_memory_enabled() else "off", "session" if "memory" in self.overrides else "agent.json"))
+
+        if "activity_status" in self.overrides:
+            act_src = "session"
+        elif getattr(self.agent, "activity_status_enabled", None) is not None:
+            act_src = "agent.json"
+        else:
+            act_src = "config.json"
+        rows.append(("activity_status", "on" if self.effective_activity_status_enabled() else "off", act_src))
         return rows
 
 

@@ -543,6 +543,7 @@ nested object. `respond_to_bots`, `memory_enabled`, etc. are top-level.
 | `tool_response_mode` | string | `"media_only"` | `"media_only"` suppresses text on attachment turns; any other value disables that. |
 | `respond_to_bots` | bool | `false` | Top-level. `true` lets the agent reply to other bots. |
 | `memory_enabled` | bool | `true` | Auto-injects the memory tools regardless of `allowed_tools`. |
+| `activity_status_enabled` | bool | unset (→ inherits global → `false`) | Optional per-agent override for the background `⚙️ working` activity line. Unset = inherit the global config.json `activity_status_enabled`; a session `/session set activity_status` beats it. |
 | `channels.respond_in` | string | `"mentions_only"` | `"all"` \| `"mentions_only"` \| `"channels_only"`. DMs bypass this. |
 | `channels.ignore_channel_ids` | list[int] | `[]` | Hard ignore; beats `always_respond_channel_ids`. |
 | `channels.always_respond_channel_ids` | list[int] | `[]` | Always answer here regardless of `respond_in`. |
@@ -603,7 +604,13 @@ gateway restart). Beyond `integrations.*`, `models.*`, and
   Off by default because on SHORT background turns it just spams the
   operator's channel (a burst of restart-retry jobs each ending in `end_chain`
   posted six `⚙️ working: end_chain` messages, 2026-10-10). Normal
-  replies to a human are never affected either way. Absent/malformed → `false`.
+  replies to a human are never affected either way.
+  **Three-tier override cascade** (highest wins), mirroring the model/effort
+  config: session override (`/session set activity_status on|off`) → agent
+  (agent.json top-level `activity_status_enabled`) → this global key → default
+  `false`. Each tier applies only if explicitly set; missing at a tier falls
+  through to the next, so this global value is the floor whenever no agent or
+  session has overridden it. Absent/malformed at the global tier → `false`.
 - `insecure_tls_hosts` — list of hostnames (case-insensitive) exempted
   from `fetch_url`'s TLS certificate verification. For non-internal hosts
   with self-signed/broken certs the operator explicitly trusts.
@@ -1493,8 +1500,8 @@ time; a token <32 chars is ignored.
 per-conversation settings applied to the token's `external:<session>`
 conversation on every request — the same keys and validation as `/session set`
 (`model`, `context_window`, `compaction_trigger`, `max_tokens`, `effort`,
-`memory`, and `options` for ollama agents; see "`/session` — per-conversation
-overrides"). Invalid entries are logged and skipped, valid ones are stored in
+`memory`, `activity_status`, and `options` for ollama agents; see "`/session` —
+per-conversation overrides"). Invalid entries are logged and skipped, valid ones are stored in
 the conversation's `.meta.json`, so `/session show` on that conversation
 agrees with the token file and an edit to the token takes effect on the next
 request (removing a key from the token does NOT unset an already-persisted
@@ -3058,13 +3065,15 @@ setting (highest wins):
    model, so a session pinned to a different model automatically gets that
    model's window / trigger / cap / effort (and, on Anthropic, its `-1m`
    header only if the effective model name carries the suffix);
-4. **agent.json** — `model`, `ollama_options`, `memory_enabled`;
-5. provider default.
+4. **agent.json** — `model`, `ollama_options`, `memory_enabled`,
+   `activity_status_enabled`;
+5. provider default (and, for `activity_status`, the global config.json
+   `activity_status_enabled` key then `false`).
 
 Keys by provider: anthropic `model`, `context_window`, `compaction_trigger`,
-`max_tokens`, `effort`, `memory`; openai `model`, `context_window`,
-`max_tokens`, `effort`, `memory`; ollama `model`, `context_window`,
-`options`, `memory`.
+`max_tokens`, `effort`, `memory`, `activity_status`; openai `model`,
+`context_window`, `max_tokens`, `effort`, `memory`, `activity_status`; ollama
+`model`, `context_window`, `options`, `memory`, `activity_status`.
 
 - `/session` (or `/session show`) — every setting with its effective value
   and which layer it came from.
@@ -3083,6 +3092,9 @@ Keys by provider: anthropic `model`, `context_window`, `compaction_trigger`,
   dispatch for that conversation, regardless of `memory_enabled` or ACL
   entries naming them; `memory on` works the other way on an agent whose
   `memory_enabled` is false.
+- `activity_status on|off` overrides the background activity-status line for
+  THIS conversation, beating the agent.json and global `activity_status_enabled`
+  values (same cascade as above; see "Global service keys").
 
 Changes take effect on the next real turn (no synthetic turn fired). Owner-only
 on every transport: the Discord slash `/session action key value` and the

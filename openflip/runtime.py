@@ -3228,7 +3228,14 @@ class AgentRunner:
                     # Best-effort: a send failure here is cosmetic and must
                     # never tear the turn.
                     from .config_global import get_activity_status_enabled
-                    if (get_activity_status_enabled()
+                    _act_session_ov = None
+                    try:
+                        _act_session_ov = conv.overrides.get("activity_status")
+                    except Exception:
+                        _act_session_ov = None
+                    if (get_activity_status_enabled(
+                                agent_value=getattr(agent, "activity_status_enabled", None),
+                                session_value=_act_session_ov)
                             and originator_visibility in ("cron", "kairos")
                             and turn_count >= 3 and new_calls):
                         import time as _act_time

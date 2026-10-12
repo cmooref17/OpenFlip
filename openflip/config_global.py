@@ -400,22 +400,43 @@ def get_run_command_admin_only() -> bool:
     return True
 
 
-def get_activity_status_enabled() -> bool:
-    """Whether background (cron/kairos) turns post a '⚙️ working (round N): <tools>'
-    activity line to the channel past round 2. Top-level config key
-    `activity_status_enabled` (bool). DEFAULTS TO FALSE — off unless a deployment
-    explicitly opts in. Why: the line is meant to show a long overnight job is
-    alive, but on short background turns it just spams the operator's channel
-    (e.g. a run of restart retries each ending in end_chain posted six '⚙️
-    working: end_chain' messages, 2026-10-10). Absent/malformed → False.
+def _coerce_activity_status_bool(val) -> bool:
+    """Coerce a raw activity_status value to a definite bool. bool passthrough;
+    string "true"/"1"/"yes"/"on" → True, "false"/"0"/"no"/"off" (or anything
+    unclear) → False. The SINGLE source of the string-parsing logic — every
+    tier of get_activity_status_enabled's cascade coerces through here. None is
+    NOT handled here: the cascade guards on `is not None` so an unset tier falls
+    through instead of coercing to False.
     """
-    cfg = get_config()
-    val = cfg.get("activity_status_enabled", False)
     if isinstance(val, bool):
         return val
     if isinstance(val, str):
         return val.strip().lower() in ("true", "1", "yes", "on")
     return False
+
+
+def get_activity_status_enabled(agent_value=None, session_value=None) -> bool:
+    """Whether background (cron/kairos) turns post a '⚙️ working (round N): <tools>'
+    activity line to the channel past round 2.
+
+    Three-tier override cascade (highest wins), mirroring the model/effort
+    config cascade: session override → agent (agent.json) → global (config.json
+    `activity_status_enabled`) → default False. Each tier applies ONLY if
+    explicitly set; a None means "not set at this tier" and falls through to the
+    next. DEFAULTS TO FALSE — off unless a tier explicitly opts in. Why off:
+    the line is meant to show a long overnight job is alive, but on short
+    background turns it just spams the operator's channel (e.g. a run of restart
+    retries each ending in end_chain posted six '⚙️ working: end_chain'
+    messages, 2026-10-10). Absent/malformed at the global tier → False.
+
+    Called with no args, it returns the plain global value (back-compat for any
+    other caller).
+    """
+    if session_value is not None:
+        return _coerce_activity_status_bool(session_value)
+    if agent_value is not None:
+        return _coerce_activity_status_bool(agent_value)
+    return _coerce_activity_status_bool(get_config().get("activity_status_enabled", False))
 
 
 def get_max_tool_turns() -> int:

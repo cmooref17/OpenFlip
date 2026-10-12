@@ -532,6 +532,12 @@ class Agent:
     ignore_categories: set[int]
     respond_to_bots: bool
     memory_enabled: bool = True
+    # Optional per-agent override for the background activity-status line.
+    # None = not set in agent.json (inherit the global config.json value);
+    # True/False = agent-level opt-in/out. Defaults to None (NOT False) so
+    # "absent" stays distinguishable from "set to false" — resolved via
+    # config_global.get_activity_status_enabled's cascade.
+    activity_status_enabled: bool | None = None
     # Memory-consolidation ("dream") config. OFF by default. Keys:
     # enabled (gates AUTO-fire only), min_idle_minutes, max_memory_chars.
     # Parsed via _parse_dream so a missing block is fully backward-compatible.
@@ -670,6 +676,9 @@ class Agent:
             ignore_categories=_int_set(channels.get("ignore_categories")),
             respond_to_bots=bool(data.get("respond_to_bots", False)),
             memory_enabled=bool(data.get("memory_enabled", True)),
+            # Raw passthrough (NOT bool()) so absent stays None — distinct from
+            # an explicit false. Coercion lives in get_activity_status_enabled.
+            activity_status_enabled=data.get("activity_status_enabled", None),
             dream=_parse_dream(data.get("dream")),
             proactive=_parse_proactive(data.get("proactive")),
             trigger=_parse_trigger(data.get("trigger")),
@@ -759,6 +768,11 @@ class Agent:
         }
         if self.think is not None:
             data["think"] = self.think
+        # Optional activity-status override — only serialized when explicitly
+        # set (None = inherit global), so agents that never touched it keep
+        # their agent.json byte-identical on disk.
+        if self.activity_status_enabled is not None:
+            data["activity_status_enabled"] = self.activity_status_enabled
         # Only serialize the dream block when it differs from the OFF-by-default
         # baseline, so agents that never opted in keep their agent.json
         # byte-identical on disk.
