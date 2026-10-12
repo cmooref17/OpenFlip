@@ -439,6 +439,105 @@ def get_activity_status_enabled(agent_value=None, session_value=None) -> bool:
     return _coerce_activity_status_bool(get_config().get("activity_status_enabled", False))
 
 
+# ── error_display / error_message: what a USER sees when a turn fails ──
+#
+# Three-tier override cascade (highest wins), mirroring activity_status above:
+# session override → agent (agent.json) → global (config.json) → default.
+# Both default to today's byte-for-byte behavior when unset everywhere
+# (error_display="raw" shows the real provider/framework error text).
+
+_VALID_ERROR_DISPLAY = ("raw", "silent", "message")
+DEFAULT_ERROR_MESSAGE = "Sorry, something went wrong. Please try again in a bit."
+
+# One-time warning dedupe for malformed error_display at the agent/global tier
+# (so a bad config value logs ONCE, not every failed turn).
+_warned_error_display: set[str] = set()
+
+
+def _coerce_error_display(val):
+    """Normalize a raw error_display value to one of raw/silent/message, or
+    None if it isn't a recognized mode. The SINGLE source of the validation —
+    every tier of get_error_display's cascade coerces through here. None/unknown
+    returns None so the caller can fall through to the next tier (or default).
+    """
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v in _VALID_ERROR_DISPLAY:
+            return v
+    return None
+
+
+def _warn_error_display_once(tier: str, val) -> None:
+    """Log ONCE per (tier,value) that a configured error_display is invalid and
+    is being ignored. Never crashes the caller."""
+    key = f"{tier}:{val!r}"
+    if key in _warned_error_display:
+        return
+    _warned_error_display.add(key)
+    try:
+        print_ts(
+            f"[config] ignoring invalid error_display at {tier} tier: {val!r} "
+            f"(valid: {', '.join(_VALID_ERROR_DISPLAY)}); falling through"
+        )
+    except Exception:
+        pass
+
+
+def get_error_display(agent_value=None, session_value=None) -> str:
+    """What a USER sees when a turn fails with a framework/provider error.
+
+    Three-tier override cascade (highest wins), same None-falls-through
+    semantics as get_activity_status_enabled: session override → agent
+    (agent.json `error_display`) → global (config.json `error_display`) →
+    default "raw". Each tier applies ONLY if explicitly set to a VALID mode;
+    an unset tier (None) or an invalid value falls through to the next.
+
+    Modes:
+      - "raw"     — show the real error text (today's behavior; the default).
+      - "silent"  — show nothing to the user (error still logged).
+      - "message" — show the fixed get_error_message() line instead.
+
+    Session values are validated at set time (normalize_override), so a bad one
+    can't persist there; a malformed agent/global value is ignored with a
+    one-time warning and never crashes. Called with no args → the plain global
+    value (back-compat).
+    """
+    if session_value is not None:
+        coerced = _coerce_error_display(session_value)
+        if coerced is not None:
+            return coerced
+    if agent_value is not None:
+        coerced = _coerce_error_display(agent_value)
+        if coerced is not None:
+            return coerced
+        _warn_error_display_once("agent", agent_value)
+    raw = get_config().get("error_display", "raw")
+    coerced = _coerce_error_display(raw)
+    if coerced is not None:
+        return coerced
+    _warn_error_display_once("global", raw)
+    return "raw"
+
+
+def get_error_message(agent_value=None, session_value=None) -> str:
+    """The fixed line shown to a USER when error_display resolves to "message".
+
+    Same cascade as get_error_display: session → agent (agent.json
+    `error_message`) → global (config.json `error_message`) → DEFAULT_ERROR_MESSAGE.
+    An empty string at a tier counts as NOT set and falls through (so clearing
+    the key restores the next tier / the default). Called with no args → the
+    plain global value (back-compat).
+    """
+    if session_value is not None and str(session_value).strip():
+        return str(session_value)
+    if agent_value is not None and str(agent_value).strip():
+        return str(agent_value)
+    raw = get_config().get("error_message", "")
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    return DEFAULT_ERROR_MESSAGE
+
+
 def get_max_tool_turns() -> int:
     """Hard cap on model rounds (tool batches) in ONE turn. Top-level config key
     `max_tool_turns` (int, >= 10). Default 300: long agentic jobs (builds, batch

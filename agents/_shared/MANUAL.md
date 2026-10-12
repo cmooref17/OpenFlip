@@ -544,6 +544,8 @@ nested object. `respond_to_bots`, `memory_enabled`, etc. are top-level.
 | `respond_to_bots` | bool | `false` | Top-level. `true` lets the agent reply to other bots. |
 | `memory_enabled` | bool | `true` | Auto-injects the memory tools regardless of `allowed_tools`. |
 | `activity_status_enabled` | bool | unset (→ inherits global → `false`) | Optional per-agent override for the background `⚙️ working` activity line. Unset = inherit the global config.json `activity_status_enabled`; a session `/session set activity_status` beats it. |
+| `error_display` | string | unset (→ inherits global → `"raw"`) | Optional per-agent override for what a USER sees when a turn fails with a framework/provider error. `"raw"` \| `"silent"` \| `"message"`. Unset/invalid = inherit the global config.json `error_display`; a session `/session set error_display` beats it. |
+| `error_message` | string | unset (→ inherits global → built-in) | Optional per-agent override for the fixed line shown when `error_display` is `"message"`. Empty/unset = inherit global then the built-in default; a session `/session set error_message` beats it. |
 | `channels.respond_in` | string | `"mentions_only"` | `"all"` \| `"mentions_only"` \| `"channels_only"`. DMs bypass this. |
 | `channels.ignore_channel_ids` | list[int] | `[]` | Hard ignore; beats `always_respond_channel_ids`. |
 | `channels.always_respond_channel_ids` | list[int] | `[]` | Always answer here regardless of `respond_in`. |
@@ -611,6 +613,29 @@ gateway restart). Beyond `integrations.*`, `models.*`, and
   `false`. Each tier applies only if explicitly set; missing at a tier falls
   through to the next, so this global value is the floor whenever no agent or
   session has overridden it. Absent/malformed at the global tier → `false`.
+- `error_display` — string, one of `"raw"` / `"silent"` / `"message"`,
+  **defaults to `"raw"`**. Controls what a USER sees when a turn fails with a
+  framework/provider error (rate-limit-after-retries, auth, transport,
+  bad_request, provider anomaly, empty-response notices). `"raw"` shows the
+  real error text (unchanged legacy behavior); `"silent"` shows the user
+  nothing; `"message"` shows the fixed `error_message` line instead. In every
+  mode the real error is still written to `log.txt` (unchanged), plus a
+  one-line `error hidden from user (error_display=…)` note when a mode hid it,
+  so an operator can always find the cause. Applies only to the two
+  user-facing error posts; the `⚙️ working` activity line and tool-result
+  posts are unaffected. **Three-tier override cascade** (highest wins),
+  mirroring `activity_status_enabled`: session override (`/session set
+  error_display raw|silent|message`) → agent (agent.json `error_display`) →
+  this global key → default `"raw"`. Each tier applies only if set to a VALID
+  mode; an invalid value at the session tier is rejected with a message, and
+  an invalid value at the agent/global tier is ignored (one-time warning
+  logged) and falls through to the next tier — never a crash.
+- `error_message` — string, the fixed line shown to the user when
+  `error_display` resolves to `"message"`. Same three-tier cascade (session
+  `/session set error_message <text>` → agent (agent.json `error_message`) →
+  this global key → built-in default `"Sorry, something went wrong. Please try
+  again in a bit."`). An empty string at a tier counts as NOT set and falls
+  through to the next tier.
 - `insecure_tls_hosts` — list of hostnames (case-insensitive) exempted
   from `fetch_url`'s TLS certificate verification. For non-internal hosts
   with self-signed/broken certs the operator explicitly trusts.
@@ -1500,8 +1525,8 @@ time; a token <32 chars is ignored.
 per-conversation settings applied to the token's `external:<session>`
 conversation on every request — the same keys and validation as `/session set`
 (`model`, `context_window`, `compaction_trigger`, `max_tokens`, `effort`,
-`memory`, `activity_status`, and `options` for ollama agents; see "`/session` —
-per-conversation overrides"). Invalid entries are logged and skipped, valid ones are stored in
+`memory`, `activity_status`, `error_display`, `error_message`, and `options`
+for ollama agents; see "`/session` — per-conversation overrides"). Invalid entries are logged and skipped, valid ones are stored in
 the conversation's `.meta.json`, so `/session show` on that conversation
 agrees with the token file and an edit to the token takes effect on the next
 request (removing a key from the token does NOT unset an already-persisted
@@ -3066,14 +3091,18 @@ setting (highest wins):
    model's window / trigger / cap / effort (and, on Anthropic, its `-1m`
    header only if the effective model name carries the suffix);
 4. **agent.json** — `model`, `ollama_options`, `memory_enabled`,
-   `activity_status_enabled`;
+   `activity_status_enabled`, `error_display`, `error_message`;
 5. provider default (and, for `activity_status`, the global config.json
-   `activity_status_enabled` key then `false`).
+   `activity_status_enabled` key then `false`; for `error_display` /
+   `error_message`, the global config.json keys then `"raw"` / the built-in
+   default line).
 
 Keys by provider: anthropic `model`, `context_window`, `compaction_trigger`,
-`max_tokens`, `effort`, `memory`, `activity_status`; openai `model`,
-`context_window`, `max_tokens`, `effort`, `memory`, `activity_status`; ollama
-`model`, `context_window`, `options`, `memory`, `activity_status`.
+`max_tokens`, `effort`, `memory`, `activity_status`, `error_display`,
+`error_message`; openai `model`, `context_window`, `max_tokens`, `effort`,
+`memory`, `activity_status`, `error_display`, `error_message`; ollama `model`,
+`context_window`, `options`, `memory`, `activity_status`, `error_display`,
+`error_message`.
 
 - `/session` (or `/session show`) — every setting with its effective value
   and which layer it came from.
@@ -3095,6 +3124,14 @@ Keys by provider: anthropic `model`, `context_window`, `compaction_trigger`,
 - `activity_status on|off` overrides the background activity-status line for
   THIS conversation, beating the agent.json and global `activity_status_enabled`
   values (same cascade as above; see "Global service keys").
+- `error_display raw|silent|message` overrides what a USER sees when a turn
+  fails with a framework/provider error for THIS conversation, beating the
+  agent.json and global `error_display` values (same cascade; see "Global
+  service keys"). An invalid value is rejected here with a message. The real
+  error is always logged regardless of mode.
+- `error_message <text>` overrides the fixed line shown when `error_display`
+  resolves to `message` for THIS conversation (empty text falls through to the
+  agent.json / global / built-in default).
 
 Changes take effect on the next real turn (no synthetic turn fired). Owner-only
 on every transport: the Discord slash `/session action key value` and the

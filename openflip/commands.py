@@ -186,7 +186,7 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
             choices=["show", "set", "unset", "clear"], default="show", required=False,
             description="show (default) · set <key> <value> · unset <key> · clear (all)"),
         key: str = nextcord.SlashOption(
-            choices=["model", "context_window", "compaction_trigger", "max_tokens", "effort", "memory", "activity_status", "options"],
+            choices=["model", "context_window", "compaction_trigger", "max_tokens", "effort", "memory", "activity_status", "error_display", "error_message", "options"],
             default="", required=False,
             description="Setting to change (which keys apply depends on the provider — see show)"),
         value: str = nextcord.SlashOption(

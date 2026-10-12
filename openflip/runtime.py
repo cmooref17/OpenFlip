@@ -2899,13 +2899,50 @@ class AgentRunner:
                         if auto_post_final_text and not silent:
                             _err_text = (getattr(ai_message, "content_text", None) or
                                          getattr(ai_message, "content", "") or "")
+                            # What the USER sees for this framework error —
+                            # raw/silent/message — from the session→agent→global
+                            # cascade. Defensive: any failure falls back to the
+                            # unchanged "raw" behavior. The real error is still
+                            # logged below (print_ts) in every mode.
                             try:
-                                for chunk in _split_for_discord(_err_text):
-                                    await _safe_channel_send(channel, chunk)
-                                # The error WAS shown to the operator — mark the
-                                # turn as having produced visible output so the
-                                # terminal contract doesn't double-post it below.
-                                _posted_assistant_text = True
+                                _err_display = conv.effective_error_display()
+                            except Exception:
+                                _err_display = "raw"
+                            try:
+                                if _err_display == "silent":
+                                    # Show nothing. Still mark output as posted
+                                    # so the terminal contract doesn't post its
+                                    # own warning on top.
+                                    _posted_assistant_text = True
+                                    print_ts(
+                                        f"{COLOR_YELLOW}  error hidden from user "
+                                        f"(error_display=silent){COLOR_END}",
+                                        agent=agent.id,
+                                    )
+                                elif _err_display == "message":
+                                    try:
+                                        _disp_msg = conv.effective_error_message()
+                                    except Exception:
+                                        _disp_msg = ""
+                                    if not _disp_msg:
+                                        from .config_global import DEFAULT_ERROR_MESSAGE
+                                        _disp_msg = DEFAULT_ERROR_MESSAGE
+                                    await _safe_channel_send(channel, _disp_msg)
+                                    _posted_assistant_text = True
+                                    print_ts(
+                                        f"{COLOR_YELLOW}  error hidden from user "
+                                        f"(error_display=message){COLOR_END}",
+                                        agent=agent.id,
+                                    )
+                                else:
+                                    # raw — unchanged.
+                                    for chunk in _split_for_discord(_err_text):
+                                        await _safe_channel_send(channel, chunk)
+                                    # The error WAS shown to the operator — mark
+                                    # the turn as having produced visible output
+                                    # so the terminal contract doesn't double-post
+                                    # it below.
+                                    _posted_assistant_text = True
                             except Exception:
                                 pass
                         # Pop the triggering user message ONLY for structural
@@ -4349,8 +4386,40 @@ class AgentRunner:
                         f"operator-visible output ({_log_reason}){COLOR_END}",
                         agent=agent.id, error=True,
                     )
+                    # What the USER sees for this terminal-contract failure —
+                    # raw/silent/message — from the session→agent→global
+                    # cascade. Defensive fallback to "raw" (unchanged). The
+                    # real reason is already logged above in every mode.
                     try:
-                        await _safe_channel_send(channel, _user_msg)
+                        _err_display = conv.effective_error_display()
+                    except Exception:
+                        _err_display = "raw"
+                    try:
+                        if _err_display == "silent":
+                            # Skip the send entirely.
+                            print_ts(
+                                f"{COLOR_YELLOW}  error hidden from user "
+                                f"(error_display=silent){COLOR_END}",
+                                agent=agent.id,
+                            )
+                        else:
+                            if _err_display == "message":
+                                try:
+                                    _term_msg = conv.effective_error_message()
+                                except Exception:
+                                    _term_msg = ""
+                                if not _term_msg:
+                                    from .config_global import DEFAULT_ERROR_MESSAGE
+                                    _term_msg = DEFAULT_ERROR_MESSAGE
+                                print_ts(
+                                    f"{COLOR_YELLOW}  error hidden from user "
+                                    f"(error_display=message){COLOR_END}",
+                                    agent=agent.id,
+                                )
+                            else:
+                                # raw — unchanged.
+                                _term_msg = _user_msg
+                            await _safe_channel_send(channel, _term_msg)
                     except Exception:
                         pass
         except Exception as _term_err:

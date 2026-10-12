@@ -37,7 +37,9 @@ from .config_global import (
     get_model_context_window,
     _MAX_TOKENS_CEILING,
     _VALID_EFFORT_LEVELS,
+    _VALID_ERROR_DISPLAY,
     _VALID_OPENAI_EFFORT_LEVELS,
+    _coerce_error_display,
 )
 
 # Anthropic's server-side compaction floor; matches get_compaction_trigger.
@@ -53,9 +55,9 @@ _OPENAI_SESSION_EFFORT = ("minimal", "low", "medium", "high", "xhigh")
 # Which override keys each provider honors. Anything else is rejected at set
 # time with a message naming the valid keys, so a typo can't silently persist.
 PROVIDER_KEYS: dict[str, tuple[str, ...]] = {
-    "anthropic": ("model", "context_window", "compaction_trigger", "max_tokens", "effort", "memory", "activity_status"),
-    "openai": ("model", "context_window", "max_tokens", "effort", "memory", "activity_status"),
-    "ollama": ("model", "context_window", "options", "memory", "activity_status"),
+    "anthropic": ("model", "context_window", "compaction_trigger", "max_tokens", "effort", "memory", "activity_status", "error_display", "error_message"),
+    "openai": ("model", "context_window", "max_tokens", "effort", "memory", "activity_status", "error_display", "error_message"),
+    "ollama": ("model", "context_window", "options", "memory", "activity_status", "error_display", "error_message"),
 }
 
 # Meta sidecar key. Legacy `effort_override` (pre-overrides layout) is still
@@ -217,6 +219,21 @@ def normalize_override(provider: str, key: str, raw: Any) -> tuple[Any, str]:
             return None, "activity_status must be on/off (true/false)"
         return b, ""
 
+    if key == "error_display":
+        if not isinstance(raw, str):
+            return None, "error_display must be one of: raw, silent, message"
+        mode = raw.strip().lower()
+        if mode not in _VALID_ERROR_DISPLAY:
+            return None, f"error_display must be one of: {', '.join(_VALID_ERROR_DISPLAY)}"
+        return mode, ""
+
+    if key == "error_message":
+        # Any text is valid; empty string means "unset at the session tier"
+        # (falls through to agent/global/default in get_error_message).
+        if not isinstance(raw, str):
+            return None, "error_message must be text"
+        return raw, ""
+
     if key == "options":
         opts = _coerce_options(raw)
         if not opts:
@@ -302,6 +319,25 @@ class SessionOverridesMixin:
         return get_activity_status_enabled(
             agent_value=getattr(self.agent, "activity_status_enabled", None),
             session_value=self.overrides.get("activity_status"),
+        )
+
+    def effective_error_display(self) -> str:
+        """Session override → agent (agent.json) → global (config.json) → "raw".
+        Delegates the whole cascade to get_error_display so the validation lives
+        in one place."""
+        from .config_global import get_error_display
+        return get_error_display(
+            agent_value=getattr(self.agent, "error_display", None),
+            session_value=self.overrides.get("error_display"),
+        )
+
+    def effective_error_message(self) -> str:
+        """Session override → agent (agent.json) → global (config.json) →
+        DEFAULT_ERROR_MESSAGE. Delegates the whole cascade to get_error_message."""
+        from .config_global import get_error_message
+        return get_error_message(
+            agent_value=getattr(self.agent, "error_message", None),
+            session_value=self.overrides.get("error_message"),
         )
 
     # `effort_override` compatibility surface — /effort (slash + text) and the
@@ -450,6 +486,27 @@ class SessionOverridesMixin:
         else:
             act_src = "config.json"
         rows.append(("activity_status", "on" if self.effective_activity_status_enabled() else "off", act_src))
+
+        # error_display / error_message — same session → agent.json → config.json
+        # cascade. A tier counts as the source only when it's set to an
+        # effective value (invalid/empty falls through, matching the resolvers).
+        if _coerce_error_display(self.overrides.get("error_display")) is not None:
+            ed_src = "session"
+        elif _coerce_error_display(getattr(self.agent, "error_display", None)) is not None:
+            ed_src = "agent.json"
+        else:
+            ed_src = "config.json"
+        rows.append(("error_display", self.effective_error_display(), ed_src))
+
+        _sess_msg = self.overrides.get("error_message")
+        _agent_msg = getattr(self.agent, "error_message", None)
+        if isinstance(_sess_msg, str) and _sess_msg.strip():
+            em_src = "session"
+        elif isinstance(_agent_msg, str) and _agent_msg.strip():
+            em_src = "agent.json"
+        else:
+            em_src = "config.json"
+        rows.append(("error_message", self.effective_error_message(), em_src))
         return rows
 
 
