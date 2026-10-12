@@ -400,6 +400,24 @@ def get_run_command_admin_only() -> bool:
     return True
 
 
+def get_activity_status_enabled() -> bool:
+    """Whether background (cron/kairos) turns post a '⚙️ working (round N): <tools>'
+    activity line to the channel past round 2. Top-level config key
+    `activity_status_enabled` (bool). DEFAULTS TO FALSE — off unless a deployment
+    explicitly opts in. Why: the line is meant to show a long overnight job is
+    alive, but on short background turns it just spams the operator's channel
+    (e.g. a run of restart retries each ending in end_chain posted six '⚙️
+    working: end_chain' messages, 2026-10-10). Absent/malformed → False.
+    """
+    cfg = get_config()
+    val = cfg.get("activity_status_enabled", False)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes", "on")
+    return False
+
+
 def get_max_tool_turns() -> int:
     """Hard cap on model rounds (tool batches) in ONE turn. Top-level config key
     `max_tool_turns` (int, >= 10). Default 300: long agentic jobs (builds, batch

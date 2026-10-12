@@ -3227,7 +3227,9 @@ class AgentRunner:
                     # run so a long overnight turn reads as alive, not stalled.
                     # Best-effort: a send failure here is cosmetic and must
                     # never tear the turn.
-                    if (originator_visibility in ("cron", "kairos")
+                    from .config_global import get_activity_status_enabled
+                    if (get_activity_status_enabled()
+                            and originator_visibility in ("cron", "kairos")
                             and turn_count >= 3 and new_calls):
                         import time as _act_time
                         _ACTIVITY_MIN_GAP_S = 30.0

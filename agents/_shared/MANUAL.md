@@ -596,6 +596,14 @@ gateway restart). Beyond `integrations.*`, `models.*`, and
   agent.json. Use on deployments where a non-admin identity (e.g. a
   handle-based transport that can't resolve admin) still needs `run_command`
   and access is instead scoped by agent.json. Absent/malformed → `true`.
+- `activity_status_enabled` — bool, **defaults to `false`** (off). When
+  `true`, background turns (cron/kairos) past round 2 post a `⚙️ working
+  (round N): <tools>` activity line to the anchor conversation, throttled to
+  one per 30s, so a long overnight job reads as alive rather than stalled.
+  Off by default because on SHORT background turns it just spams the
+  operator's channel (a burst of restart-retry jobs each ending in `end_chain`
+  posted six `⚙️ working: end_chain` messages, 2026-10-10). Normal
+  replies to a human are never affected either way. Absent/malformed → `false`.
 - `insecure_tls_hosts` — list of hostnames (case-insensitive) exempted
   from `fetch_url`'s TLS certificate verification. For non-internal hosts
   with self-signed/broken certs the operator explicitly trusts.
