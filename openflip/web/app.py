@@ -425,8 +425,8 @@ async def events_recent():
 # calls usage_ledger's query functions, never the write path.
 
 # Friendly group name → ledger column, and window → since-delta. Both MIRROR
-# the /usage slash command (commands.py) EXACTLY so the web and Discord views
-# agree. 'all' = everything (since 0).
+# the windows/groups this page has always used. 'all' = everything (since 0).
+# (The Discord /usage command now shows Claude plan limits, not this ledger.)
 _USAGE_GROUP_COLS = {"agent": "agent_id", "channel": "channel_id",
                      "session": "session_id", "user": "user_id", "model": "model"}
 _USAGE_WINDOW_DELTAS = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}

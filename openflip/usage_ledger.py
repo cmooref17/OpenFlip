@@ -4,7 +4,7 @@ The ledger is the product: every completed turn writes ONE raw row carrying
 the full token breakdown + an estimated cost, and the entire usage dict is
 stored verbatim in `raw_usage` so no field is ever lost even if Anthropic
 adds new counters. Nothing is aggregated at write-time — every view (the
-`/usage` slash command, ad-hoc queries) is a read-side query over these rows.
+web /usage page, ad-hoc queries) is a read-side query over these rows.
 
 Design rules (see CLAUDE.md):
   - Writes must be bulletproof: a failure recording usage NEVER propagates up

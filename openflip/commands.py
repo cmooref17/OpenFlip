@@ -521,70 +521,17 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         await agents_ui.open_agents_panel(interaction, runner_agent_id=runner.agent.id)
 
     @bot.slash_command(name="usage",
-        description="(owner) Aggregated API usage over a time window.")
-    async def usage_cmd(
-        interaction: nextcord.Interaction,
-        window: str = nextcord.SlashOption(
-            choices=["24h", "7d", "30d", "all"],
-            default="24h",
-            required=False,
-            description="Time window to aggregate (default 24h)."),
-        group_by: str = nextcord.SlashOption(
-            name="group_by",
-            choices=["session", "channel", "agent", "user", "model"],
-            default="session",
-            required=False,
-            description="How to break down the totals (default session)."),
-    ):
+        description="(owner) Claude plan usage: session and weekly limits, like Claude Code's /usage.")
+    async def usage_cmd(interaction: nextcord.Interaction):
         if not await _owner_check(interaction): return
-        from . import usage_ledger
-        # Window → since_ts. 'all' = everything (since 0).
-        _deltas = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
-        now = time.time()
-        since_ts = 0.0 if window == "all" else now - _deltas.get(window, 86400)
-        # Friendly group name → ledger column.
-        _col_map = {"agent": "agent_id", "channel": "channel_id",
-                    "session": "session_id", "user": "user_id", "model": "model"}
-        col = _col_map.get(group_by, "session_id")
-
-        grand = usage_ledger.totals(since_ts)
-        if not grand.get("turns"):
-            await interaction.response.send_message(
-                f"No usage recorded in the last {window} yet.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        from . import plan_usage
+        try:
+            data = await plan_usage.fetch_plan_usage()
+        except Exception as e:
+            await interaction.followup.send(f"Couldn't read plan usage: {e}", ephemeral=True)
             return
-        rows = usage_ledger.aggregate(since_ts, group_by=col)
-
-        header = (
-            f"Usage — window: {window} • group by: {group_by}\n"
-            f"Totals: {grand['turns']:,} turns • "
-            f"{_humanize_tokens(grand['total_tokens'])} tokens • "
-            f"${grand['est_cost_usd']:.2f}"
-        )
-        # Build an aligned monospace table. Truncate to top N groups so the
-        # message stays under Discord's 2000-char cap.
-        TOP_N = 25
-        shown = rows[:TOP_N]
-        name_w = max([len(str(r["group"] or "—")) for r in shown] + [5])
-        name_w = min(name_w, 28)
-        lines = [f"{'group'.ljust(name_w)}  {'turns':>6}  {'tokens':>8}  {'cost':>9}"]
-        lines.append("-" * (name_w + 2 + 6 + 2 + 8 + 2 + 9))
-        for r in shown:
-            grp = str(r["group"] or "—")
-            if len(grp) > name_w:
-                grp = grp[: name_w - 1] + "…"
-            lines.append(
-                f"{grp.ljust(name_w)}  {r['turns']:>6,}  "
-                f"{_humanize_tokens(r['total_tokens']):>8}  "
-                f"${r['est_cost_usd']:>8.2f}"
-            )
-        if len(rows) > TOP_N:
-            lines.append(f"… {len(rows) - TOP_N} more group(s) not shown")
-
-        body = header + "\n```\n" + "\n".join(lines) + "\n```"
-        chunks = _chunk_for_discord(body)
-        await interaction.response.send_message(chunks[0], ephemeral=True)
-        for extra in chunks[1:]:
-            await interaction.followup.send(extra, ephemeral=True)
+        await interaction.followup.send(plan_usage.format_plan_usage(data)[:1990], ephemeral=True)
 
     @bot.slash_command(name="reload",
         description="(admin) Reload this agent's config + system files from disk.")
@@ -1016,19 +963,6 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
     # relevant agent's agent.json.
 
     # (no agent-specific commands currently registered.)
-
-
-def _humanize_tokens(n: int) -> str:
-    """Render a token count compactly: 2.1M / 800k / 512. Used by /usage."""
-    try:
-        n = int(n or 0)
-    except (TypeError, ValueError):
-        return "0"
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.0f}k"
-    return str(n)
 
 
 def _chunk_for_discord(text: str, limit: int = 1900) -> list[str]:

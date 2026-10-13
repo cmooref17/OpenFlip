@@ -3212,21 +3212,20 @@ visible right there.
 - `/agents` — agent overview panel: enable/disable, reload, per-agent
   tool toggles.
 
-### `/usage` — aggregated API usage (owner-only)
+### `/usage` — Claude plan limits (owner-only)
 
-`/usage [window] [group_by]` shows aggregated model-API usage (Anthropic +
-OpenAI turns) over a time window, read from the usage ledger (below).
-Owner-only, ephemeral response.
+`/usage` shows the subscription plan limits the anthropic provider's OAuth login
+is under — the same numbers Claude Code's `/usage` shows: the session (5-hour)
+and weekly bars, each with its percent used and reset time (machine-local time),
+plus per-model weekly buckets (Opus/Sonnet) and extra-usage credits when the
+account has them. Owner-only, ephemeral, read-only. Source:
+`GET {api_base}/api/oauth/usage` with the OAuth bearer token
+(`openflip/plan_usage.py`). Unknown buckets Anthropic adds later are shown under
+their raw key rather than dropped. Needs a working Claude login; a failure
+replies with the error instead of numbers.
 
-- `window` — `24h` (default) / `7d` / `30d` / `all`.
-- `group_by` — `agent` (default) / `channel` / `user` / `model`.
-
-Output is a monospace table: a header line with the window plus grand totals
-(turns, total tokens, total estimated cost in USD), then a per-group breakdown
-sorted by estimated cost descending — group value, turns, humanized token count
-(e.g. `2.1M` / `800k`), and `$X.XX`. Capped at the top 25 groups to stay under
-Discord's 2000-char limit (a `… N more group(s) not shown` line is appended when
-truncated). An empty window replies `No usage recorded in the last <window> yet.`
+(The old `/usage` that aggregated the usage ledger by window/group was removed
+2026-10-13. The ledger itself and the web dashboard's /usage page are unchanged.)
 
 ### Usage ledger
 
@@ -3235,7 +3234,7 @@ ledger at `data/usage_ledger.db` (WAL mode; gitignored). The row carries the
 full token breakdown (input / output / cache-read / cache-creation), a computed
 total, an estimated USD cost, the outcome (`ok` / `compaction` / `error`), and
 the entire usage dict verbatim in `raw_usage` so no future counter is ever lost.
-Nothing is aggregated at write-time — `/usage` and any ad-hoc query are read-side
+Nothing is aggregated at write-time — the web /usage page and any ad-hoc query are read-side
 aggregations over these rows.
 
 - **Module:** `openflip/usage_ledger.py` (`record_usage`, `query_usage`,
