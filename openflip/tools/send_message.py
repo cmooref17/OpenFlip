@@ -256,6 +256,15 @@ async def send_message(text: str, channel_id: int = 0, session_id: str = "") -> 
     except Exception as e:
         return ToolResult.fail(f"Send failed: {e}")
 
+    # A post into a DIFFERENT conversation than this turn's must also land in
+    # that conversation's own history, or the agent there never saw its own
+    # message when the person answers (openflip/_cross_post.py). The current
+    # conversation is skipped inside (the turn itself records it).
+    from .._cross_post import record_cross_post
+    _target_conv = conv_id if session_id else f"discord:{target_channel_id}"
+    _rec = record_cross_post(_target_conv, text)
+
     return ToolResult(
-        model_feedback=f"Sent {len(chunks)} message chunk(s) to {target_label}.",
+        model_feedback=f"Sent {len(chunks)} message chunk(s) to {target_label}."
+        + (f" ({_rec})" if _rec else ""),
     )
