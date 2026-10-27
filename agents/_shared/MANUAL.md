@@ -636,6 +636,18 @@ gateway restart). Beyond `integrations.*`, `models.*`, and
   this global key → built-in default `"Sorry, something went wrong. Please try
   again in a bit."`). An empty string at a tier counts as NOT set and falls
   through to the next tier.
+- `quiet_turn_nudge` — object `{"enabled": true, "rounds": 3, "seconds": 90}`
+  (all fields optional; defaults shown). On an operator-facing human turn,
+  once `rounds` tool rounds OR `seconds` of wall time pass with no text from
+  the agent reaching the channel (the turn start counts as the baseline), a
+  `[FRAMEWORK]` note is appended after that round's tool results asking for
+  a few words of status before continuing. Fires at most once per silence
+  window (the counters reset when it fires and whenever the agent's text
+  posts). A human message drained mid-turn gets an immediate "acknowledge it
+  in one line" note instead. Never fires on silent, synthetic (cron /
+  heartbeat / kairos / trigger), peer, or chain-terminator turns. `false`
+  (or `"enabled": false`) turns it off. Pairs with FRAMEWORK.md's "Keep the
+  operator posted during long work".
 - `insecure_tls_hosts` — list of hostnames (case-insensitive) exempted
   from `fetch_url`'s TLS certificate verification. For non-internal hosts
   with self-signed/broken certs the operator explicitly trusts.

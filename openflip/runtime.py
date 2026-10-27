@@ -265,6 +265,141 @@ def _settle_result_future(
         pass
 
 
+# ---------------------------------------------------------------------------
+# Quiet-turn nudge (operator-facing human turns only)
+#
+# Models rarely write text alongside a tool call, so long multi-tool turns go
+# silent — the operator sees only a typing indicator. The runtime already posts
+# any text the model writes beside a tool call (the intra-loop post in
+# _run_turn, which sets _posted_assistant_text). This tracker counts tool
+# rounds and wall time since the agent last posted text to the channel during
+# the turn (turn start is the baseline) and, once either threshold is crossed,
+# returns a short [FRAMEWORK] note to append after that round's tool results
+# (same mechanism as the round-cap warning: a user-role note AFTER the
+# tool_result messages, never between a tool_use and its tool_result). Firing
+# resets both counters, so it can fire again only after another full window
+# of silence — never every round. A HUMAN soft-inject drained mid-turn fires
+# an acknowledge note right away and resets the counters too.
+#
+# Thresholds come from config.json `quiet_turn_nudge`
+# {"enabled": true, "rounds": 3, "seconds": 90} (read at runtime, defaults
+# applied per-field). The gate is operator_facing_turn — silent, synthetic
+# (cron/heartbeat/trigger/kairos/dream), peer and chain-terminator turns
+# never get a nudge. Tests: tests/test_quiet_turn_nudge.py.
+# ---------------------------------------------------------------------------
+QUIET_TURN_NUDGE_TEXT = (
+    "[FRAMEWORK]: The operator hasn't heard from you in a while. "
+    "Say in a few words what you're doing, then continue."
+)
+SOFT_INJECT_ACK_TEXT = (
+    "[FRAMEWORK]: The operator just sent a message. "
+    "Acknowledge it in one line, then continue."
+)
+_QUIET_TURN_NUDGE_DEFAULTS = {"enabled": True, "rounds": 3, "seconds": 90.0}
+
+
+def get_quiet_turn_nudge_settings(cfg: dict | None = None) -> dict:
+    """Resolve config.json `quiet_turn_nudge` → {"enabled": bool, "rounds": int,
+    "seconds": float}. Missing/invalid fields fall back per-field to the
+    defaults (on / 3 rounds / 90 s); a non-dict value (e.g. `false`) disables.
+    `cfg` is injectable for tests; default reads the live global config."""
+    out = dict(_QUIET_TURN_NUDGE_DEFAULTS)
+    if cfg is None:
+        try:
+            from .config_global import get_config
+            cfg = get_config()
+        except Exception:
+            cfg = {}
+    raw = (cfg or {}).get("quiet_turn_nudge", None)
+    if raw is None:
+        return out
+    if isinstance(raw, bool):
+        out["enabled"] = raw
+        return out
+    if not isinstance(raw, dict):
+        return out
+    out["enabled"] = bool(raw.get("enabled", True))
+    try:
+        out["rounds"] = max(1, int(raw.get("rounds", out["rounds"])))
+    except (TypeError, ValueError):
+        pass
+    try:
+        out["seconds"] = max(1.0, float(raw.get("seconds", out["seconds"])))
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
+def should_quiet_turn_nudge(
+    *,
+    rounds_since_post: int,
+    seconds_since_post: float,
+    enabled: bool,
+    rounds: int,
+    seconds: float,
+    operator_facing: bool,
+) -> bool:
+    """Pure decision: nudge when the feature is on, the turn is operator-
+    facing, and EITHER threshold is reached. No state — the caller owns the
+    counters (see QuietTurnTracker)."""
+    if not enabled or not operator_facing:
+        return False
+    if rounds <= 0 and seconds <= 0:
+        return False
+    return rounds_since_post >= rounds or seconds_since_post >= seconds
+
+
+class QuietTurnTracker:
+    """Per-turn counters for the quiet-turn nudge. `clock` is injectable so
+    tests can drive wall time; `settings` is the dict from
+    get_quiet_turn_nudge_settings()."""
+
+    def __init__(self, settings: dict | None = None, *, clock=None):
+        import time as _time
+        self._clock = clock or _time.monotonic
+        s = settings if settings is not None else get_quiet_turn_nudge_settings()
+        self.enabled = bool(s.get("enabled", True))
+        self.rounds = int(s.get("rounds", 3))
+        self.seconds = float(s.get("seconds", 90.0))
+        self.rounds_since_post = 0
+        self.last_post_at = self._clock()   # turn start is the baseline
+        self.fired = 0                      # quiet nudges fired this turn (diagnostics)
+
+    @property
+    def seconds_since_post(self) -> float:
+        return max(0.0, self._clock() - self.last_post_at)
+
+    def reset(self) -> None:
+        self.rounds_since_post = 0
+        self.last_post_at = self._clock()
+
+    def note_posted(self) -> None:
+        """The agent's text reached the channel (intra-loop post)."""
+        self.reset()
+
+    def after_tool_round(self, *, operator_facing: bool, human_drained: bool = False) -> str | None:
+        """Call once per tool round, AFTER the round's tool results (and any
+        soft-inject drain) have been appended. Returns the [FRAMEWORK] note to
+        append for this round, or None. A drained human soft-inject wins over
+        the quiet nudge (one note per round) and resets the window."""
+        if not self.enabled or not operator_facing:
+            return None
+        if human_drained:
+            self.reset()
+            return SOFT_INJECT_ACK_TEXT
+        self.rounds_since_post += 1
+        if should_quiet_turn_nudge(
+            rounds_since_post=self.rounds_since_post,
+            seconds_since_post=self.seconds_since_post,
+            enabled=self.enabled, rounds=self.rounds, seconds=self.seconds,
+            operator_facing=operator_facing,
+        ):
+            self.fired += 1
+            self.reset()
+            return QUIET_TURN_NUDGE_TEXT
+        return None
+
+
 class AgentRunner:
     def __init__(self, agent: Agent, token: str, transport: Optional[Transport] = None, transports: Optional[list[Transport]] = None):
         self.agent = agent
@@ -2596,6 +2731,18 @@ class AgentRunner:
         # diagnostic instead of letting the operator see silence. Models
         # Claude Code's `isResultSuccessful` exit check.
         _posted_assistant_text = False
+        # Quiet-turn nudge (see QuietTurnTracker above the class). Counts tool
+        # rounds / wall time since the agent last posted text in THIS turn;
+        # reset at the intra-loop post below. Gate is evaluated per round
+        # because auto_post_final_text/silent can flip mid-turn.
+        _quiet = QuietTurnTracker()
+
+        def _quiet_gate() -> bool:
+            return operator_facing_turn(
+                auto_post_final_text=auto_post_final_text, silent=silent,
+                is_chain_terminator=is_chain_terminator,
+                originator_agent_id=originator_agent_id,
+                auto_route_from_peer=auto_route_from_peer, log_tag=log_tag)
         # Unattended-work activity line (cron/kairos only). Long overnight work
         # turns otherwise show nothing but a "typing" indicator for the whole
         # run — the operator can't tell a live multi-tool turn from a dead one
@@ -3090,6 +3237,7 @@ class AgentRunner:
                             # contract must not treat a later textless
                             # end_turn as dead air.
                             _posted_assistant_text = True
+                            _quiet.note_posted()
                         except Exception:
                             pass
 
@@ -3417,6 +3565,7 @@ class AgentRunner:
                     # call (so the model sees the operator's mid-turn
                     # message at its next decision point). See
                     # _drain_pending_injects for the marker format.
+                    _human_drained_this_round = False
                     try:
                         _ch_id_drain = _conv_key
                         _drained_n = self._drain_pending_injects(_ch_id_drain, conv)
@@ -3426,6 +3575,7 @@ class AgentRunner:
                             # to another chat() after a tool batch, so the
                             # drained marker is guaranteed a decision point.
                             _human_softinject_drained_this_turn = True
+                            _human_drained_this_round = True
                         # If a human soft-injected during a synthetic turn
                         # (e.g. operator messaged us mid-talk_to_agent
                         # exchange), the silent-by-default visibility no
@@ -3447,6 +3597,34 @@ class AgentRunner:
                         print_ts(
                             f"{COLOR_YELLOW}inner-loop soft-inject drain failed (continuing): "
                             f"{_drain_err}{COLOR_END}",
+                            agent=agent.id,
+                        )
+
+                    # Quiet-turn nudge: after this round's tool results (and
+                    # any drained soft-inject marker) are on history, ask the
+                    # agent for a one-line status if the operator has heard
+                    # nothing for N rounds / T seconds, or to acknowledge a
+                    # just-drained operator message. Same append mechanism as
+                    # the round-cap warning above (user-role note AFTER the
+                    # tool_result batch — never between tool_use and its
+                    # tool_result). Fires at most once per silence window.
+                    try:
+                        _quiet_note = _quiet.after_tool_round(
+                            operator_facing=_quiet_gate(),
+                            human_drained=_human_drained_this_round,
+                        )
+                        if _quiet_note:
+                            conv.messages.append(ChatMessage('user', _quiet_note))
+                            print_ts(
+                                f"{COLOR_YELLOW}{log_tag}quiet-turn nudge "
+                                f"({'soft-inject ack' if _human_drained_this_round else 'status'}) "
+                                f"injected at round {turn_count}{COLOR_END}",
+                                agent=agent.id,
+                            )
+                    except Exception as _quiet_err:
+                        print_ts(
+                            f"{COLOR_YELLOW}{log_tag}quiet-turn nudge failed (continuing): "
+                            f"{_quiet_err}{COLOR_END}",
                             agent=agent.id,
                         )
 
