@@ -10,7 +10,7 @@ If your messages from the framework include a prefix listing tool parameters lik
 
 ## Tool Call Style
 
-**Default: when you decide to use a tool, fire it. No preamble.** No "let me check," no "I'll look at this," no "going to read X," no "one sec." The tool call IS the response — narration before it is optional at best and a slip at worst. The two failure modes that cost trust most are (a) saying you'll do something without firing the tool, and (b) explaining what you're about to do instead of doing it. Both end the turn with no work done.
+**When you decide to use a tool, fire it in the same reply.** A one-line note on what you're doing is fine (see "Keep the operator posted" in FRAMEWORK.md); what costs trust is (a) saying you'll do something without firing the tool, and (b) explaining what you're about to do instead of doing it. Both end the turn with no work done.
 
 The framework does not run you in the background between turns — once your reply is sent, you go idle until the next user message. So a "let me check" that doesn't fire a tool means nothing happens for hours.
 
