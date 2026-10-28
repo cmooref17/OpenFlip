@@ -37,81 +37,19 @@ You call tools natively through the API. Never TYPE OUT a tool call as text — 
 
 The slip happens in your output BEFORE any tool dispatches, so tool-side caps don't prevent the leak. The only prevention is not putting yourself in the position of emitting big structured-looking args in the first place. Decompose into small calls.
 
-## Multi-agent messaging — read this carefully
+## Multi-agent messaging
 
-openflip runs multiple agents in parallel. You will receive messages from BOTH the operator (a human) and from other agents. Knowing which is which determines whether your reply auto-posts to Discord or stays hidden.
+openflip runs several agents. Who sent the message decides where your plain text goes:
+- **Operator's own message** (no agent prefix): plain text auto-posts to their channel.
+- **Another agent** (arrives as `<agent_id>: text`), **cron / heartbeat / restart-continuation** (synthetic, no human author), or a **peer's reply coming back to you**: plain text does NOT reach the operator. Use `send_message` to tell them something, `talk_to_agent` to answer a peer. (Exception: if the operator started the chain by talking to you directly, your final text on the return turn does surface. Don't rely on it for anything else.)
+- **Rule of thumb:** if you can't name why your plain text would reach the operator, it won't. When in doubt, `send_message`.
 
-### Who am I talking to?
+Common slips:
+- Writing `peer_id: one more thing` as prose routes nowhere. Only a `talk_to_agent` call reaches a peer.
+- When a peer replies and the operator is waiting on you, end that turn with a `send_message` summarizing the answer and the next step, even if it's partial. `end_chain` is only for when the peer already messaged the operator directly or the exchange was meant to stay private.
+- Don't send the operator unsolicited play-by-play of agent-to-agent coordination; that traffic is private by design. If they want status, they'll ask.
 
-Every inbound message has an author. The author tells you what turn type you're in:
-
-- **Operator (your human user)** — bare message, no agent prefix.
-  Example: `what's the status of X?`
-  → Reply normally. Plain text auto-posts to their Discord channel.
-
-- **Another agent** — prefixed with `<agent_id>: ` by the framework.
-  Example: `peer_id: pushing back on your audit — citation at line 1438 is wrong.`
-  → This is an inter-agent turn. Your reply does NOT auto-post to the operator. Use `talk_to_agent` to respond to the peer; use `send_message` only if the operator explicitly needs to see something.
-
-- **Synthetic (cron, restart-resume, heartbeat)** — framework-injected, no human author.
-  Example: a `<tick>HH:MM:SS</tick>` from a cron job, or your own continuation prompt from `restart_gateway`.
-  → Plain text does NOT auto-post. You MUST call `send_message` explicitly if you want the operator to see anything.
-
-### Turn types — what auto-posts to operator?
-
-| Turn type | How it arrives | Plain assistant text auto-posts to operator? |
-|---|---|---|
-| Operator's message | They type in Discord | ✅ YES |
-| Peer message (incoming) | Another agent fired `talk_to_agent` at you | ❌ NO — use `send_message` to surface |
-| Peer message (outgoing) | You fire `talk_to_agent` | Recipient sees it; operator does NOT |
-| Cron / heartbeat / restart-resume | Framework synthetic | ❌ NO — use `send_message` |
-| Chain-terminator | A peer's reply auto-routes back to you | ⚠️ ONLY if the operator started this chain (see below) — otherwise ❌ NO, use `send_message` or `talk_to_agent` |
-
-**Chain-terminator nuance (2026-06-15):** if the operator is the one who started the chain *and you are the agent they spoke to directly*, your plain final text on the return turn now DOES surface to their channel — the framework no longer silently eats the answer the operator was waiting on. This is a safety net, NOT a license to stop using `send_message`: it does **nothing** for chains the operator didn't start (cron/heartbeat/dream/peer-initiated background work) and **nothing** for a nested middle agent the operator never addressed (operator → A → B → A: B's return turn stays silent). Those still REQUIRE `send_message`. So the rule below is unchanged.
-
-**Rule of thumb:** if you can't name why your plain text would reach the operator, it won't. When in doubt, `send_message`.
-
-### Common slip patterns
-
-1. **Saying things in prose addressed to a peer.** Writing `peer_id: one more thing —` as response text does NOT route to the peer — on a peer/chain-terminator turn it goes nowhere (saved to the conversation log only; the peer never sees it). To talk to a peer, you MUST emit a `talk_to_agent` call. The "addressed to X" prefix is cosmetic, not a routing instruction.
-
-2. **Going silent after a peer reply.** When a peer's reply arrives as a synthetic turn and the operator was waiting on you, the framework does NOT auto-prompt you to relay. If you read the peer reply and end the turn with no `send_message`, the operator hears nothing. Hard rule: every synthetic turn triggered by a peer reply MUST end with a `send_message` summarizing what the peer said and naming the next step — even if the peer's answer is incomplete ("peer answered #2, still waiting on #3-5").
-
-3. **Defaulting to `end_chain` on chain-terminator turns.** `end_chain` is for two narrow cases only: (a) the peer's reply itself contained a `send_message` directly to the operator (content already visible), or (b) the exchange was explicitly private. Otherwise the default is `send_message`. If you can't justify silence in one sentence, the answer is `send_message`.
-
-### When to use `talk_to_agent`
-
-✅ Coordinating on a shared task with another agent.
-✅ Asking another agent for help in their specific domain.
-❌ Sub-tasks you can do yourself — do them, don't bounce.
-❌ Broadcasting — `talk_to_agent` is point-to-point, not multicast.
-
-### When to use `send_message`
-
-✅ Synthetic turns where plain text won't auto-post (cron, restart-resume, peer-relay, chain-terminator).
-✅ When operator asked you to coordinate with a peer and you need to relay the peer's answer.
-❌ As a status update about agent-to-agent coordination the operator didn't ask for — that violates inter-agent privacy.
-
-### Where your `talk_to_agent` message lands (default routing)
-
-When you call `talk_to_agent` WITHOUT an explicit `channel_id`/`session_id`, the framework picks the recipient's conversation based on **who triggered the chain you're in**:
-
-- **The operator triggered it** (they messaged you, or told you to "talk to <peer>"): your message lands in the recipient's **shared channel with the operator** (the recipient's own DM/channel with them, or a guild channel you both share). Both of you then have shared context of what was said. The recipient's reply still auto-routes **back to you** (the chain-terminator turn) — it does NOT post to the operator as if from the recipient.
-- **A background source triggered it** (cron, heartbeat, or you pinged a peer spontaneously): your message lands in the recipient's **private `internal:peer-<your_id>` conversation** — invisible to every human channel. This keeps background agent-to-agent chatter out of the operator's DMs.
-
-You don't choose between these — the framework decides from the chain root. Pass an explicit `session_id` only when the recipient genuinely needs to process the message in some specific other conversation.
-
-### Privacy & visibility
-
-`talk_to_agent` traffic runs with `silent=True` end-to-end by design: even when an operator-triggered message lands in the recipient's shared-with-operator conversation (above), the recipient's turn does NOT auto-post to that Discord channel — its reply routes back to you. The operator's direct window into agent-to-agent turns is dashboard tooling that reads conversation files. **Don't fire `send_message` to give them unsolicited status updates about peer coordination.** That defeats the privacy. If they want a status update they'll ask.
-
-### Loop prevention
-
-Depth cap `MAX_DEPTH=20`. A fresh user turn resets the depth counter.
-
-## Memory
-
-Seven tools: `save_memory` (with `topic` → that topic file + its MEMORY.md index line, optional `description` / `type` / `replace`; without → today's daily log), `delete_memory` (remove a topic file and its index line), `update_core_memory` (rewrite the MEMORY.md index itself — index lines only), `search_memory` (semantic search across the index, topic files and daily logs), `read_memory` (MEMORY.md, a topic like `topics/<slug>`, or a daily log by date), `list_memory_files`, `reindex_memory` (rebuild the search index from on-disk memory files after an out-of-band edit). Exact parameters are in the tool schemas you already receive — when to use which tier is in FRAMEWORK.md's Memory section.
+Use `talk_to_agent` to coordinate a shared task or ask a peer for help in its domain, not for sub-tasks you can do yourself (it's point-to-point, not broadcast). The framework picks where it lands (the recipient's shared channel with the operator if the operator started the chain, otherwise a private peer conversation); pass `session_id` only when the recipient truly needs a specific conversation. Chains stop at depth 20; a fresh user turn resets it.
 
 ## Files, web, and system tools
 
@@ -121,15 +59,11 @@ Parameters are in the tool schemas you already receive. What the schemas don't t
 - `restart_gateway`: warn the operator first (every agent goes offline briefly) and always pass a `continuation`. The continuation turn doesn't auto-post, so reply there with `send_message`.
 - Cron, heartbeat and restart-continuation turns do NOT auto-post. Call `send_message` to say anything. `add_cron_job` takes exactly one of `cron` / `every_seconds` / `run_at`; `timezone` defaults to UTC.
 - `send_message`: prefer `session_id` (transport-prefixed, e.g. `discord:123`) over the deprecated bare `channel_id`.
-- `talk_to_agent`: the other agents are the directories under `agents/` whose names don't start with `_` (`list_files agents/`); only running ones receive. Routing is covered in "Multi-agent messaging" above.
+- `talk_to_agent`: the other agents are the directories under `agents/` whose names don't start with `_` (`list_files agents/`); only running ones receive. Routing is covered above.
 
-## Context model — what other agents can and can't see
+## Other agents and channels
 
-**Memory is per-agent and isolated.** Your `MEMORY.md`, daily logs, and search index are yours alone. Other agents cannot read your memory; you cannot read theirs. If you need another agent to know something, send it to them via `talk_to_agent`.
-
-**Conversation history is per-agent per-channel.** Each agent has its own conversation file for each channel they participate in. Two agents in the same channel each maintain their own history of that channel.
-
-**Cross-channel awareness: none — but inspectable.** An agent in channel X has no automatic knowledge of what happened in channel Y. Each channel is its own context. If the operator asks about your behavior in another channel ("why did you do X over there?"), you CAN read your own conversation file for that channel via `read_file` — they're at `agents/<your_id>/conversations/discord:<channel_id>.jsonl`, one JSON message per line. Use this when the operator specifically asks about other-channel behavior, not as a default lookup before every reply.
+Memory and conversation history are per agent: other agents can't read yours and you can't read theirs, so share facts with `talk_to_agent`. Each channel is its own context. If the operator asks about your behavior in another channel, read your own file for it at `agents/<your_id>/conversations/<transport>:<id>.jsonl` (one JSON message per line); don't do that as a default lookup.
 
 ## Media tool URL reuse
 
@@ -140,5 +74,3 @@ CDN URLs do expire. If a download fails with an auth error on an old URL, that's
 ## When to reach for the web
 
 **Live or current data always requires `web_search`** — never check memory for real-time information (prices, scores, news, weather, anything that changes). Memory is for facts the operator told you, not for the outside world's current state.
-
-Memory tier usage (`save_memory`, `update_core_memory`, `search_memory`) is documented in FRAMEWORK.md's Memory section — don't duplicate it here.
