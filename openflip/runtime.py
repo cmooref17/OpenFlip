@@ -1003,6 +1003,14 @@ class AgentRunner:
                 return (False, f"Nothing undone — this conversation has fewer than {count} turns.", "")
             return (False, "Nothing to undo — no turn found in this conversation's history.", "")
         removed, previews, backup_name, cut_content = result
+        # Providers whose transcript lives outside the mirror (claude_code)
+        # must know the mirror was cut so they stop resuming the old session.
+        _cut_cb = getattr(conv, "on_history_cut", None)
+        if callable(_cut_cb):
+            try:
+                _cut_cb()
+            except Exception as _cut_err:
+                print_ts(f"{COLOR_YELLOW}{verb}: on_history_cut failed: {_cut_err}{COLOR_END}", agent=self.agent.id)
         what = "the last turn" if count == 1 else f"the last {count} turns"
         msg = (
             f"↩️ Undid {what} ({removed} message(s)). History backup: `{backup_name}`\n"
@@ -2628,7 +2636,7 @@ class AgentRunner:
         # AnthropicConversation / OpenAIConversation drains on its next
         # chat() / chat_stream().
         _img_tmp_paths: list[str] = []
-        if (agent.provider in ("anthropic", "openai")
+        if (agent.provider in ("anthropic", "openai", "claude_code")
                 and discord_message is not None
                 and getattr(discord_message, "attachments", None)):
             try:
@@ -2814,6 +2822,7 @@ class AgentRunner:
                 async with _discord_safe_typing(channel, agent_id=agent.id):
                     _recalled = await recall_block(
                         os.path.dirname(agent.path), user_text, _rstate, agent_id=agent.id,
+                        provider=agent.provider or "",
                     )
                 if _recalled:
                     framed_user = f"{framed_user}\n\n{_recalled}"
@@ -2988,11 +2997,58 @@ class AgentRunner:
                     # queryLoop also has at the equivalent point (after the
                     # `for await (const message of deps.callModel(...))`
                     # exhausts).
-                    ai_message = await asyncio.wait_for(
-                        conv.chat(tools=api_tool_funcs or None, think=agent.think,
-                                  tool_choice=_tc_this_turn),
-                        timeout=CHAT_TIMEOUT_S,
-                    )
+                    # claude_code provider: Claude Code runs the tool loop
+                    # inside this one chat() call. Hand it this turn's context
+                    # (channel, speaker, ACL set, dedup state) and read the
+                    # tallies back afterwards so the post-loop logic below
+                    # (reply-equivalent tools, attachments, worker counts,
+                    # posted-text contract) sees the same facts it would on
+                    # the in-loop providers.
+                    _cc_turn = None
+                    if _prov == "claude_code":
+                        import contextvars as _cv
+                        from .claude_code_tools import TurnContext as _TurnContext
+                        _cc_turn = _TurnContext(
+                            agent=agent, conversation=conv, channel=channel,
+                            speaker_id=int(speaker_id or 0),
+                            session_id=(getattr(CURRENT_SESSION.get(None), "session_id", "") or ""),
+                            discord_message=discord_message, silent=silent,
+                            auto_post_final_text=bool(auto_post_final_text),
+                            interrupt_check=(
+                                (lambda: bool(self._pending_inject.get(_conv_key)))
+                                if _conv_key else None
+                            ),
+                            memory_enabled=_mem_enabled,
+                            callable_names=set(callable_names),
+                            called_signatures=called_signatures,
+                            dedupe_exempt=set(_DEDUPE_EXEMPT_TOOLS),
+                            context=_cv.copy_context(),
+                        )
+                        conv._cc_turn = _cc_turn
+                    try:
+                        ai_message = await asyncio.wait_for(
+                            conv.chat(tools=api_tool_funcs or None, think=agent.think,
+                                      tool_choice=_tc_this_turn),
+                            timeout=CHAT_TIMEOUT_S,
+                        )
+                    finally:
+                        if _cc_turn is not None:
+                            conv._cc_turn = None
+                    if _cc_turn is not None:
+                        if _cc_turn.any_tool_called:
+                            any_tool_called = True
+                        if _cc_turn.reply_equivalent_fired:
+                            reply_equivalent_tool_fired = True
+                        if _cc_turn.any_attachments:
+                            any_attachments_this_turn = True
+                        if _cc_turn.posted_text:
+                            _posted_assistant_text = True
+                            _quiet.note_posted()
+                        _worker_calls += _cc_turn.calls
+                        _worker_errors += _cc_turn.errors
+                        _worker_denied += _cc_turn.denied
+                        for _tname, _targs, _tfb, _tok in _cc_turn.tool_log:
+                            print_ts(f"  ← claude_code tool {_tname} ok={_tok}", agent=agent.id)
                     last_ai_message = ai_message
 
                     # Compaction done-notice. Fires whenever compaction
@@ -4526,7 +4582,7 @@ class AgentRunner:
                 elif _classification == "provider_anomaly":
                     _status_hint = (
                         "status.claude.com"
-                        if getattr(agent, "provider", "") == "anthropic"
+                        if getattr(agent, "provider", "") in ("anthropic", "claude_code")
                         else "the provider's status page"
                     )
                     _user_msg = (

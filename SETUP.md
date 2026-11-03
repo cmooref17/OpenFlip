@@ -245,6 +245,21 @@ export ANTHROPIC_API_KEY=sk-ant-xxx...
 
 To persist: add that line to `~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`.
 
+## 10a. Claude Code provider (`provider: "claude_code"`)
+
+Runs the agent on the real Claude Code binary through the Claude Agent SDK.
+No API key and no token handling in openflip: the box's own `claude` login is
+used by Claude Code itself.
+
+1. Install the pinned SDK (already in `requirements.txt`): `pip install -r requirements.txt`
+2. Log in once as the user that runs openflip: `claude auth login`
+   (headless box: `claude setup-token` and export `CLAUDE_CODE_OAUTH_TOKEN`)
+3. In `agents/<id>/agent.json`: `"provider": "claude_code"`, model e.g. `"anthropic/claude-sonnet-5-5"`
+4. Restart. Check `log.txt` for `claude_code: client connected`.
+
+Details, config keys and what differs from the `anthropic` provider:
+`docs/claude_code_provider.md`.
+
 ## 11. Start it for real
 
 ```bash

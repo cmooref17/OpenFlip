@@ -4,6 +4,10 @@ nextcord
 # Anthropic provider
 anthropic
 
+# claude_code provider (runs the real Claude Code binary via the Agent SDK;
+# pinned — upgrade deliberately and re-run tests/spike_claude_code.py)
+claude-agent-sdk==0.2.177
+
 # Ollama provider (vendored openflip/ollama_api/ talks to a local Ollama server)
 ollama
 pydantic

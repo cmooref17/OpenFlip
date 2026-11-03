@@ -140,3 +140,6 @@ SECURITY_AUDIT.md
 # new files in data/ are ignored automatically, no whack-a-mole)
 data/*
 !data/secret_scrub.py
+
+# claude_code provider spike output (local, per-machine)
+tests/spike_claude_code.out.json

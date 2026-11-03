@@ -154,7 +154,8 @@ class RecallState:
         self.bytes_used = 0
 
 
-async def recall_block(agent_dir: str, query: str, state: RecallState, *, agent_id: str = "") -> str:
+async def recall_block(agent_dir: str, query: str, state: RecallState, *, agent_id: str = "",
+                       provider: str = "") -> str:
     """Pick relevant topic files for `query`; return the block ('' if none).
     Never raises."""
     from .memory_recall_api import recall_enabled, selector_model, call_selector
@@ -165,12 +166,14 @@ async def recall_block(agent_dir: str, query: str, state: RecallState, *, agent_
             print_ts("memory recall: session budget exhausted", agent=agent_id)
             return ""
         cands = [c for c in list_candidates(agent_dir) if c["filename"] not in state.surfaced]
-        model = selector_model()
+        _cc = (provider == "claude_code")
+        model = selector_model(provider=provider) if _cc else selector_model()
         if not cands or not model:
             return ""
         started = time.time()
         answer = await asyncio.wait_for(
-            call_selector(model, format_candidates(cands), query[:4000]),
+            call_selector(model, format_candidates(cands), query[:4000], provider=provider)
+            if _cc else call_selector(model, format_candidates(cands), query[:4000]),
             timeout=SELECTOR_TIMEOUT_S + 5,
         )
         by_name = {c["filename"]: c for c in cands}

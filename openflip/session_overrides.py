@@ -58,7 +58,14 @@ PROVIDER_KEYS: dict[str, tuple[str, ...]] = {
     "anthropic": ("model", "context_window", "compaction_trigger", "max_tokens", "effort", "memory", "activity_status", "error_display", "error_message"),
     "openai": ("model", "context_window", "max_tokens", "effort", "memory", "activity_status", "error_display", "error_message"),
     "ollama": ("model", "context_window", "options", "memory", "activity_status", "error_display", "error_message"),
+    # claude_code: Claude Code owns the context window, compaction and output
+    # cap, so only the knobs the SDK exposes are overridable.
+    "claude_code": ("model", "effort", "memory", "activity_status", "error_display", "error_message"),
 }
+
+# Providers that speak the same model vocabulary (a claude-* model is valid on
+# both the anthropic and claude_code providers).
+_MODEL_FAMILY = {"anthropic": "anthropic", "claude_code": "anthropic", "openai": "openai", "ollama": "ollama"}
 
 # Meta sidecar key. Legacy `effort_override` (pre-overrides layout) is still
 # read on load and migrated into `overrides.effort`; it is never written back.
@@ -171,7 +178,7 @@ def normalize_override(provider: str, key: str, raw: Any) -> tuple[Any, str]:
             return None, "model must be a non-empty model name"
         model = raw.strip()
         inferred = provider_for_model(model)
-        if inferred != provider:
+        if _MODEL_FAMILY.get(inferred, inferred) != _MODEL_FAMILY.get(provider, provider):
             return None, (
                 f"`{model}` looks like a {inferred} model but this agent runs {provider}; "
                 f"a session override can't change provider (histories aren't compatible) — use `/model` for that"

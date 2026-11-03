@@ -20,7 +20,7 @@ def recall_enabled() -> bool:
     return rc.get("enabled", True) is not False
 
 
-def selector_model() -> str:
+def selector_model(provider: str = "") -> str:
     """config.json `memory_recall.model`, else the newest anthropic sonnet in
     config's `models` block (CC uses the default Sonnet). '' = unavailable."""
     from .config_global import get_config
@@ -31,15 +31,23 @@ def selector_model() -> str:
     models = cfg.get("models") or {}
     sonnets = sorted(
         (n for n, meta in models.items()
-         if (meta or {}).get("provider") == "anthropic" and "sonnet" in n and not n.endswith("-1m")),
+         if (meta or {}).get("provider") in ("anthropic", "claude_code")
+         and "sonnet" in n and not n.endswith("-1m")),
         reverse=True,
     )
-    return sonnets[0] if sonnets else ""
+    if sonnets:
+        return sonnets[0]
+    # claude_code can run on Claude Code's own default without a config entry.
+    return "sonnet" if provider == "claude_code" else ""
 
 
-async def call_selector(model: str, candidates_text: str, query: str) -> str:
+async def call_selector(model: str, candidates_text: str, query: str, *, provider: str = "") -> str:
     """Return the selector's raw text answer. Raises on any failure (the
-    caller swallows and logs)."""
+    caller swallows and logs). On the claude_code provider the selector is a
+    one-shot Claude Code query (no OAuth handling here)."""
+    if provider == "claude_code":
+        from .claude_code_conversation import call_selector as _cc_selector
+        return await _cc_selector(model, candidates_text, query)
     import aiohttp
     from .anthropic_conversation import (
         _load_oauth_access_token, _DEFAULT_API_BASE, _DEFAULT_ANTHROPIC_VERSION,

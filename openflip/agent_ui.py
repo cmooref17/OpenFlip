@@ -67,7 +67,7 @@ def _claude_models() -> list[str]:
         models = (get_config() or {}).get("models", {}) or {}
         claude = [
             name for name, meta in models.items()
-            if (meta or {}).get("provider") == "anthropic"
+            if (meta or {}).get("provider") in ("anthropic", "claude_code")
         ]
         if claude:
             return claude
@@ -109,11 +109,15 @@ def _is_openai_model(model: str) -> bool:
     return model.startswith("openai/")
 
 
-def _provider_for_model(model: str) -> str:
-    """Infer the provider from a model name."""
+def _provider_for_model(model: str, current: str | None = None) -> str:
+    """Infer the provider from a model name. A claude model keeps an agent on
+    the claude_code provider when that is what it already runs (`current`);
+    the two providers share the model vocabulary."""
     if _is_openai_model(model):
         return "openai"
-    return "anthropic" if _is_claude_model(model) else "ollama"
+    if _is_claude_model(model):
+        return "claude_code" if current == "claude_code" else "anthropic"
+    return "ollama"
 
 
 async def _fetch_ollama_models() -> list[str]:
@@ -290,8 +294,8 @@ class _ModelPicker(nextcord.ui.StringSelect):
             await interaction.response.defer()
             return
         # Auto-set provider based on model type
-        new_provider = _provider_for_model(new_model)
         old_provider = getattr(agent, "provider", "ollama")
+        new_provider = _provider_for_model(new_model, current=old_provider)
         agent.model = new_model
         agent.provider = new_provider
         # When switching providers, clear existing conversations for this
@@ -792,7 +796,7 @@ def model_command_users() -> set[int]:
 
 def _session_model_choices(agent) -> list[str]:
     prov = getattr(agent, "provider", "ollama")
-    if prov == "anthropic":
+    if prov in ("anthropic", "claude_code"):
         return list(_claude_models())
     if prov == "openai":
         return [f"openai/{m}" for m in _openai_models()]

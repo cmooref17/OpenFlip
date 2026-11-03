@@ -10,6 +10,8 @@ conversation class itself).
 Routing contract (must stay in sync with agent._VALID_PROVIDERS):
   - "anthropic" → AnthropicConversation (OAuth via Claude Code creds)
   - "openai"    → OpenAIConversation (API key, Chat Completions)
+  - "claude_code" → ClaudeCodeConversation (the real Claude Code binary via
+    the Claude Agent SDK; Claude Code holds the login, OpenFlip never does)
   - anything else (including the "ollama" default) → DiscordConversation.
     Falling through to ollama for unknown values preserves the historical
     behavior; agent.py's normalizer already warns on unknown providers at
@@ -31,6 +33,9 @@ def conversation_class(provider: str) -> type:
     if provider == "openai":
         from .openai_conversation import OpenAIConversation
         return OpenAIConversation
+    if provider == "claude_code":
+        from .claude_code_conversation import ClaudeCodeConversation
+        return ClaudeCodeConversation
     from .conversation import DiscordConversation
     return DiscordConversation
 
@@ -43,7 +48,7 @@ def chat_message_class(provider: str) -> type:
     anthropic_conversation (OpenAIConversation reuses it — see that module's
     import note); ollama uses its own from the vendored ollama_api package.
     """
-    if provider in ("anthropic", "openai"):
+    if provider in ("anthropic", "openai", "claude_code"):
         from .anthropic_conversation import ChatMessage
         return ChatMessage
     from .ollama_api import ChatMessage

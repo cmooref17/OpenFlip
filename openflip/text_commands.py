@@ -478,8 +478,8 @@ async def _do_model(runner, arg, channel, transport, session_id) -> None:
     # panel does. When the provider changes, clear this agent's live
     # conversations: Ollama / Anthropic / OpenAI histories aren't compatible.
     old_model = agent.model
-    new_provider = _provider_for_model(new_model)
     old_provider = agent.provider
+    new_provider = _provider_for_model(new_model, current=old_provider)
     agent.model = new_model
     agent.provider = new_provider
     if new_provider != old_provider:
@@ -555,7 +555,7 @@ async def _do_status(runner, ch_id, channel, transport, session_id) -> None:
     if usage:
         total = usage["total_input"]
         lines.append(f"• Context: {total:,} / {window:,}")
-        if agent.provider in ("anthropic", "openai"):
+        if agent.provider in ("anthropic", "openai", "claude_code"):
             lines.append(
                 f"• Cache: read {usage['cache_read_input_tokens']:,} • "
                 f"create {usage['cache_creation_input_tokens']:,}"

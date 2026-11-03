@@ -429,7 +429,7 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
             lines.append(f"• Context: {total:,} / {window:,}")
             # Cache stats only meaningful for anthropic + openai (ollama
             # always 0). Both populate the same cache_* keys in last_usage.
-            if agent.provider in ("anthropic", "openai"):
+            if agent.provider in ("anthropic", "openai", "claude_code"):
                 lines.append(
                     f"• Cache: read {usage['cache_read_input_tokens']:,} • "
                     f"create {usage['cache_creation_input_tokens']:,}"

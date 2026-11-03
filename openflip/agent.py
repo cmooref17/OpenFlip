@@ -21,7 +21,7 @@ _SHARED_PREFIX = "_shared/"
 # A typo like "antropic" or the stale "claude-cli" would therefore route
 # SILENTLY to ollama — _valid_provider warns on an unknown value instead so the
 # mistake surfaces at load instead of as mysterious wrong-provider behavior.
-_VALID_PROVIDERS = frozenset({"ollama", "anthropic", "openai"})
+_VALID_PROVIDERS = frozenset({"ollama", "anthropic", "openai", "claude_code"})
 
 
 def _valid_provider(raw: Any, *, agent_id: str) -> str:

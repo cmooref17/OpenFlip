@@ -9,7 +9,7 @@ schedule.
 
 - **Chat transports** — each agent is a Discord bot; iMessage is also supported
   on macOS. One agent can listen on multiple transports at once.
-- **Model providers** — Anthropic API (Claude) or a local Ollama server,
+- **Model providers** — Anthropic API (Claude), the Claude Code binary via the Agent SDK (`claude_code`, see `docs/claude_code_provider.md`), or a local Ollama server,
   per-agent and per-model configurable (reasoning effort, context, etc.).
 - **Tools** — file access, web search/fetch, sending messages, and a drop-in
   `openflip/tools/` plugin system, all gated by per-agent/per-user ACLs.

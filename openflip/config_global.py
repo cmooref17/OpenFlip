@@ -606,6 +606,7 @@ def get_openai_default_model() -> str:
 # default). Bumping a specific model's window means adding it to config.json.
 _DEFAULT_CONTEXT_WINDOW_BY_PROVIDER = {
     "anthropic": 200_000,
+    "claude_code": 200_000,
     "openai": 128_000,
     "ollama": 32_000,
 }
@@ -742,7 +743,7 @@ def get_effort(model_name: str, provider: str = "") -> str | None:
     """
     if provider == "openai":
         valid = _VALID_OPENAI_EFFORT_LEVELS
-    elif provider and provider != "anthropic":
+    elif provider and provider not in ("anthropic", "claude_code"):
         return None
     else:
         valid = _VALID_EFFORT_LEVELS
