@@ -156,14 +156,24 @@ them), not in any agent.json.
 
 ## Provider + model
 
-- `provider` — `"anthropic"`, `"openai"`, or `"ollama"`. Default
-  `"ollama"`. Picks which conversation class wraps the agent (routing
-  lives in `openflip/providers.py`): `AnthropicConversation` for direct
-  API calls through the operator's Claude OAuth, `OpenAIConversation`
-  for direct OpenAI calls (ChatGPT-subscription OAuth preferred, API key
-  as fallback — see the openai-provider section below), or
-  `DiscordConversation` (Ollama-backed) for local models. All three are
-  NATIVE providers — the agent's own turns run on that API.
+- `provider` — `"anthropic"`, `"claude_code"`, `"openai"`, or `"ollama"`.
+  Default `"ollama"`. Picks which conversation class wraps the agent
+  (routing lives in `openflip/providers.py`): `AnthropicConversation` for
+  direct Anthropic API calls (auth mode set by `anthropic_auth`, below),
+  `ClaudeCodeConversation` to run the agent on the real Claude Code
+  binary through the Claude Agent SDK (see the claude_code-provider
+  section below), `OpenAIConversation` for direct OpenAI calls
+  (ChatGPT-subscription OAuth preferred, API key as fallback — see the
+  openai-provider section below), or `DiscordConversation`
+  (Ollama-backed) for local models.
+- `anthropic_auth` — `"anthropic"` provider only. `"oauth"` (default, the
+  legacy path using Claude Code's stored login) or `"api_key"` (a plain
+  Anthropic API client: `x-api-key`, openflip's own user agent, no Claude
+  Code headers or billing block). Falls back to
+  `integrations.anthropic.auth` in config.json, then `"oauth"`. The key
+  comes from `integrations.anthropic.api_key` or `ANTHROPIC_API_KEY`.
+  Memory recall and `web_search` follow the same mode. The oauth path is
+  kept as the legacy option and is planned for deprecation.
 - `model` — provider-specific model name. **For Anthropic, the working
   format is `anthropic/<model-id>[-1m]`** — note the `anthropic/` provider
   prefix (stripped by `_normalize_model` before the API call) and the
@@ -199,6 +209,34 @@ them), not in any agent.json.
   effort <level>` (owner-only, Anthropic + OpenAI), which wins over the
   model config. See "What's the current model / context window?" and
   "`/session` — per-conversation overrides" below.
+
+### The "claude_code" provider — setup + what's supported
+
+Runs the agent on the unmodified Claude Code binary via the Claude Agent
+SDK (`claude-agent-sdk`, pinned in `requirements.txt`, bundles its own
+Claude Code). Claude Code holds the login; openflip never reads, stores
+or refreshes a credential on this provider. Full design, config keys and
+measured numbers: `docs/claude_code_provider.md`.
+
+Setup: install requirements **into the venv the gateway actually runs
+from** (check `ps` for the python path; a wrong venv shows as
+`No module named 'claude_agent_sdk'` and a "streaming-cleanup error" on
+the first turn), log in once as the gateway's OS user (`claude auth
+login`, or `claude setup-token` + `CLAUDE_CODE_OAUTH_TOKEN` on a headless
+box), then set `"provider": "claude_code"` and restart. A healthy agent
+logs `claude_code: client connected` and one `claude_code usage:` line
+per turn.
+
+How it differs: one Claude Code session per conversation (resumed by id
+from the `.meta.json` sidecar; a lost session is reseeded from history
+automatically); Claude Code runs the tool loop, but every tool call still
+goes through openflip's executor (ACL, locks, dry-run, posting
+unchanged); Claude Code's built-in tools are off; `/compact`, `/undo`,
+`/reset`, `/stop` are supported; `/uncompact`, sticky `tool_choice` and
+request dumps are not. Each live conversation is a ~220 MB child process,
+dropped after `claude_code.idle_disconnect_s` (default 600) idle.
+Rollback: set `provider` back to `"anthropic"` and restart; the JSONL
+history is shared.
 
 ### The "openai" provider — setup + what's supported
 
@@ -2521,6 +2559,10 @@ Defense in depth against path traversal via the unsigned marker.
 ---
 
 # 13. OAuth & credentials (Anthropic provider)
+
+This section covers the legacy `anthropic_auth: "oauth"` path only. The
+`"api_key"` mode uses a Console API key, and the `claude_code` provider
+leaves credentials entirely to Claude Code (see "Provider + model").
 
 ## Where creds live
 
