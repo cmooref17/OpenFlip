@@ -155,7 +155,7 @@ class RecallState:
 
 
 async def recall_block(agent_dir: str, query: str, state: RecallState, *, agent_id: str = "",
-                       provider: str = "") -> str:
+                       provider: str = "", anthropic_auth: str = "") -> str:
     """Pick relevant topic files for `query`; return the block ('' if none).
     Never raises."""
     from .memory_recall_api import recall_enabled, selector_model, call_selector
@@ -167,13 +167,19 @@ async def recall_block(agent_dir: str, query: str, state: RecallState, *, agent_
             return ""
         cands = [c for c in list_candidates(agent_dir) if c["filename"] not in state.surfaced]
         _cc = (provider == "claude_code")
+        _api = (anthropic_auth == "api_key")
         model = selector_model(provider=provider) if _cc else selector_model()
         if not cands or not model:
             return ""
         started = time.time()
+        if _cc:
+            _call = call_selector(model, format_candidates(cands), query[:4000], provider=provider)
+        elif _api:
+            _call = call_selector(model, format_candidates(cands), query[:4000], anthropic_auth="api_key")
+        else:
+            _call = call_selector(model, format_candidates(cands), query[:4000])
         answer = await asyncio.wait_for(
-            call_selector(model, format_candidates(cands), query[:4000], provider=provider)
-            if _cc else call_selector(model, format_candidates(cands), query[:4000]),
+            _call,
             timeout=SELECTOR_TIMEOUT_S + 5,
         )
         by_name = {c["filename"]: c for c in cands}

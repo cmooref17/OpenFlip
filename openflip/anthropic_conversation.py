@@ -220,6 +220,51 @@ def _detect_claude_code_version() -> str:
 _DETECTED_CC_VERSION = _detect_claude_code_version()
 _DEFAULT_USER_AGENT = f"claude-code/{_DETECTED_CC_VERSION}"
 _DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
+# User agent for the plain API-key path: openflip identifies as itself.
+_API_KEY_USER_AGENT = "openflip-anthropic"
+
+
+def auth_mode_for(agent) -> str:
+    """Resolve the auth mode for an agent on this provider ("oauth" | "api_key")."""
+    from .config_global import get_anthropic_auth_mode
+    return get_anthropic_auth_mode(getattr(agent, "anthropic_auth", None))
+
+
+def build_auth(mode: str, *, access_token: str | None = None, api_key: str | None = None,
+               wants_1m: bool = False) -> tuple[dict, list[dict]]:
+    """Headers + leading system blocks for one /v1/messages request.
+
+    "api_key": a normal Anthropic API client — `x-api-key`, only the real
+    public betas the body uses, openflip's own user agent, NO billing block.
+    "oauth":   the historical Claude-Code-login path, byte-for-byte as before.
+    """
+    betas = ["extended-cache-ttl-2025-04-11", "compact-2026-01-12"]
+    if mode == "api_key":
+        if wants_1m:
+            betas.append("context-1m-2025-08-07")
+        headers = {
+            "x-api-key": api_key or "",
+            "anthropic-version": _DEFAULT_ANTHROPIC_VERSION,
+            "anthropic-beta": ",".join(betas),
+            "User-Agent": _API_KEY_USER_AGENT,
+            "content-type": "application/json",
+        }
+        return headers, []
+    betas = ["claude-code-20250219", "oauth-2025-04-20"] + betas
+    if wants_1m:
+        betas.append("context-1m-2025-08-07")
+    headers = {
+        "authorization": f"Bearer {access_token}",
+        "anthropic-version": _DEFAULT_ANTHROPIC_VERSION,
+        "anthropic-beta": ",".join(betas),
+        "User-Agent": _DEFAULT_USER_AGENT,
+        "content-type": "application/json",
+    }
+    billing = {
+        "type": "text",
+        "text": f"x-anthropic-billing-header: cc_version={_DETECTED_CC_VERSION}; cc_entrypoint=sdk-cli; cch=00000;",
+    }
+    return headers, [billing]
 _CLAUDE_CODE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 _OAUTH_REFRESH_URL = "https://platform.claude.com/v1/oauth/token"
 # 5 min eager refresh leeway — matches Claude Code's `mB()` function in cli.js
@@ -2091,13 +2136,27 @@ class AnthropicConversation(SessionOverridesMixin):
         if _retry_attempt == 0:
             self.compacted_this_turn = False
 
-        access_token = await _load_oauth_access_token()
-        if not access_token:
-            yield FrameworkErrorEvent(
-                message=f"⚠️ Anthropic OAuth token unavailable — check {_CREDS_PATH}.",
-                kind="auth",
-            )
-            return
+        _auth_mode = auth_mode_for(self.agent)
+        access_token: str | None = None
+        _api_key: str | None = None
+        if _auth_mode == "api_key":
+            from .config_global import get_anthropic_api_key
+            _api_key = get_anthropic_api_key()
+            if not _api_key:
+                yield FrameworkErrorEvent(
+                    message="⚠️ Anthropic API key not configured — set integrations.anthropic.api_key "
+                            "in config.json or ANTHROPIC_API_KEY (agent is on anthropic_auth: api_key).",
+                    kind="auth",
+                )
+                return
+        else:
+            access_token = await _load_oauth_access_token()
+            if not access_token:
+                yield FrameworkErrorEvent(
+                    message=f"⚠️ Anthropic OAuth token unavailable — check {_CREDS_PATH}.",
+                    kind="auth",
+                )
+                return
 
         # See chat() — trim only fires on retry-after-overflow.
         # Auto-compact gate: if the last turn's measured total_input was
@@ -2218,21 +2277,24 @@ class AnthropicConversation(SessionOverridesMixin):
                 }]
             }
 
-        # Billing block (claude-cli routing) + cached system prompt.
-        _BILLING_BLOCK = {
-            "type": "text",
-            "text": f"x-anthropic-billing-header: cc_version={_DETECTED_CC_VERSION}; cc_entrypoint=sdk-cli; cch=00000;",
-        }
-        system_blocks = [_BILLING_BLOCK]
+        # Auth-mode-specific headers + leading system blocks (the oauth path
+        # carries its billing block; the api_key path carries none), then the
+        # cached system prompt.
+        headers, system_blocks = build_auth(
+            _auth_mode, access_token=access_token, api_key=_api_key,
+            wants_1m=self._wants_1m_context(),
+        )
+        system_blocks = list(system_blocks)
         if system_prompt:
             system_blocks.append({
                 "type": "text",
                 "text": system_prompt,
                 "cache_control": {"type": "ephemeral", "ttl": "1h"},
             })
-        else:
+        elif system_blocks:
             system_blocks[0]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-        body["system"] = system_blocks
+        if system_blocks:
+            body["system"] = system_blocks
 
         if tool_schemas:
             body["tools"] = tool_schemas
@@ -2264,27 +2326,9 @@ class AnthropicConversation(SessionOverridesMixin):
                         }
                     ]
 
-        # Headers — must mirror chat()'s beta flag set. The streaming path
-        # previously omitted `claude-code-20250219`, `oauth-2025-04-20`, and
-        # `compact-2026-01-12`, which caused 400s whenever `force_compact_next`
-        # was True because `compact_20260112` requires the `compact-2026-01-12`
-        # beta to be enabled. Keep this list in sync with chat()'s _beta_flags.
-        _beta_flags = [
-            "claude-code-20250219",
-            "oauth-2025-04-20",
-            "extended-cache-ttl-2025-04-11",
-            "compact-2026-01-12",
-        ]
-        if self._wants_1m_context():
-            _beta_flags.append("context-1m-2025-08-07")
-        headers = {
-            "authorization": f"Bearer {access_token}",
-            "anthropic-version": _DEFAULT_ANTHROPIC_VERSION,
-            "anthropic-beta": ",".join(_beta_flags),
-            "User-Agent": _DEFAULT_USER_AGENT,
-            "content-type": "application/json",
-        }
-
+        # Headers were built with the system blocks above (build_auth). The
+        # `compact-2026-01-12` beta must stay in both modes: `compact_20260112`
+        # in the body 400s without it.
         session = await self._ensure_http_session()
 
         # Request dump (same as chat()) — minimal vs full controlled by env.
@@ -2359,6 +2403,12 @@ class AnthropicConversation(SessionOverridesMixin):
                 if status != 200:
                     # Read full error body for messaging.
                     text = await resp.text()
+                    if status == 401 and _auth_mode == "api_key":
+                        yield FrameworkErrorEvent(
+                            message="⚠️ Anthropic API key rejected (401). Check integrations.anthropic.api_key / ANTHROPIC_API_KEY.",
+                            kind="auth",
+                        )
+                        return
                     if status == 401:
                         # Try one refresh + recursive retry.
                         if _retry_attempt == 0:

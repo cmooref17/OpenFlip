@@ -41,7 +41,8 @@ def selector_model(provider: str = "") -> str:
     return "sonnet" if provider == "claude_code" else ""
 
 
-async def call_selector(model: str, candidates_text: str, query: str, *, provider: str = "") -> str:
+async def call_selector(model: str, candidates_text: str, query: str, *, provider: str = "",
+                        anthropic_auth: str = "") -> str:
     """Return the selector's raw text answer. Raises on any failure (the
     caller swallows and logs). On the claude_code provider the selector is a
     one-shot Claude Code query (no OAuth handling here)."""
@@ -49,20 +50,23 @@ async def call_selector(model: str, candidates_text: str, query: str, *, provide
         from .claude_code_conversation import call_selector as _cc_selector
         return await _cc_selector(model, candidates_text, query)
     import aiohttp
-    from .anthropic_conversation import (
-        _load_oauth_access_token, _DEFAULT_API_BASE, _DEFAULT_ANTHROPIC_VERSION,
-        _DEFAULT_USER_AGENT, _DETECTED_CC_VERSION,
-    )
+    from .anthropic_conversation import _load_oauth_access_token, _DEFAULT_API_BASE, build_auth
     from .utils import http_session
-    token = await _load_oauth_access_token()
-    if not token:
-        raise RuntimeError("OAuth token unavailable")
+    if anthropic_auth == "api_key":
+        from .config_global import get_anthropic_api_key
+        key = get_anthropic_api_key()
+        if not key:
+            raise RuntimeError("Anthropic API key not configured")
+        headers, prefix_blocks = build_auth("api_key", api_key=key)
+    else:
+        token = await _load_oauth_access_token()
+        if not token:
+            raise RuntimeError("OAuth token unavailable")
+        headers, prefix_blocks = build_auth("oauth", access_token=token)
     body = {
         "model": model,
         "max_tokens": SELECTOR_MAX_TOKENS,
-        "system": [
-            {"type": "text", "text": (f"x-anthropic-billing-header: cc_version={_DETECTED_CC_VERSION}; "
-                                      f"cc_entrypoint=sdk-cli; cch=00000;")},
+        "system": list(prefix_blocks) + [
             {"type": "text", "text": SELECTOR_SYSTEM},
         ],
         "messages": [
@@ -71,13 +75,6 @@ async def call_selector(model: str, candidates_text: str, query: str, *, provide
             {"role": "user", "content": (f"Select memories relevant to:\n{query}\n\n"
                                          "Answer with JSON only: {\"selected_memories\": [\"<filename>\", ...]}")},
         ],
-    }
-    headers = {
-        "authorization": f"Bearer {token}",
-        "anthropic-version": _DEFAULT_ANTHROPIC_VERSION,
-        "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
-        "User-Agent": _DEFAULT_USER_AGENT,
-        "content-type": "application/json",
     }
     session = await http_session()
     async with session.post(f"{_DEFAULT_API_BASE}/v1/messages", json=body, headers=headers,

@@ -50,6 +50,7 @@ are shared (same JSONL mirror); the Claude Code session is simply left behind.
 | Memory recall | selector = one-shot `query()` on Claude Code (`memory_recall.model`, default `sonnet`) |
 | Usage | `/usage` ledger row per turn from the result's usage (+ `model_usage`, `total_cost_usd` in `raw_usage`); `/status` context = last request's input |
 | Operator soft-inject | PreToolUse hook denies further tool calls once a message is queued (batch interrupt) |
+| `web_search` tool | backend `anthropic`/`auto` runs as a one-shot Claude Code query using its built-in WebSearch (no direct Messages call from openflip); SearXNG backend unchanged |
 
 Not available on this provider: `/uncompact`, sticky `tool_choice` forcing,
 request dumps (`OPENFLIP_REQUEST_DUMP`; use `OTEL_LOG_RAW_API_BODIES=file:<dir>`
@@ -72,6 +73,14 @@ is Claude Code).
 | resume by session id | memory intact, same id; `set_model("sonnet")` live switch works |
 | image content block | works ("Red") |
 | one-shot selector (`query()`, max_turns=1) | 2.4 s |
+
+## The `anthropic` provider beside it
+
+The old provider stays selectable and now has two auth modes per agent
+(`anthropic_auth` in agent.json, or `integrations.anthropic.auth` in config.json):
+`api_key` is a plain API client (x-api-key, openflip user agent, no Claude Code
+headers or billing block); `oauth` is the historical path, unchanged. Memory
+recall and `web_search` follow the same mode. See SETUP.md §10.
 
 ## Tests
 

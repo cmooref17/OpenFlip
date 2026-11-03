@@ -567,6 +567,8 @@ class Agent:
     # supplies only a prompt + optional context, never tools or a session.
     trigger: dict = field(default_factory=lambda: {**_TRIGGER_DEFAULTS, "allowed_tools": []})
     provider: str = "ollama"
+    # "oauth" | "api_key" | None (None = config.json / default). anthropic only.
+    anthropic_auth: str | None = None
     think: bool | None = None
     # Path ACLs accept EITHER a flat list (historical form, applies to
     # everyone) OR an opt-in dict that is TRANSPORT-KEYED, structurally
@@ -697,6 +699,9 @@ class Agent:
             proactive=_parse_proactive(data.get("proactive")),
             trigger=_parse_trigger(data.get("trigger")),
             provider=_valid_provider(data.get("provider"), agent_id=agent_id),
+            anthropic_auth=(str(data["anthropic_auth"]).strip().lower()
+                            if isinstance(data.get("anthropic_auth"), str) and data.get("anthropic_auth").strip()
+                            else None),
             think=data.get("think", None),
             allowed_read_paths=read_paths,
             allowed_write_paths=write_paths,
@@ -733,6 +738,7 @@ class Agent:
             "display_name": self.display_name,
             "model": self.model,
             "provider": self.provider,
+            **({"anthropic_auth": self.anthropic_auth} if self.anthropic_auth else {}),
             "system_files": self.system_files,
             "ollama_options": self.ollama_options,
             "tool_response_mode": self.tool_response_mode,

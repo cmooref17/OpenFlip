@@ -13,6 +13,7 @@ from .conversation import DiscordConversation
 from .anthropic_conversation import AnthropicConversation, MalformedRequestError
 from .openai_conversation import OpenAIConversation
 from .providers import make_conversation, chat_message_class
+from .anthropic_conversation import auth_mode_for
 from .pipeline import build_user_prompt, should_respond, build_visible_tools, build_api_tool_funcs, extract_image_attachments, build_inbound_from_discord, strip_memory_tools
 from .session import InboundMessage, Session, WorkerOutcome
 from .tool_executor import execute_tool_calls, build_model_feedback
@@ -2823,6 +2824,7 @@ class AgentRunner:
                     _recalled = await recall_block(
                         os.path.dirname(agent.path), user_text, _rstate, agent_id=agent.id,
                         provider=agent.provider or "",
+                        anthropic_auth=(auth_mode_for(agent) if (agent.provider or "") == "anthropic" else ""),
                     )
                 if _recalled:
                     framed_user = f"{framed_user}\n\n{_recalled}"

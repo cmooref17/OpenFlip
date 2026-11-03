@@ -245,6 +245,17 @@ export ANTHROPIC_API_KEY=sk-ant-xxx...
 
 To persist: add that line to `~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`.
 
+The `anthropic` provider has two auth modes, chosen per agent:
+
+| `anthropic_auth` | What is sent | Credential |
+|---|---|---|
+| `"api_key"` | a plain Anthropic API request (`x-api-key`, openflip's own user agent, no Claude Code headers) | `integrations.anthropic.api_key` in config.json, or `ANTHROPIC_API_KEY` |
+| `"oauth"` (default) | the historical path using Claude Code's stored login | Claude Code's credentials on this machine |
+
+Set it in `agents/<id>/agent.json` (`"anthropic_auth": "api_key"`) or for every
+anthropic agent at once in config.json (`"integrations": {"anthropic": {"auth": "api_key", "api_key": "sk-ant-..."}}`).
+The agent value wins. Memory recall's selector call follows the same mode.
+
 ## 10a. Claude Code provider (`provider: "claude_code"`)
 
 Runs the agent on the real Claude Code binary through the Claude Agent SDK.

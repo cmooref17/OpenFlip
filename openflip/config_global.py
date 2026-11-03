@@ -552,6 +552,38 @@ def get_max_tool_turns() -> int:
     return max(10, n)
 
 
+_VALID_ANTHROPIC_AUTH = ("oauth", "api_key")
+
+
+def get_anthropic_auth_mode(agent_value=None) -> str:
+    """How the `anthropic` provider authenticates: "oauth" (Claude Code's
+    stored login, the historical path) or "api_key" (a Console API key,
+    plain API client — no Claude Code imitation in the request).
+
+    Precedence: agent.json `anthropic_auth` > config.json
+    `integrations.anthropic.auth` > "oauth" (unchanged default)."""
+    for raw in (agent_value, ((get_config().get("integrations") or {}).get("anthropic") or {}).get("auth")):
+        if isinstance(raw, str) and raw.strip().lower() in _VALID_ANTHROPIC_AUTH:
+            return raw.strip().lower()
+    return "oauth"
+
+
+def get_anthropic_api_key() -> str:
+    """Return the Anthropic API key for `anthropic_auth: "api_key"`, or "".
+
+    Lookup order:
+      1. `integrations.anthropic.api_key` in config.json
+      2. ANTHROPIC_API_KEY environment variable
+      3. "" (surfaces as an auth error at chat time)
+    """
+    cfg = get_config()
+    entry = (cfg.get("integrations") or {}).get("anthropic") or {}
+    key = entry.get("api_key")
+    if key:
+        return str(key).strip()
+    return os.environ.get("ANTHROPIC_API_KEY", "").strip()
+
+
 def get_openai_api_key() -> str:
     """Return the OpenAI API key, or "" if unconfigured.
 
