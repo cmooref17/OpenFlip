@@ -172,6 +172,10 @@ class ClaudeCodeConversation(SessionOverridesMixin):
                 self._cc_synced = max(0, min(int(cc.get("synced", 0) or 0), len(msgs)))
             except (TypeError, ValueError):
                 self._cc_synced = 0
+        else:
+            # No Claude Code session yet (agent migrated from another provider):
+            # the whole mirror is prior history to replay on the first turn.
+            self._cc_synced = len(msgs)
         if not msgs:
             return
         for entry in msgs:
@@ -215,7 +219,7 @@ class ClaudeCodeConversation(SessionOverridesMixin):
         print_ts("claude_code: history cut (/undo) — next turn reseeds a new session from the mirror",
                  agent=self.agent.id)
         self._cc_session_id = None
-        self._cc_synced = 0
+        self._cc_synced = len(self.messages)   # everything that survived is prior history
         self._drop_client()
         try:
             self._save_meta()
@@ -303,6 +307,25 @@ class ClaudeCodeConversation(SessionOverridesMixin):
             self._wants_1m_context(), tuple(tool_names),
         )
 
+    @staticmethod
+    def _is_missing_session_error(err: BaseException | str) -> bool:
+        text = str(err)
+        return "No conversation found with session ID" in text
+
+    def _reseed_session(self, reason: str):
+        """Forget the Claude Code session; the next connect starts a new one
+        seeded with the mirrored history (see _migration_preamble)."""
+        print_ts(f"{COLOR_YELLOW}claude_code: {reason} — starting a new session seeded from history{COLOR_END}",
+                 agent=self.agent.id)
+        self._cc_session_id = None
+        # _cc_synced stays: those messages were in the lost session, so they
+        # are exactly the history to replay.
+        self._client, self._client_sig = None, None
+        try:
+            self._save_meta()
+        except Exception:
+            pass
+
     async def _ensure_client(self, tool_names: list[str], think: bool | None):
         from claude_agent_sdk import ClaudeSDKClient
         prompt_text = self._system_prompt_text()
@@ -313,7 +336,17 @@ class ClaudeCodeConversation(SessionOverridesMixin):
         opts = self._build_options(prompt_text, tool_names, think, resume=self._cc_session_id)
         client = ClaudeSDKClient(opts)
         t0 = time.monotonic()
-        await client.connect()
+        try:
+            await client.connect()
+        except Exception as e:
+            if self._cc_session_id and self._is_missing_session_error(e):
+                await self._safe_disconnect(client)
+                self._reseed_session(f"session {self._cc_session_id[:8]} not found on this machine")
+                opts = self._build_options(prompt_text, tool_names, think, resume=None)
+                client = ClaudeSDKClient(opts)
+                await client.connect()
+            else:
+                raise
         self._client = client
         self._client_sig = sig
         self._client_tools = list(tool_names)
@@ -417,9 +450,9 @@ class ClaudeCodeConversation(SessionOverridesMixin):
     def _compose_prompt(self) -> tuple[str, list[dict]]:
         pending = self._pending_messages()
         parts: list[str] = []
-        if not self._cc_session_id and self._cc_synced == 0 and len(self.messages) > len(pending):
-            # First turn on Claude Code for a conversation with prior history.
-            self._cc_synced = len(self.messages) - len(pending)
+        if not self._cc_session_id and self._cc_synced > 0:
+            # New Claude Code session for a conversation with prior history
+            # (provider migration, /undo, or a lost session): replay the tail.
             pre = self._migration_preamble()
             if pre:
                 parts.append(pre)
@@ -455,10 +488,13 @@ class ClaudeCodeConversation(SessionOverridesMixin):
         return blocks
 
     # ------------------------------------------------------------ chat
-    async def _run_query(self, tools: list[Callable] | None, think: bool | None):
+    async def _run_query(self, tools: list[Callable] | None, think: bool | None, _reseeded: bool = False):
         """Send the pending prompt and yield every SDK message of the response.
         Handles /compact, session bookkeeping, idle timer and interrupt."""
         tool_names = [f.__name__ for f in (tools or [])]
+        synced_before = self._cc_synced
+        images_before = list(self._pending_image_attachments or [])
+        had_session = bool(self._cc_session_id)
         client = await self._ensure_client(tool_names, think)
         prompt_text, images = self._compose_prompt()
         if not prompt_text.strip() and not images:
@@ -484,6 +520,19 @@ class ClaudeCodeConversation(SessionOverridesMixin):
             self._cc_synced = len(self.messages)
             async for m in client.receive_response():
                 yield m
+        except Exception as e:
+            if (had_session and not _reseeded and not isinstance(e, asyncio.CancelledError)
+                    and self._is_missing_session_error(e)):
+                # The resumed session vanished under us (project dir cleaned,
+                # different machine). Rebuild once from the mirror and resend.
+                await self._safe_disconnect(client)
+                self._reseed_session("resumed session rejected")
+                self._cc_synced = synced_before
+                self._pending_image_attachments = images_before
+                async for m in self._run_query(tools, think, _reseeded=True):
+                    yield m
+                return
+            raise
         except asyncio.CancelledError:
             # /stop or a runtime timeout cancelled the turn: stop Claude Code
             # too, then drain so the next query starts clean.

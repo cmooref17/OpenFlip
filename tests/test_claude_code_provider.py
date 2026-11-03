@@ -104,6 +104,8 @@ class FakeClient:
         FakeClient.instances.append(self)
 
     async def connect(self):
+        if getattr(self.options, "resume", None) == "gone-1":
+            raise RuntimeError("Command failed: No conversation found with session ID: gone-1")
         self.connected = True
 
     async def disconnect(self):
@@ -272,11 +274,32 @@ def main() -> int:
     check("compacted flag set + force flags cleared", conv.compacted_this_turn and not conv.force_compact_next)
     # /undo → on_history_cut → fresh session seeded from the mirror.
     conv.on_history_cut()
-    check("undo clears session + synced", conv._cc_session_id is None and conv._cc_synced == 0)
+    check("undo clears session, survivors become history", conv._cc_session_id is None and conv._cc_synced == len(conv.messages))
     conv.messages.append(ChatMessage("user", "owner: new question"))
     prompt, _imgs = conv._compose_prompt()
     check("reseed prompt replays migrated history", prompt.startswith("[FRAMEWORK]: Earlier history") and "owner: please ping 5" in prompt and prompt.rstrip().endswith("owner: new question"))
     check("reseed does not replay the new message as history", prompt.count("owner: new question") == 1)
+
+    # Missing session on resume → reseed a fresh session from the mirror, same turn.
+    conv3 = ccc.ClaudeCodeConversation("discord:77", ag)
+    conv3.messages.append(ChatMessage("user", "owner: earlier question"))
+    conv3.messages.append(ChatMessage("assistant", "earlier answer"))
+    conv3._cc_session_id = "gone-1"
+    conv3._cc_synced = 2
+    conv3.messages.append(ChatMessage("user", "owner: are you there?"))
+    conv3._cc_turn = _turn(conv3, channel)
+    FakeClient.script = [[SystemMessage(subtype="init", data={"session_id": "fresh-1"}),
+                          AssistantMessage(content=[TextBlock("yes")], model="claude-opus-5-5", usage=usage2),
+                          _result(session_id="fresh-1", stop_reason="end_turn", usage=usage2)]]
+    out3 = asyncio.run(conv3.chat(tools=[]))
+    conv3._cc_turn = None
+    c3 = FakeClient.instances[-1]
+    check("missing session: turn still succeeds", out3.content_text == "yes" and not out3.is_framework_error)
+    check("missing session: reconnected without resume", c3.options.resume is None and c3.connected)
+    check("missing session: new session id adopted", conv3._cc_session_id == "fresh-1")
+    check("missing session: prompt replays history then the new message once",
+          c3.queries and c3.queries[-1].startswith("[FRAMEWORK]: Earlier history") and "earlier answer" in c3.queries[-1]
+          and c3.queries[-1].count("owner: are you there?") == 1)
 
     print("\n(d) failures")
     conv2 = ccc.ClaudeCodeConversation("discord:9", ag)

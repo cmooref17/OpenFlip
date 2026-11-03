@@ -44,6 +44,7 @@ are shared (same JSONL mirror); the Claude Code session is simply left behind.
 | Images | inbound attachments go in as image content blocks on the user message |
 | `/compact` | sends Claude Code's own `/compact` before the next prompt; auto-compaction is Claude Code's (PreCompact hook flags it so the usual notice + `[FRAMEWORK]` note fire) |
 | `/undo` | runtime calls `on_history_cut()`; the next turn starts a NEW session seeded with the surviving mirror (`migrate_history_chars`) |
+| Lost session | a resume that Claude Code rejects ("No conversation found with session ID", e.g. its project dir was cleaned or the box changed) is retried once in the same turn as a NEW session seeded from the mirror |
 | `/reset` | deletes mirror + meta, drops the session |
 | `/stop` | task cancellation → `client.interrupt()` |
 | `/model`, `/effort`, `/session set` | model, effort, memory, activity_status, error_display, error_message (context window / compaction trigger / max_tokens are Claude Code's) |
