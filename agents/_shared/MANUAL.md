@@ -911,10 +911,14 @@ problem.
   with_attachments: bool = False)`** — delete a Discord message by ID,
   or find-and-delete the bot's most recent message if both IDs are 0.
   Cross-channel deletion is owner-only.
-- **`fetch_discord_message(url: str)`** — fetch a Discord message URL
-  or a Discord CDN image URL. Returns author/content/attachment URLs.
-  Image attachments are downloaded and queued for vision on the next
-  model iteration.
+- **`fetch_discord_message(url: str)`** — fetch a Discord message URL,
+  a Discord CDN image URL, or any public http(s) image URL. Message URLs
+  return author/content/attachment URLs. Images (message attachments, CDN
+  links, and plain web image links) are downloaded and queued for vision
+  on the next model iteration. Web image links reuse `fetch_url`'s SSRF
+  guard: private/internal addresses are owner/admin-only, the connection
+  is pinned to the vetted IP, every redirect hop is re-checked, non-image
+  content types are refused, and downloads are capped at 20 MB.
 
 ## Multi-agent
 

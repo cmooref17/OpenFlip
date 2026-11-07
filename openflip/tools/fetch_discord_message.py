@@ -85,6 +85,108 @@ async def _queue_image_bytes_for_vision(
     return True, None
 
 
+_MAX_PUBLIC_IMAGE_BYTES = 20 * 1024 * 1024
+_MAX_PUBLIC_REDIRECTS = 5
+_EXT_FOR_CT = {'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp'}
+
+
+def _conv_for_current_turn(runner):
+    """The live conversation object for the current turn, or None."""
+    try:
+        from ..tool_executor import CURRENT_CHANNEL_ID, CURRENT_SESSION
+        session = CURRENT_SESSION.get(None)
+        if session is not None and session.transport == "discord":
+            ch_id = session.channel_id_int
+        else:
+            ch_id = int(CURRENT_CHANNEL_ID.get())
+        return runner.conversations.get(runner.conv_key(ch_id))
+    except (LookupError, KeyError, ValueError):
+        return None
+
+
+async def _download_public_image(url: str) -> tuple[bytes | None, str, str]:
+    """Download an image from an arbitrary http(s) URL.
+
+    Uses fetch_url's SSRF guard (resolve once, refuse private/internal
+    addresses for non-owner/admin callers, pin the connection to the vetted
+    IP, re-check every redirect hop). Returns (data, content_type, error).
+    """
+    from urllib.parse import urljoin, urlparse
+    import aiohttp
+    from .fetch_url import _BROWSER_HEADERS, _caller_is_owner_or_admin, _resolve_and_vet_host
+
+    privileged = _caller_is_owner_or_admin()
+    current = url
+    async with aiohttp.ClientSession() as http:
+        for _hop in range(_MAX_PUBLIC_REDIRECTS + 1):
+            parsed = urlparse(current)
+            if parsed.scheme not in ('http', 'https'):
+                return None, '', f'Unsupported URL scheme in {current}.'
+            host = parsed.hostname or ''
+            req_url = current
+            headers = dict(_BROWSER_HEADERS)
+            headers['Accept'] = 'image/avif,image/webp,image/png,image/*;q=0.9,*/*;q=0.5'
+            headers['Sec-Fetch-Dest'] = 'image'
+            kwargs: dict = {}
+            if not privileged:
+                internal, pinned = await _resolve_and_vet_host(host)
+                if internal:
+                    return None, '', f'Refusing internal/private address {host} (owner/admins only).'
+                if not pinned:
+                    return None, '', f'Could not resolve host {host}.'
+                port = parsed.port
+                ip = f'[{pinned}]' if ':' in pinned else pinned
+                req_url = parsed._replace(netloc=ip + (f':{port}' if port else '')).geturl()
+                headers['Host'] = (f'[{host}]' if ':' in host else host) + (f':{port}' if port else '')
+                if parsed.scheme == 'https':
+                    kwargs['server_hostname'] = host
+            async with http.get(
+                req_url, headers=headers, allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=20), **kwargs,
+            ) as resp:
+                loc = resp.headers.get('Location')
+                if resp.status in (301, 302, 303, 307, 308) and loc:
+                    current = urljoin(current, loc)
+                    continue
+                if resp.status != 200:
+                    return None, '', f'HTTP {resp.status} from {host}.'
+                ct = (resp.content_type or '').lower()
+                if not ct.startswith('image/'):
+                    return None, '', f'URL is not an image (content-type: {ct or "unknown"}).'
+                chunks, total = [], 0
+                async for chunk in resp.content.iter_chunked(65536):
+                    total += len(chunk)
+                    if total > _MAX_PUBLIC_IMAGE_BYTES:
+                        return None, '', 'Image is larger than 20 MB.'
+                    chunks.append(chunk)
+                return b''.join(chunks), ct, ''
+    return None, '', f'Too many redirects (>{_MAX_PUBLIC_REDIRECTS}).'
+
+
+async def _fetch_public_image(url_s: str, agent, runner) -> ToolResult:
+    """Path C: any other http(s) image URL -> download (guarded) and queue for vision."""
+    try:
+        data, ct, err = await _download_public_image(url_s)
+    except Exception as e:
+        return ToolResult.fail(f'Failed to download image: {e}')
+    if data is None:
+        return ToolResult.fail(err)
+    base = url_s.split('?', 1)[0].split('#', 1)[0]
+    fn = (base.rsplit('/', 1)[-1] or 'image').lower()
+    if not any(fn.endswith(ext) for ext in _IMG_EXTS):
+        fn = (fn or 'image') + _EXT_FOR_CT.get(ct, '.png')
+    ok, reason = await _queue_image_bytes_for_vision(data, fn, ct, _conv_for_current_turn(runner))
+    if not ok:
+        return ToolResult.fail(f'Downloaded but rejected: {reason}')
+    print_ts(
+        f'{COLOR_YELLOW}fetch_discord_message: downloaded web image {fn} ({len(data)} bytes), queued for vision{COLOR_END}',
+        agent=agent.id,
+    )
+    return ToolResult(
+        model_feedback=f'Downloaded image ({fn}, {len(data)} bytes) and queued for vision. You will SEE it on your next iteration.',
+    )
+
+
 def _content_type_for(filename: str) -> str:
     fn = (filename or '').lower()
     if fn.endswith(('.jpg', '.jpeg')):
@@ -98,9 +200,9 @@ def _content_type_for(filename: str) -> str:
 
 @tool
 async def fetch_discord_message(url: str) -> ToolResult:
-    '''Fetch a Discord message OR a CDN image by URL.
+    '''Fetch a Discord message, a Discord CDN image, or any public image URL.
 
-    Two URL forms supported:
+    Three URL forms supported:
     1. Discord message URL (https://discord.com/channels/{guild}/{channel}/{message})
        — fetches the message, returns author/content/attachment URLs, and
        queues any image attachments for vision.
@@ -109,10 +211,14 @@ async def fetch_discord_message(url: str) -> ToolResult:
        re-inspect an image you previously produced (or the user attached) in
        a NEW turn — the URL of any prior tool output can be passed back here.
 
-    Either form queues the image for your vision on the next iteration.
+    3. Any other http(s) image URL (e.g. https://example.com/pic.png) — downloads
+       the image (SSRF-guarded like fetch_url: private/internal addresses are
+       owner/admin-only, every redirect hop is re-checked) and queues it.
+
+    Every form queues the image for your vision on the next iteration.
 
     Args:
-        url: A Discord message URL or a Discord CDN attachment URL.
+        url: A Discord message URL, a Discord CDN attachment URL, or an http(s) image URL.
     '''
     url_s = (url or '').strip()
 
@@ -173,7 +279,10 @@ async def fetch_discord_message(url: str) -> ToolResult:
     # the channel and message IDs from the URL.
     m = _URL_RE.match(url_s)
     if not m:
-        return ToolResult.fail('Not a valid Discord message or CDN URL.')
+        # Path C: any other http(s) URL is treated as a public image link.
+        if url_s.lower().startswith(('http://', 'https://')):
+            return await _fetch_public_image(url_s, agent, runner)
+        return ToolResult.fail('Not a Discord message URL, Discord CDN URL, or http(s) image URL.')
     _guild, channel_id_s, message_id_s = m.groups()
     channel_id = int(channel_id_s)
     message_id = int(message_id_s)
