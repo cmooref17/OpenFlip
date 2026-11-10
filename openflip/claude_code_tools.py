@@ -136,8 +136,9 @@ async def run_tool_call(turn: TurnContext, name: str, args: dict, tool_use_id: s
             agent=agent.id,
         )
         return _payload(
-            "Note: this tool call duplicates one already executed this turn and was "
-            "skipped. Either try a different approach or finalize your reply.",
+            "Note: this tool call exactly repeats one that already succeeded this turn, "
+            "so it was skipped; its result is above. If the task is not finished, continue "
+            "with the next step (change the arguments if you really need to repeat it).",
             is_error=True,
         )
 

@@ -387,6 +387,20 @@ NOT supported (deliberate differences — these commands answer
   empty `auth` (denied by default; owner sees them anyway via the
   Discord owner-bypass; broadens via `/grant`).
 
+**Repeated tool calls within one turn.** A call whose name + arguments exactly
+match one that already SUCCEEDED earlier in the same turn is skipped (failed
+calls stay retryable), and the model gets a note that its result is above and
+to continue with the next step. Exempt, because what they observe or act on
+changes between calls: `read_file`, `list_files`, `list_memory_files`,
+`read_memory`, `search_memory`, `fetch_discord_message`, `fetch_url`,
+`web_search`, `list_cron_jobs`, `list_snapshots`, `delete_message`,
+`run_command`, `run_command_sandbox` and `screen`. Add more (e.g. local tools)
+with config.json `dedupe_exempt_tools: ["tool_name", ...]`, read per turn.
+Runaway loops are still capped by `max_tool_turns` (default 300). Same rule on
+the anthropic and claude_code providers (`runtime.dedupe_exempt_tools()`).
+(Before 2026-11-10 `run_command`/`screen` repeats were skipped and the note
+said "finalize your reply", which ended turns mid-task.)
+
 ## Path ACLs
 
 These govern `read_file`, `write_file`, `edit_file`, `delete_file`,

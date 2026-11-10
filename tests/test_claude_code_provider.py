@@ -170,7 +170,9 @@ def main() -> int:
     check("provider routes to ClaudeCodeConversation", conversation_class("claude_code") is ccc.ClaudeCodeConversation)
     check("chat message class is the anthropic ChatMessage", chat_message_class("claude_code") is ChatMessage)
     check("override keys are SDK knobs only", PROVIDER_KEYS["claude_code"] == ("model", "effort", "memory", "activity_status", "error_display", "error_message"))
-    check("claude model accepted on claude_code", normalize_override("claude_code", "model", "claude-sonnet-5-5") == ("claude-sonnet-5-5", ""))
+    # model ids always carry their provider (2026-11-10): a bare claude id gets the provider prefixed
+    check("claude model accepted on claude_code", normalize_override("claude_code", "model", "claude-sonnet-5-5") == ("claude_code/claude-sonnet-5-5", ""))
+    check("prefixed claude_code id kept as-is", normalize_override("claude_code", "model", "claude_code/claude-sonnet-5-5") == ("claude_code/claude-sonnet-5-5", ""))
     check("openai model rejected on claude_code", normalize_override("claude_code", "model", "openai/gpt-5.2")[0] is None)
     check("context_window rejected on claude_code", normalize_override("claude_code", "context_window", "200k")[0] is None)
 
@@ -317,7 +319,11 @@ def main() -> int:
     p2 = asyncio.run(cct.run_tool_call(t2, "cc_test_ping", {"x": 7}, tool_use_id="b"))
     conv._cc_turn = None
     check("first call runs", "pong 7" in p1["content"][0]["text"] and not p1.get("is_error"))
-    check("duplicate call suppressed with a note", p2.get("is_error") and "duplicate" in p2["content"][0]["text"])
+    check("duplicate call suppressed with a note", p2.get("is_error") and "repeats" in p2["content"][0]["text"])
+    check("duplicate note never tells the model to stop", "finalize" not in p2["content"][0]["text"])
+    # tools that act on changing state are repeatable
+    t3 = _turn(conv, channel)
+    check("run_command / screen are dedupe-exempt", {"run_command", "screen"} <= t3.dedupe_exempt or {"run_command", "screen"} <= __import__("openflip.runtime", fromlist=["x"]).dedupe_exempt_tools())
     denied_turn = _turn(conv, channel)
     denied_turn.callable_names = set()
     conv._cc_turn = denied_turn

@@ -60,7 +60,28 @@ _DEDUPE_EXEMPT_TOOLS = {
     "read_file", "list_files", "list_memory_files", "read_memory",
     "search_memory", "fetch_discord_message", "fetch_url", "web_search",
     "list_cron_jobs", "list_snapshots",
+    # Tools that act on or observe state that changes between calls: the same
+    # shell command or the same screenshot/key press is meant to be repeated
+    # (poll a log, re-check a screen after waiting, press Enter twice). Blocking
+    # the repeat skipped real work and told the agent to finalize, which ended
+    # turns mid-task (2026-11-10). Runaway loops are still bounded by
+    # max_tool_turns. Extra exemptions come from config `dedupe_exempt_tools`.
+    "run_command", "run_command_sandbox", "screen",
 }
+
+
+def dedupe_exempt_tools() -> set:
+    """Built-in exemptions plus config.json `dedupe_exempt_tools` (a list of
+    tool names), read at call time so local tools can opt in without a code
+    change."""
+    out = set(_DEDUPE_EXEMPT_TOOLS)
+    try:
+        from .config_global import get_config
+        extra = (get_config() or {}).get("dedupe_exempt_tools") or []
+        out.update(str(x) for x in extra if isinstance(x, str))
+    except Exception:
+        pass
+    return out
 
 
 # Silence sentinel. An agent woken on every channel message (e.g. an agent
@@ -3023,7 +3044,7 @@ class AgentRunner:
                             memory_enabled=_mem_enabled,
                             callable_names=set(callable_names),
                             called_signatures=called_signatures,
-                            dedupe_exempt=set(_DEDUPE_EXEMPT_TOOLS),
+                            dedupe_exempt=dedupe_exempt_tools(),
                             context=_cv.copy_context(),
                         )
                         conv._cc_turn = _cc_turn
@@ -3412,13 +3433,14 @@ class AgentRunner:
                     new_call_sigs: list[tuple[str, str]] = []
                     batch_sigs: set[tuple[str, str]] = set()
                     seen_dup = False
+                    _exempt_now = dedupe_exempt_tools()
                     import json as _json
                     for t in _tc:
                         try:
                             sig = (t.function_name, _json.dumps(t.args or {}, sort_keys=True, default=str))
                         except Exception:
                             sig = (t.function_name, repr(t.args or {}))
-                        if t.function_name in _DEDUPE_EXEMPT_TOOLS:
+                        if t.function_name in _exempt_now:
                             # Intentionally repeatable with identical args
                             # (e.g. delete_message walking back through
                             # history). Skip both the dup check and sig
@@ -3455,9 +3477,11 @@ class AgentRunner:
                                 )
                                 break
                             feedback_msg = (
-                                'Note: your previous tool call(s) were duplicates of calls '
-                                'already executed this turn and were skipped. Either try a '
-                                'different approach or finalize your reply.'
+                                'Note: your previous tool call(s) exactly repeated calls that '
+                                'already succeeded this turn, so they were skipped; their '
+                                'results are above. If the task is not finished, continue with '
+                                'the next step (change the arguments if you really need to '
+                                'repeat one).'
                             )
                             conv.messages.append(ChatMessage('tool', feedback_msg))
                             continue
