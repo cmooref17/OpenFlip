@@ -135,12 +135,31 @@ async def _fetch_ollama_models() -> list[str]:
         return []
 
 
+# The two Claude providers share one model vocabulary (the same ids run on the
+# Anthropic API and on Claude Code), so a model name alone can't say which
+# provider to use. The picker therefore offers each Claude model once per
+# provider and encodes the choice in the option VALUE as "<provider>|<model>".
+CLAUDE_PROVIDERS = ("anthropic", "claude_code")
+_PROVIDER_LABEL = {"anthropic": "Anthropic API", "claude_code": "Claude Code"}
+
+
+def _split_choice(value: str) -> tuple[Optional[str], str]:
+    """("claude_code", "anthropic/claude-opus-5-5") for "claude_code|anthropic/claude-opus-5-5";
+    (None, value) for a plain model name."""
+    if "|" in value:
+        prov, model = value.split("|", 1)
+        if prov in CLAUDE_PROVIDERS:
+            return prov, model
+    return None, value
+
+
 async def _fetch_all_models() -> list[str]:
-    """Fetch Ollama models and append Anthropic + OpenAI API models."""
+    """Fetch Ollama models and append Anthropic + OpenAI API models.
+    Claude models appear once per Claude provider ("<provider>|anthropic/<model>")."""
     ollama = await _fetch_ollama_models()
     # Prefix API-provider models to distinguish them in the picker (the
     # prefix also drives _provider_for_model on selection).
-    claude = [f"anthropic/{m}" for m in _claude_models()]
+    claude = [f"{prov}|anthropic/{m}" for m in _claude_models() for prov in CLAUDE_PROVIDERS]
     openai = [f"openai/{m}" for m in _openai_models()]
     return ollama + claude + openai
 
@@ -214,7 +233,7 @@ def _build_model_embed(agent_id: Optional[str]) -> nextcord.Embed:
     prov = getattr(agent, "provider", "ollama")
     e.add_field(name="Current model", value=f"`{agent.model}`", inline=True)
     e.add_field(name="Provider", value=f"`{prov}`", inline=True)
-    e.set_footer(text="Pick a model below to switch. Claude models auto-set provider to anthropic. Existing conversations keep history; the new model takes effect on the next message.")
+    e.set_footer(text="Pick a model below to switch. Claude models are listed once for the Anthropic API and once for Claude Code; the one you pick sets the provider. Existing conversations keep history; the new model takes effect on the next message.")
     return e
 
 
@@ -242,34 +261,46 @@ class _AgentPicker(nextcord.ui.StringSelect):
 
 
 class _ModelPicker(nextcord.ui.StringSelect):
-    def __init__(self, model_list: list[str], current: Optional[str], disabled: bool):
+    def __init__(self, model_list: list[str], current: Optional[str], disabled: bool,
+                 current_provider: Optional[str] = None):
         # 25-option Discord cap. Claude models are the ones the operator
         # actually switches between, so guarantee they always appear and let
         # Ollama models fill the remaining slots — Claude is never the thing
         # that gets cut.
+        if current and _is_claude_model(current) and current_provider in CLAUDE_PROVIDERS:
+            current_value = f"{current_provider}|{current}"
+        else:
+            current_value = current
         choices: list[str] = list(model_list)
-        if current and current not in choices:
-            choices.insert(0, current)
+        if current_value and current_value not in choices:
+            choices.insert(0, current_value)
         # Keep `current` at the front, then never let the API-provider
         # models (Claude/OpenAI) get sliced off — Ollama fills what's left.
-        head = [current] if current else []
-        api_models = [c for c in choices
-                      if (_is_claude_model(c) or _is_openai_model(c)) and c not in head]
-        ollama = [c for c in choices
-                  if not (_is_claude_model(c) or _is_openai_model(c)) and c not in head]
+        def is_api(c: str) -> bool:
+            m = _split_choice(c)[1]
+            return _is_claude_model(m) or _is_openai_model(m)
+        head = [current_value] if current_value else []
+        api_models = [c for c in choices if is_api(c) and c not in head]
+        ollama = [c for c in choices if not is_api(c) and c not in head]
         choices = (head + api_models + ollama)[:25]
         opts = []
-        for name in choices:
+        for value in choices:
+            prov, name = _split_choice(value)
             if _is_claude_model(name):
-                desc = "Anthropic (Max subscription)"
+                prov = prov or "anthropic"
+                # Drop the internal "anthropic/" id prefix from the LABEL so a
+                # Claude Code option never reads as an Anthropic API one.
+                bare = name.split("/", 1)[1] if name.startswith("anthropic/") else name
+                label = f"[{_PROVIDER_LABEL[prov]}] {bare}"
+                desc = "Claude Code (its own login)" if prov == "claude_code" else "Anthropic API (Max subscription)"
             elif _is_openai_model(name):
-                desc = "OpenAI (API key)"
+                label, desc = name, "OpenAI (API key)"
             else:
-                desc = "Ollama"
+                label, desc = name, "Ollama"
             opts.append(nextcord.SelectOption(
-                label=_truncate(name, 100), value=name,
+                label=_truncate(label, 100), value=value,
                 description=desc,
-                default=(name == current),
+                default=(value == current_value),
             ))
         if not opts:
             opts = [nextcord.SelectOption(label="(no models found)", value="__none__")]
@@ -289,13 +320,13 @@ class _ModelPicker(nextcord.ui.StringSelect):
         if not agent:
             await interaction.response.send_message("Agent not found.", ephemeral=True)
             return
-        new_model = self.values[0]
-        if new_model == agent.model:
+        chosen_provider, new_model = _split_choice(self.values[0])
+        old_provider = getattr(agent, "provider", "ollama")
+        # A Claude option names its provider explicitly; anything else is inferred from the name.
+        new_provider = chosen_provider or _provider_for_model(new_model, current=old_provider)
+        if new_model == agent.model and new_provider == old_provider:
             await interaction.response.defer()
             return
-        # Auto-set provider based on model type
-        old_provider = getattr(agent, "provider", "ollama")
-        new_provider = _provider_for_model(new_model, current=old_provider)
         agent.model = new_model
         agent.provider = new_provider
         # When switching providers, clear existing conversations for this
@@ -335,7 +366,8 @@ class ModelView(nextcord.ui.View):
         # No agent picker: /model always edits the agent it was run on
         # (same shape as /effort, which only ever targets its own conversation).
         agent = _get_agent(self.agent_id) if self.agent_id else None
-        self.add_item(_ModelPicker(self.models, agent.model if agent else None, disabled=(agent is None)))
+        self.add_item(_ModelPicker(self.models, agent.model if agent else None, disabled=(agent is None),
+                                   current_provider=getattr(agent, "provider", None) if agent else None))
         self.add_item(_RefreshModelsButton())
         self.add_item(_CloseButton())
 

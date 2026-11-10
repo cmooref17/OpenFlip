@@ -465,21 +465,30 @@ async def _do_model(runner, arg, channel, transport, session_id) -> None:
             transport, session_id, channel,
             f"Current model: `{bare_current}` (provider `{agent.provider}`).\n"
             f"{model_list}\n"
-            f"Usage: `/model <model-name>` to switch.",
+            f"Usage: `/model <model-name> [anthropic|claude_code]` to switch "
+            f"(Claude models run on either; the second word picks which).",
         )
         return
-    # First whitespace-delimited token only — same arg discipline as _do_effort.
-    new_model = arg.split(None, 1)[0].strip()
-    from .agent_ui import _provider_for_model, _propagate_model_to_live_conversations
-    if new_model == agent.model:
-        await _send(transport, session_id, channel, f"Model already set to `{new_model}`.")
+    # First token = model; optional second token picks the Claude provider
+    # (the Anthropic API and Claude Code share the same model names).
+    parts = arg.split()
+    new_model = parts[0].strip()
+    want_provider = parts[1].strip().lower() if len(parts) > 1 else None
+    from .agent_ui import _provider_for_model, _propagate_model_to_live_conversations, _is_claude_model, CLAUDE_PROVIDERS
+    if want_provider and (want_provider not in CLAUDE_PROVIDERS or not _is_claude_model(new_model)):
+        await _send(transport, session_id, channel,
+                    f"❌ The provider word only applies to Claude models and must be one of: "
+                    f"{', '.join(CLAUDE_PROVIDERS)}.")
         return
-    # Auto-infer the provider from the name and flip it too — exactly as the
-    # panel does. When the provider changes, clear this agent's live
-    # conversations: Ollama / Anthropic / OpenAI histories aren't compatible.
     old_model = agent.model
     old_provider = agent.provider
-    new_provider = _provider_for_model(new_model, current=old_provider)
+    # Auto-infer the provider from the name (or take the explicit one) and flip
+    # it too — exactly as the panel does. When the provider changes, clear this
+    # agent's live conversations: Ollama / Anthropic / OpenAI histories aren't compatible.
+    new_provider = want_provider or _provider_for_model(new_model, current=old_provider)
+    if new_model == old_model and new_provider == old_provider:
+        await _send(transport, session_id, channel, f"Model already set to `{new_model}` on `{new_provider}`.")
+        return
     agent.model = new_model
     agent.provider = new_provider
     if new_provider != old_provider:

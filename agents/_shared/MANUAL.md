@@ -3239,8 +3239,11 @@ overrides, so it could show the default while the chat ran on another model.)
 
 `/model` is also a cross-transport text-prefix mirror (the Discord slash `/model`
 opens an interactive panel that can't render off-Discord): bare `/model` shows the
-current model + provider + usage, `/model <model-name>` switches the agent's model
-(auto-inferring + flipping the provider, mirroring the slash panel's set+save).
+current model + provider + usage, `/model <model-name> [anthropic|claude_code]` switches
+the agent's model (auto-inferring + flipping the provider, mirroring the slash panel's
+set+save). Claude model ids run on BOTH the Anthropic API and Claude Code, so the optional
+second word picks which; the slash panel lists every Claude model twice, labeled
+`[Anthropic API] <model>` and `[Claude Code] <model>`, and the option picked sets the provider.
 Owner-only on every transport.
 
 `/status` slash command shows runtime state. Its "Messages: X in memory /
