@@ -3233,7 +3233,7 @@ The Discord `/model` panel is PER-CONVERSATION for everyone, the owner included:
 it shows the model THIS chat actually runs on (session override if set, else the
 agent default, both shown) and its picker sets a session override for this chat
 only, with "Reset to default" to clear it. Claude options are labeled
-`[Claude Code] <model>` / `[Anthropic API] <model>` (both providers run the same model
+`claude_code/<model>` / `anthropic/<model>` (both providers run the same model
 ids). Options on the agent's current provider set the session override only; the OWNER
 also sees the other Claude provider's options, and picking one switches the agent's
 provider + default model in agent.json (a session override can't change provider),

@@ -291,7 +291,7 @@ class _ModelPicker(nextcord.ui.StringSelect):
                 # Drop the internal "anthropic/" id prefix from the LABEL so a
                 # Claude Code option never reads as an Anthropic API one.
                 bare = name.split("/", 1)[1] if name.startswith("anthropic/") else name
-                label = f"[{_PROVIDER_LABEL[prov]}] {bare}"
+                label = f"{prov}/{bare}"
                 desc = "Claude Code (its own login)" if prov == "claude_code" else "Anthropic API (Max subscription)"
             elif _is_openai_model(name):
                 label, desc = name, "OpenAI (API key)"
@@ -856,7 +856,7 @@ class _SessionModelPicker(nextcord.ui.StringSelect):
             prov, m = _split_choice(value)
             bare = m.split("/", 1)[-1]
             if prov:
-                label = f"[{_PROVIDER_LABEL[prov]}] {bare}"
+                label = f"{prov}/{bare}"
                 desc = ("this chat only" if prov == current_provider
                         else f"switches {_PROVIDER_LABEL[current_provider] if current_provider in _PROVIDER_LABEL else current_provider} -> {_PROVIDER_LABEL[prov]} for the whole agent")
             else:
