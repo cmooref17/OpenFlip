@@ -3232,8 +3232,14 @@ Text-mirror gating in general: `/effort`, `/session`, `/model`, `/models`,
 The Discord `/model` panel is PER-CONVERSATION for everyone, the owner included:
 it shows the model THIS chat actually runs on (session override if set, else the
 agent default, both shown) and its picker sets a session override for this chat
-only, with "Reset to default" to clear it. It never edits agent.json. To change an
-agent's default model, use the text mirror `/model <model-name>` below. (Before
+only, with "Reset to default" to clear it. Claude options are labeled
+`[Claude Code] <model>` / `[Anthropic API] <model>` (both providers run the same model
+ids). Options on the agent's current provider set the session override only; the OWNER
+also sees the other Claude provider's options, and picking one switches the agent's
+provider + default model in agent.json (a session override can't change provider),
+clears live conversations and this chat's model override. Non-owners only see their
+agent's own provider. To change an agent's default model on the same provider, use the
+text mirror `/model <model-name>` below. (Before
 2026-10-06 the owner's slash `/model` edited agent.json and ignored session
 overrides, so it could show the default while the chat ran on another model.)
 
@@ -3242,9 +3248,8 @@ opens an interactive panel that can't render off-Discord): bare `/model` shows t
 current model + provider + usage, `/model <model-name> [anthropic|claude_code]` switches
 the agent's model (auto-inferring + flipping the provider, mirroring the slash panel's
 set+save). Claude model ids run on BOTH the Anthropic API and Claude Code, so the optional
-second word picks which; the slash panel lists every Claude model twice, labeled
-`[Anthropic API] <model>` and `[Claude Code] <model>`, and the option picked sets the provider.
-Owner-only on every transport.
+second word picks which. Owner-only on every transport. (The agent-wide `ModelView`
+panel in agent_ui.py, reached via `open_model_panel`, has no slash command wired to it.)
 
 `/status` slash command shows runtime state. Its "Messages: X in memory /
 Y on disk" line reports the REAL on-disk count: a missing conversation

@@ -826,10 +826,16 @@ def model_command_users() -> set[int]:
         return set()
 
 
-def _session_model_choices(agent) -> list[str]:
+def _session_model_choices(agent, include_other_provider: bool = False) -> list[str]:
+    """Option values for the per-chat /model panel. Claude models are encoded
+    "<provider>|<model>" (see _split_choice) so the label can say which provider
+    runs them. The agent's own provider comes first; with include_other_provider
+    (owner only) the other Claude provider's options follow; picking one of those
+    switches the agent's provider, since a session override can't."""
     prov = getattr(agent, "provider", "ollama")
-    if prov in ("anthropic", "claude_code"):
-        return list(_claude_models())
+    if prov in CLAUDE_PROVIDERS:
+        provs = [prov] + ([p for p in CLAUDE_PROVIDERS if p != prov] if include_other_provider else [])
+        return [f"{pv}|{m}" for pv in provs for m in _claude_models()]
     if prov == "openai":
         return [f"openai/{m}" for m in _openai_models()]
     return []
@@ -843,11 +849,21 @@ def _session_effective(conv, agent) -> str:
 
 
 class _SessionModelPicker(nextcord.ui.StringSelect):
-    def __init__(self, choices: list[str], current: str):
+    def __init__(self, choices: list[str], current: str, current_provider: str = ""):
         cur_bare = current.split("/", 1)[-1]
-        opts = [nextcord.SelectOption(label=_truncate(m, 100), value=m,
-                                      default=(m.split("/", 1)[-1] == cur_bare))
-                for m in choices[:24]]
+        opts = []
+        for value in choices[:24]:
+            prov, m = _split_choice(value)
+            bare = m.split("/", 1)[-1]
+            if prov:
+                label = f"[{_PROVIDER_LABEL[prov]}] {bare}"
+                desc = ("this chat only" if prov == current_provider
+                        else f"switches {_PROVIDER_LABEL[current_provider] if current_provider in _PROVIDER_LABEL else current_provider} -> {_PROVIDER_LABEL[prov]} for the whole agent")
+            else:
+                label, desc = m, None
+            opts.append(nextcord.SelectOption(
+                label=_truncate(label, 100), value=value, description=desc,
+                default=(bare == cur_bare and (prov is None or prov == current_provider))))
         opts.append(nextcord.SelectOption(label="Reset to default", value="__reset__",
                                           description="Use the agent's normal model again"))
         super().__init__(placeholder="Pick a model for this chat…", options=opts,
@@ -856,12 +872,39 @@ class _SessionModelPicker(nextcord.ui.StringSelect):
     async def callback(self, interaction: nextcord.Interaction):
         view: "SessionModelView" = self.view
         pick = self.values[0]
+        prov, model = _split_choice(pick)
+        agent = view.agent
+        old_provider = getattr(agent, "provider", "")
         if pick == "__reset__":
             view.conv.unset_override("model")
-            msg = f"✅ This chat is back to the default model `{view.agent.model}`."
+            msg = f"✅ This chat is back to the default model `{agent.model}`."
+        elif prov and prov != old_provider:
+            # Cross-provider pick (owner only — non-owners never get these options):
+            # a session override can't change provider, so switch the agent itself,
+            # exactly like the agent-wide picker does.
+            if not is_owner(interaction.user.id):
+                await interaction.response.send_message("Only the owner can switch provider.", ephemeral=True)
+                return
+            agent.model = model if "/" in model else f"anthropic/{model}"
+            agent.provider = prov
+            # Drop this chat's old model override so the new pick actually wins.
+            try:
+                view.conv.unset_override("model")
+            except Exception:
+                pass
+            runner = _runner_for(agent.id)
+            if runner:
+                runner.conversations.clear()
+            if not agent.save():
+                await interaction.response.send_message("❌ Failed to save agent JSON.", ephemeral=True)
+                return
+            n = _propagate_model_to_live_conversations(agent.id)
+            msg = (f"✅ `{agent.id}` now runs `{agent.model}` on **{_PROVIDER_LABEL[prov]}** "
+                   f"(was {_PROVIDER_LABEL.get(old_provider, old_provider)}; updated {n} live conversation(s)).")
         else:
-            ok, res = view.conv.set_override("model", pick)
-            msg = f"✅ This chat now uses `{res}`." if ok else f"❌ {res}"
+            ok, res = view.conv.set_override("model", model)
+            where = f" on **{_PROVIDER_LABEL[prov]}**" if prov else ""
+            msg = f"✅ This chat now uses `{res}`{where}." if ok else f"❌ {res}"
         view.stop()
         await interaction.response.edit_message(content=msg, embed=None, view=None)
 
@@ -872,7 +915,9 @@ class SessionModelView(nextcord.ui.View):
         self.user_id = user_id
         self.conv = conv
         self.agent = agent
-        self.add_item(_SessionModelPicker(_session_model_choices(agent), _session_effective(conv, agent)))
+        self.add_item(_SessionModelPicker(
+            _session_model_choices(agent, include_other_provider=is_owner(user_id)),
+            _session_effective(conv, agent), getattr(agent, "provider", "")))
         self.add_item(_CloseButton())
 
     async def interaction_check(self, interaction: nextcord.Interaction) -> bool:
@@ -894,5 +939,5 @@ async def open_session_model_panel(interaction: nextcord.Interaction, *, conv, a
         return
     e = nextcord.Embed(title="🤖 Model for this chat", color=0x5865F2)
     e.description = (f"**{agent.display_name}** in this conversation only.\n"
-                     f"Current: `{_session_effective(conv, agent)}` (default `{agent.model}`)")
+                     f"Current: `{_session_effective(conv, agent)}` on **{_PROVIDER_LABEL.get(agent.provider, agent.provider)}** (default `{agent.model}`)")
     await interaction.response.send_message(embed=e, view=SessionModelView(interaction.user.id, conv, agent), ephemeral=True)
