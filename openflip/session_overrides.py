@@ -83,6 +83,8 @@ def provider_for_model(model: str) -> str:
     m = (model or "").strip()
     if m.startswith("openai/"):
         return "openai"
+    if m.startswith("claude_code/"):
+        return "claude_code"
     if m.startswith("claude-") or m.startswith("anthropic/"):
         return "anthropic"
     return "ollama"
@@ -183,6 +185,15 @@ def normalize_override(provider: str, key: str, raw: Any) -> tuple[Any, str]:
                 f"`{model}` looks like a {inferred} model but this agent runs {provider}; "
                 f"a session override can't change provider (histories aren't compatible) — use `/model` for that"
             )
+        if _MODEL_FAMILY.get(provider) == "anthropic":
+            # Model ids always carry the provider ("claude_code/claude-opus-5-5").
+            # A bare name or a legacy "anthropic/" id on a claude_code agent gets
+            # this agent's prefix; an explicit claude_code/ id on an anthropic
+            # agent is a provider switch, which a session override can't do.
+            if model.startswith("claude_code/") and provider != "claude_code":
+                return None, (f"`{model}` runs on claude_code but this agent runs {provider}; "
+                              f"a session override can't change provider — use `/model` for that")
+            model = f"{provider}/{model.split('/', 1)[-1]}"
         return model, ""
 
     if key == "context_window":

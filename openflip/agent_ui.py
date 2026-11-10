@@ -81,6 +81,7 @@ def _is_claude_model(model: str) -> bool:
     return (
         model.startswith("claude-")
         or model.startswith("anthropic/")
+        or model.startswith("claude_code/")
     )
 
 
@@ -115,6 +116,10 @@ def _provider_for_model(model: str, current: str | None = None) -> str:
     the two providers share the model vocabulary."""
     if _is_openai_model(model):
         return "openai"
+    if model.startswith("claude_code/"):
+        return "claude_code"
+    if model.startswith("anthropic/"):
+        return "anthropic"
     if _is_claude_model(model):
         return "claude_code" if current == "claude_code" else "anthropic"
     return "ollama"
@@ -135,31 +140,29 @@ async def _fetch_ollama_models() -> list[str]:
         return []
 
 
-# The two Claude providers share one model vocabulary (the same ids run on the
-# Anthropic API and on Claude Code), so a model name alone can't say which
-# provider to use. The picker therefore offers each Claude model once per
-# provider and encodes the choice in the option VALUE as "<provider>|<model>".
+# A model id always carries its provider: "anthropic/claude-opus-5-5" runs on
+# the Anthropic API, "claude_code/claude-opus-5-5" on Claude Code. Both Claude
+# providers share the bare names in config.json, so the picker offers each one
+# under both prefixes and the prefix picked sets the provider.
 CLAUDE_PROVIDERS = ("anthropic", "claude_code")
-_PROVIDER_LABEL = {"anthropic": "Anthropic API", "claude_code": "Claude Code"}
 
 
-def _split_choice(value: str) -> tuple[Optional[str], str]:
-    """("claude_code", "anthropic/claude-opus-5-5") for "claude_code|anthropic/claude-opus-5-5";
-    (None, value) for a plain model name."""
-    if "|" in value:
-        prov, model = value.split("|", 1)
-        if prov in CLAUDE_PROVIDERS:
-            return prov, model
-    return None, value
+def canonical_model(model: str, provider: str) -> str:
+    """Full "<provider>/<model>" id for a Claude model on a Claude provider (a
+    bare name or a legacy "anthropic/" id on claude_code gets the right prefix).
+    Anything else is returned unchanged."""
+    if model and provider in CLAUDE_PROVIDERS and _is_claude_model(model):
+        return f"{provider}/{model.split('/', 1)[-1]}"
+    return model
 
 
 async def _fetch_all_models() -> list[str]:
     """Fetch Ollama models and append Anthropic + OpenAI API models.
-    Claude models appear once per Claude provider ("<provider>|anthropic/<model>")."""
+    Claude models appear once per Claude provider as "<provider>/<model>"."""
     ollama = await _fetch_ollama_models()
     # Prefix API-provider models to distinguish them in the picker (the
     # prefix also drives _provider_for_model on selection).
-    claude = [f"{prov}|anthropic/{m}" for m in _claude_models() for prov in CLAUDE_PROVIDERS]
+    claude = [f"{prov}/{m}" for prov in CLAUDE_PROVIDERS for m in _claude_models()]
     openai = [f"openai/{m}" for m in _openai_models()]
     return ollama + claude + openai
 
@@ -267,36 +270,29 @@ class _ModelPicker(nextcord.ui.StringSelect):
         # actually switches between, so guarantee they always appear and let
         # Ollama models fill the remaining slots — Claude is never the thing
         # that gets cut.
-        if current and _is_claude_model(current) and current_provider in CLAUDE_PROVIDERS:
-            current_value = f"{current_provider}|{current}"
-        else:
-            current_value = current
+        current_value = canonical_model(current, current_provider or "") if current else current
         choices: list[str] = list(model_list)
         if current_value and current_value not in choices:
             choices.insert(0, current_value)
         # Keep `current` at the front, then never let the API-provider
         # models (Claude/OpenAI) get sliced off — Ollama fills what's left.
         def is_api(c: str) -> bool:
-            m = _split_choice(c)[1]
-            return _is_claude_model(m) or _is_openai_model(m)
+            return _is_claude_model(c) or _is_openai_model(c)
         head = [current_value] if current_value else []
         api_models = [c for c in choices if is_api(c) and c not in head]
         ollama = [c for c in choices if not is_api(c) and c not in head]
         choices = (head + api_models + ollama)[:25]
         opts = []
         for value in choices:
-            prov, name = _split_choice(value)
-            if _is_claude_model(name):
-                prov = prov or "anthropic"
-                # Drop the internal "anthropic/" id prefix from the LABEL so a
-                # Claude Code option never reads as an Anthropic API one.
-                bare = name.split("/", 1)[1] if name.startswith("anthropic/") else name
-                label = f"{prov}/{bare}"
-                desc = "Claude Code (its own login)" if prov == "claude_code" else "Anthropic API (Max subscription)"
-            elif _is_openai_model(name):
-                label, desc = name, "OpenAI (API key)"
+            label = value
+            if value.startswith("claude_code/"):
+                desc = "Claude Code (its own login)"
+            elif _is_claude_model(value):
+                desc = "Anthropic API (Max subscription)"
+            elif _is_openai_model(value):
+                desc = "OpenAI (API key)"
             else:
-                label, desc = name, "Ollama"
+                desc = "Ollama"
             opts.append(nextcord.SelectOption(
                 label=_truncate(label, 100), value=value,
                 description=desc,
@@ -320,10 +316,10 @@ class _ModelPicker(nextcord.ui.StringSelect):
         if not agent:
             await interaction.response.send_message("Agent not found.", ephemeral=True)
             return
-        chosen_provider, new_model = _split_choice(self.values[0])
+        new_model = self.values[0]
         old_provider = getattr(agent, "provider", "ollama")
-        # A Claude option names its provider explicitly; anything else is inferred from the name.
-        new_provider = chosen_provider or _provider_for_model(new_model, current=old_provider)
+        # The id's prefix is the provider ("claude_code/…", "anthropic/…", "openai/…").
+        new_provider = _provider_for_model(new_model, current=old_provider)
         if new_model == agent.model and new_provider == old_provider:
             await interaction.response.defer()
             return
@@ -827,15 +823,14 @@ def model_command_users() -> set[int]:
 
 
 def _session_model_choices(agent, include_other_provider: bool = False) -> list[str]:
-    """Option values for the per-chat /model panel. Claude models are encoded
-    "<provider>|<model>" (see _split_choice) so the label can say which provider
-    runs them. The agent's own provider comes first; with include_other_provider
-    (owner only) the other Claude provider's options follow; picking one of those
-    switches the agent's provider, since a session override can't."""
+    """Full model ids for the per-chat /model panel. The agent's own provider
+    comes first; with include_other_provider (owner only) the other Claude
+    provider's ids follow, and picking one switches the agent's provider,
+    since a session override can't."""
     prov = getattr(agent, "provider", "ollama")
     if prov in CLAUDE_PROVIDERS:
         provs = [prov] + ([p for p in CLAUDE_PROVIDERS if p != prov] if include_other_provider else [])
-        return [f"{pv}|{m}" for pv in provs for m in _claude_models()]
+        return [f"{pv}/{m}" for pv in provs for m in _claude_models()]
     if prov == "openai":
         return [f"openai/{m}" for m in _openai_models()]
     return []
@@ -843,27 +838,24 @@ def _session_model_choices(agent, include_other_provider: bool = False) -> list[
 
 def _session_effective(conv, agent) -> str:
     try:
-        return conv.overrides.get("model") or agent.model
+        raw = conv.overrides.get("model") or agent.model
     except Exception:
-        return agent.model
+        raw = agent.model
+    return canonical_model(raw, getattr(agent, "provider", ""))
 
 
 class _SessionModelPicker(nextcord.ui.StringSelect):
     def __init__(self, choices: list[str], current: str, current_provider: str = ""):
-        cur_bare = current.split("/", 1)[-1]
         opts = []
         for value in choices[:24]:
-            prov, m = _split_choice(value)
-            bare = m.split("/", 1)[-1]
-            if prov:
-                label = f"{prov}/{bare}"
+            prov = _provider_for_model(value, current=current_provider)
+            desc = None
+            if prov in CLAUDE_PROVIDERS:
                 desc = ("this chat only" if prov == current_provider
-                        else f"switches {_PROVIDER_LABEL[current_provider] if current_provider in _PROVIDER_LABEL else current_provider} -> {_PROVIDER_LABEL[prov]} for the whole agent")
-            else:
-                label, desc = m, None
+                        else f"switches the whole agent to {prov}")
             opts.append(nextcord.SelectOption(
-                label=_truncate(label, 100), value=value, description=desc,
-                default=(bare == cur_bare and (prov is None or prov == current_provider))))
+                label=_truncate(value, 100), value=value, description=desc,
+                default=(value == current)))
         opts.append(nextcord.SelectOption(label="Reset to default", value="__reset__",
                                           description="Use the agent's normal model again"))
         super().__init__(placeholder="Pick a model for this chat…", options=opts,
@@ -872,21 +864,20 @@ class _SessionModelPicker(nextcord.ui.StringSelect):
     async def callback(self, interaction: nextcord.Interaction):
         view: "SessionModelView" = self.view
         pick = self.values[0]
-        prov, model = _split_choice(pick)
         agent = view.agent
         old_provider = getattr(agent, "provider", "")
         if pick == "__reset__":
             view.conv.unset_override("model")
-            msg = f"✅ This chat is back to the default model `{agent.model}`."
-        elif prov and prov != old_provider:
-            # Cross-provider pick (owner only — non-owners never get these options):
+            msg = f"✅ This chat is back to the default model `{canonical_model(agent.model, old_provider)}`."
+        elif _provider_for_model(pick, current=old_provider) != old_provider:
+            # Cross-provider pick (owner only; non-owners never get these options):
             # a session override can't change provider, so switch the agent itself,
             # exactly like the agent-wide picker does.
             if not is_owner(interaction.user.id):
                 await interaction.response.send_message("Only the owner can switch provider.", ephemeral=True)
                 return
-            agent.model = model if "/" in model else f"anthropic/{model}"
-            agent.provider = prov
+            agent.model = pick
+            agent.provider = _provider_for_model(pick, current=old_provider)
             # Drop this chat's old model override so the new pick actually wins.
             try:
                 view.conv.unset_override("model")
@@ -899,12 +890,10 @@ class _SessionModelPicker(nextcord.ui.StringSelect):
                 await interaction.response.send_message("❌ Failed to save agent JSON.", ephemeral=True)
                 return
             n = _propagate_model_to_live_conversations(agent.id)
-            msg = (f"✅ `{agent.id}` now runs `{agent.model}` on **{_PROVIDER_LABEL[prov]}** "
-                   f"(was {_PROVIDER_LABEL.get(old_provider, old_provider)}; updated {n} live conversation(s)).")
+            msg = f"✅ `{agent.id}` now runs `{agent.model}` (updated {n} live conversation(s))."
         else:
-            ok, res = view.conv.set_override("model", model)
-            where = f" on **{_PROVIDER_LABEL[prov]}**" if prov else ""
-            msg = f"✅ This chat now uses `{res}`{where}." if ok else f"❌ {res}"
+            ok, res = view.conv.set_override("model", pick)
+            msg = f"✅ This chat now uses `{res}`." if ok else f"❌ {res}"
         view.stop()
         await interaction.response.edit_message(content=msg, embed=None, view=None)
 
@@ -939,5 +928,5 @@ async def open_session_model_panel(interaction: nextcord.Interaction, *, conv, a
         return
     e = nextcord.Embed(title="🤖 Model for this chat", color=0x5865F2)
     e.description = (f"**{agent.display_name}** in this conversation only.\n"
-                     f"Current: `{_session_effective(conv, agent)}` on **{_PROVIDER_LABEL.get(agent.provider, agent.provider)}** (default `{agent.model}`)")
+                     f"Current: `{_session_effective(conv, agent)}` (default `{canonical_model(agent.model, agent.provider)}`)")
     await interaction.response.send_message(embed=e, view=SessionModelView(interaction.user.id, conv, agent), ephemeral=True)
