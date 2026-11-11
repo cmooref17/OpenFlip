@@ -44,6 +44,7 @@ _TEXT_COMMANDS = {
     "/reload",
     "/restart",
     "/help",
+    "/usage",
 }
 
 
@@ -226,6 +227,22 @@ async def handle_text_command(
             return True
         reason = arg or "Manual restart from text-prefix /restart."
         await _do_restart(runner, ch_id, speaker_id, reason, channel, transport, session_id)
+        return True
+
+    if head == "/usage":
+        # Plan limits (session + weekly), same as the Discord /usage slash command.
+        # Answered here without a model call, so it still works when the plan is
+        # out of usage, which is exactly when you want to see it.
+        if not is_owner(speaker_id, transport=tname, handle=handle):
+            await _send(transport, session_id, channel, "Owner only.")
+            return True
+        from . import plan_usage
+        try:
+            data = await plan_usage.fetch_plan_usage()
+            text = plan_usage.format_plan_usage(data)
+        except Exception as e:
+            text = f"Couldn't read plan usage: {e}"
+        await _send(transport, session_id, channel, text)
         return True
 
     if head == "/help":

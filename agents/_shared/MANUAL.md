@@ -3235,7 +3235,7 @@ synthetic turn fired). Same model-gating caveat applies: don't set
 Available as both the Discord slash command and a cross-transport text-prefix
 mirror (iMessage + any non-Discord transport), alongside `/reset`, `/undo`,
 `/redo`, `/compact`, `/uncompact`, `/session`, `/model` (alias `/models`), `/dream`, `/status`,
-`/reload`, `/restart`, `/help`. On the text mirror the arg is optional too, but
+`/reload`, `/restart`, `/help`, `/usage`. On the text mirror the arg is optional too, but
 there's no panel off-Discord: bare `/effort` shows the current override + usage;
 `/effort <level>` sets it. `/effort` is
 owner-only on every transport (Ollama agents report it as unavailable).
@@ -3296,7 +3296,9 @@ visible right there.
 is under — the same numbers Claude Code's `/usage` shows: the session (5-hour)
 and weekly bars, each with its percent used and reset time (machine-local time),
 plus per-model weekly buckets (Opus/Sonnet) and extra-usage credits when the
-account has them. Owner-only, ephemeral, read-only. Source:
+account has them. Owner-only, ephemeral, read-only. Works as the Discord slash
+command and as a text-prefix command on every other transport (iMessage etc.); both
+answer without a model call, so it still works when the plan is out of usage. Source:
 `GET {api_base}/api/oauth/usage` with the OAuth bearer token
 (`openflip/plan_usage.py`). Unknown buckets Anthropic adds later are shown under
 their raw key rather than dropped. Needs a working Claude login; a failure
