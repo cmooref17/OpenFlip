@@ -264,6 +264,16 @@ class ClaudeCodeConversation(SessionOverridesMixin):
         from .config_global import get_max_tool_turns
         cfg = _cc_config()
         env = dict(_CC_BUILTIN_CONTEXT_OFF)
+        # Compaction: Claude Code compacts on its own window, which defaults to
+        # the full context (1M on -1m models). Pass openflip's configured
+        # trigger through CLAUDE_CODE_AUTO_COMPACT_WINDOW so both providers
+        # compact at the same point. Claude Code's minimum is 100000.
+        try:
+            _trig = int(self.effective_compaction_trigger() or 0)
+            if _trig > 0:
+                env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(max(100_000, _trig))
+        except Exception:
+            pass
         opts: dict[str, Any] = dict(
             model=self.model,
             system_prompt={"type": "custom", "prompt": prompt_text, "snapshot": False},

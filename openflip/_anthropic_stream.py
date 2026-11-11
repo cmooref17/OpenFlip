@@ -493,6 +493,13 @@ async def _yield_for_sse_event(
             tool_input_buffers[idx] = (
                 tool_input_buffers.get(idx, "") + (delta.get("partial_json") or "")
             )
+        elif dtype == "compaction_delta":
+            # Server-side compaction streams its WHOLE summary in one
+            # compaction_delta (docs: compaction-threshold#streaming). Ignoring
+            # it left every compaction block empty ("0 chars of summary"), so
+            # the next request carried no summary and the history was lost.
+            if delta.get("content") is not None:
+                block["content"] = delta.get("content")
         # citations_delta etc: ignore.
         yield ContentBlockDeltaEvent(index=idx, delta=dict(delta))
         return

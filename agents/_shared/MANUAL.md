@@ -3351,6 +3351,20 @@ replies with the error instead of numbers.
 (The old `/usage` that aggregated the usage ledger by window/group was removed
 2026-10-13. The ledger itself and the web dashboard's /usage page are unchanged.)
 
+### Compaction summary + claude_code compaction window
+
+- **Anthropic provider:** server-side compaction streams its whole summary in
+  ONE `compaction_delta` event (`content_block_start` → `compaction_delta` →
+  `content_block_stop`). `_anthropic_stream.py` stores that delta's `content`
+  on the compaction block; before 2026-11-11 it ignored the delta type, so every
+  block arrived empty ("received compaction block (0 chars ...)") and the
+  summary was lost. The log line now shows the real length.
+- **claude_code provider:** Claude Code compacts on its own window (defaults to
+  the full context). The provider now passes openflip's effective
+  `compaction_trigger` (same `models.<id>.compaction_trigger` resolution) as
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (floored at Claude Code's 100000 minimum),
+  so both providers compact at the configured point.
+
 ### Usage ledger
 
 Every completed Anthropic or OpenAI turn appends ONE raw row to an append-only SQLite
