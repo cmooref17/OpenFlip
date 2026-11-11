@@ -590,7 +590,7 @@ class AgentRunner:
                 return t.bot
         return self._transports[0].bot
 
-    def reload_agent_config(self) -> tuple[bool, int, list[str]]:
+    def reload_agent_config(self, *, explicit: bool = True) -> tuple[bool, int, list[str]]:
         """Reload this agent's config + system files from disk on demand.
 
         Wired to the owner /reload slash command and the pre-turn hot-reload
@@ -609,6 +609,16 @@ class AgentRunner:
         from pathlib import Path
         ensure_personal_files(Path(self.agent.path).parent)
         changed = self.agent.reload_if_changed()
+        if explicit:
+            # /reload (or restart_gateway's reload) is the user saying "use the
+            # files as they are now": every live session drops its instruction
+            # snapshot and rebuilds its system prompt on the next turn, even if
+            # the pre-turn check already picked the change up as a note.
+            for _c in self.conversations.values():
+                try:
+                    _c._instruction_snapshot = None
+                except Exception:
+                    pass
         if not changed:
             return (False, 0, [])
         reapplied = 0
@@ -2418,7 +2428,10 @@ class AgentRunner:
         # means `touch` and identical-content rewrites don't bust the prompt
         # cache for no reason. Cost: ~1ms across ~6 small text files.
         try:
-            self.reload_agent_config()
+            # explicit=False: a file changed mid-session is picked up, but the
+            # session keeps its instruction snapshot (the change rides as a
+            # note on the next user message; see instruction_snapshot.py).
+            self.reload_agent_config(explicit=False)
         except Exception as e:
             print_ts(f"{COLOR_RED}pre-turn reload check failed: {e}{COLOR_END}", error=True, agent=self.agent.id)
 
@@ -2556,14 +2569,11 @@ class AgentRunner:
         # agent-stable extension: it only changes when the index itself does,
         # so the cached system prefix survives ordinary turns. An old-style
         # MEMORY.md converts itself here on first load (backup kept).
+        _mem_block = ""
         if _mem_enabled and agent.memory_enabled:
             try:
                 from .memory_index import load_index_block
-                _mem_block = load_index_block(os.path.dirname(agent.path))
-                if _mem_block:
-                    system_extension = (
-                        f"{system_extension}\n\n{_mem_block}" if system_extension else _mem_block
-                    )
+                _mem_block = load_index_block(os.path.dirname(agent.path)) or ""
             except Exception as _mem_err:
                 print_ts(
                     f"{COLOR_YELLOW}memory index load failed (continuing without it): {_mem_err}{COLOR_END}",
@@ -2709,12 +2719,53 @@ class AgentRunner:
                     agent=agent.id,
                 )
 
-        # Optional per-message system extension (e.g. "tools the speaker can't use").
+        # Per-session instruction snapshot (Claude Code style, see
+        # instruction_snapshot.py). The system prompt (agent system files +
+        # the agent-stable extension + the memory index) is captured ONCE per
+        # conversation session and the exact same bytes go out every turn, so
+        # the prompt cache survives memory saves and self-edits of
+        # AGENT.md/TOOLS.md. A mid-session change rides as a note on this
+        # turn's user message instead (built below). The snapshot is retaken
+        # only on a new session, /reset, compaction, or /reload / restart
+        # (those clear conv._instruction_snapshot).
+        from .instruction_snapshot import InstructionSnapshot
+        from .agent import load_system_sources
+        _agent_dir = os.path.dirname(agent.path)
+        _cur_sources = load_system_sources(
+            _agent_dir, agent.system_files, agent_id=agent.id, display_name=agent.display_name,
+        )
+        _base_ext, _turn_ext = system_extension, ""
+        if is_chain_terminator and system_extension and "[returning from peer]" in system_extension:
+            # The peer-return steering only exists on chain-terminator turns;
+            # keep it out of the snapshot so it can't bake into the session.
+            _cut = system_extension.find("[returning from peer]")
+            _base_ext = system_extension[:_cut].rstrip()
+            _turn_ext = system_extension[_cut:]
+        if _base_ext:
+            _cur_sources.append(("(tool usage rules)", _base_ext))
+        if _mem_block:
+            _cur_sources.append(("MEMORY.md", _mem_block))
+        _snap = getattr(conv, "_instruction_snapshot", None)
+        _instr_note = ""
+        if _snap is None:
+            _sys = conv.system_message or ""
+            if _base_ext:
+                _sys = _sys + "\n" + _base_ext
+            if _mem_block:
+                _sys = _sys + "\n\n" + _mem_block
+            _snap = InstructionSnapshot.capture(_cur_sources, _sys)
+            conv._instruction_snapshot = _snap
+        else:
+            _instr_note = _snap.changed_note(_cur_sources)
+            if _instr_note:
+                print_ts(
+                    f"instruction files changed mid-session: sent as a note, system prompt kept "
+                    f"({len(_instr_note)} chars)", agent=agent.id,
+                )
         original_system = conv.system_message
-        if system_extension:
-            conv.system_message = original_system + "\n" + system_extension
-            if conv.messages and conv.messages[0].role == 'system':
-                conv.messages[0]['content'] = conv.system_message
+        conv.system_message = _snap.system_prompt + (("\n" + _turn_ext) if _turn_ext else "")
+        if conv.messages and conv.messages[0].role == 'system':
+            conv.messages[0]['content'] = conv.system_message
 
         ChatMessage = chat_message_class(self.agent.provider)
         # Per-round backstop only. Stream liveness is guarded by the
@@ -2854,13 +2905,14 @@ class AgentRunner:
                     f"{COLOR_YELLOW}memory recall skipped: {_recall_err}{COLOR_END}",
                     agent=agent.id,
                 )
+        if _instr_note and not _verbatim:
+            framed_user = f"{framed_user}\n\n<system-reminder>\n{_instr_note}\n</system-reminder>"
         conv.messages.append(ChatMessage('user', framed_user))
 
         async def _restore_system():
-            if system_extension:
-                conv.system_message = original_system
-                if conv.messages and conv.messages[0].role == 'system':
-                    conv.messages[0]['content'] = original_system
+            conv.system_message = original_system
+            if conv.messages and conv.messages[0].role == 'system':
+                conv.messages[0]['content'] = original_system
             # Clean up any image tempfiles staged for this turn. Chat() has already
             # consumed them by now (read + base64); deleting is safe regardless of
             # whether the turn ended normally, timed out, or errored.
@@ -3092,6 +3144,11 @@ class AgentRunner:
                     # was summarized away. Without this, agents fill the gap
                     # with intuition instead of search_memory / read_memory.
                     if getattr(conv, "compacted_this_turn", False):
+                        # Compaction rewrites the history prefix anyway, so the
+                        # cache is cold either way: take a fresh instruction
+                        # snapshot next turn (Claude Code re-reads instruction
+                        # files on compaction too).
+                        conv._instruction_snapshot = None
                         try:
                             conv.messages.append(ChatMessage(
                                 'user',

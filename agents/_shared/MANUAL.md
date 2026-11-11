@@ -46,7 +46,7 @@ agents/<id>/
 ├── TOOLS.md              # Per-agent extension of _shared/TOOLS.md. Auto-created empty, auto-injected by default. Empty = no-op.
 ├── REMINDER.md           # (optional, legacy) Plain system file — loads ONLY if listed in system_files (some agents do). The per-turn uncached end-of-payload injection mechanic was REMOVED; no special handling remains.
 ├── HEARTBEAT.md          # (optional) Prompt loaded when a `heartbeat:true` cron job fires.
-├── MEMORY.md             # Memory INDEX, one line per topic file. Auto-loaded every turn (200 lines / 25k chars cap).
+├── MEMORY.md             # Memory INDEX, one line per topic file. In the system prompt from session start; mid-session changes arrive as a note (200 lines / 25k chars cap).
 ├── conversations/        # Per-channel <conv_id>.jsonl + <conv_id>.meta.json. Auto-managed.
 ├── memory/               # topics/<slug>.md (one file per subject) + daily logs (YYYY-MM-DD.md) + index.json (embeddings).
 └── chain_state.json      # In-flight inter-agent chain IDs. Persisted across restarts.
@@ -108,9 +108,13 @@ lands right after `_shared/TOOLS.md`.
 
 Hot reload semantics: edits to `agent.json` and any file listed in
 `system_files` are hash-detected on every turn (`Agent.reload_if_changed`).
-The next message picks them up automatically. Code changes under
-`openflip/` need a framework restart. The `/reload` slash command also
-forces an explicit re-read.
+The next message picks them up automatically: `agent.json` settings take
+effect directly; changed instruction files reach a running session as a
+note on the next user message (see "Per-session instruction snapshot" in
+section 12) while the session's system prompt stays byte-identical. Code
+changes under `openflip/` need a framework restart. The `/reload` slash
+command forces an explicit re-read and rebuilds every live session's system
+prompt.
 
 ## Identity
 
@@ -2539,6 +2543,27 @@ If any byte differs, the agent reloads and the next turn picks up:
   personal `TOOLS.md`, `_shared/FRAMEWORK.md`, `_shared/TOOLS.md`, and
   a legacy `REMINDER.md` if an agent still lists it there.
 - New files added to `system_files`.
+
+### Per-session instruction snapshot (prompt cache)
+
+Modeled on Claude Code's instruction-file loading. Each conversation session
+builds its system prompt ONCE (system files + the agent-stable tool-rules
+extension + the MEMORY.md index block) and sends those exact bytes on every
+turn (`openflip/instruction_snapshot.py`, applied in `runtime._run_turn`). A
+memory save or a self-edit of `AGENT.md`/`TOOLS.md` therefore no longer
+rebuilds the system prompt, which used to re-send the whole conversation
+uncached on the next turn.
+
+When an instruction file (or the memory index) changes mid-session, the next
+user message carries a `<system-reminder>` note — "These instruction files
+changed - each replaces its earlier copy …" — with only the changed files'
+new text, each announced once. The system prompt and earlier messages are
+never rewritten.
+
+The snapshot is retaken (the system prompt rebuilt from the files as they
+are) only on: a new session, `/reset`, compaction, `/reload`, or a framework
+restart. Chain-terminator steering (the `[returning from peer]` block) stays
+per-turn and is never baked into the snapshot.
 
 The `/reload` slash command forces it explicitly. Its report is honest
 about live conversations: "re-applied to N/M live conversation(s)" —

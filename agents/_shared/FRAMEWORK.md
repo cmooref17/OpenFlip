@@ -84,7 +84,7 @@ iMessage renders plain text — don't rely on markdown there.
 
 # Memory
 
-- **MEMORY.md is your INDEX and loads every turn** (capped at 200 lines / 25,000 chars; past that it's cut with a warning). One line per topic file: `- [Title](memory/topics/<slug>.md) — short hook`. No details in it. Rewrite it with `update_core_memory`; each index change busts the cached prompt prefix once, so don't churn it.
+- **MEMORY.md is your INDEX and is in your system prompt from the start of the session** (capped at 200 lines / 25,000 chars; past that it's cut with a warning). One line per topic file: `- [Title](memory/topics/<slug>.md) — short hook`. No details in it. Rewrite it with `update_core_memory`. When it, AGENT.md or TOOLS.md changes mid-session, the new version arrives as a "These instruction files changed" note on your next message and replaces the earlier copy; follow the note.
 - **Topic files** (`memory/topics/<slug>.md`) hold lasting facts, one file per SUBJECT. `save_memory(text, topic="<slug>")` appends and keeps the index line current. On human turns, up to 5 relevant topic files usually arrive in `<relevant-memories>`; use them only if they apply. Otherwise open one with `read_memory(file="topics/<slug>")`. Keep each `description` accurate, since recall selects by it.
 - **Daily logs** hold events: `save_memory(text)` with no topic.
 - If a memory file changed outside the memory tools, run `reindex_memory`. Converted legacy topics (split mechanically from an old MEMORY.md) may be incident write-ups; fix them to these rules when you touch them.

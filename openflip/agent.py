@@ -457,6 +457,37 @@ def _load_system_files(
     return "\n\n".join(parts)
 
 
+def load_system_sources(
+    agent_dir: str,
+    filenames: list[str],
+    *,
+    agent_id: str = "",
+    display_name: str = "",
+) -> list[tuple[str, str]]:
+    """Each system file as (label, text), in agent.json order.
+
+    Same reads and template substitution as _load_system_files; joining the
+    texts of the non-empty entries with "\n\n" gives exactly what
+    _load_system_files returns. Used by instruction_snapshot to tell WHICH file
+    changed mid-session. Missing files are skipped, as in _load_system_files."""
+    out: list[tuple[str, str]] = []
+    for fname in filenames:
+        fpath = _resolve_system_file(agent_dir, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            _warn_unreadable_system_file(fpath, e)
+            continue
+        if content:
+            out.append((fname, _apply_template_vars(
+                content, agent_id=agent_id, agent_dir=agent_dir, display_name=display_name,
+            )))
+    return out
+
+
 def _get_fingerprint(path: str, agent_dir: str, system_files: list[str]) -> str:
     """SHA256 fingerprint over agent.json + all system_files (per-agent + shared).
 

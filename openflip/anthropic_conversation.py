@@ -1633,6 +1633,7 @@ class AnthropicConversation(SessionOverridesMixin):
         return dropped
 
     def clear_history(self):
+        self._instruction_snapshot = None  # /reset = new session: rebuild the system prompt
         # Pass the meta sidecar as an extra so it's deleted alongside the
         # .jsonl. Otherwise /reset would leave a stale compaction block on
         # disk; the next message would prepend a summary of the conversation

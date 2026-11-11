@@ -198,6 +198,7 @@ class ClaudeCodeConversation(SessionOverridesMixin):
             pass
 
     def clear_history(self):
+        self._instruction_snapshot = None  # /reset = new session: rebuild the system prompt
         _cio.delete_conversation_files(
             self._agent_dir(), self.conversation_id,
             extra_paths=[self._meta_path()], backup_tag="pre_reset",
@@ -243,8 +244,11 @@ class ClaudeCodeConversation(SessionOverridesMixin):
 
     # ------------------------------------------------------------ client
     def _system_prompt_text(self) -> str:
-        # runtime._run_turn already folds the memory index block and any
-        # per-turn extension into self.system_message before chat().
+        # runtime._run_turn sets self.system_message from the conversation's
+        # per-session instruction snapshot (instruction_snapshot.py) before
+        # chat(), so this text — and the client signature built from it —
+        # stays byte-identical across memory saves and AGENT.md/TOOLS.md
+        # self-edits; a mid-session change rides on the user message instead.
         parts = [self.system_message or "", _SYSTEM_REMINDER_NOTE]
         return "\n\n".join(p for p in parts if p)
 

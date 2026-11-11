@@ -251,6 +251,7 @@ class DiscordConversation(SessionOverridesMixin, _BaseConversation):
 
     def clear_history(self):
         """Delete the on-disk conversation file (and the overrides sidecar)."""
+        self._instruction_snapshot = None  # /reset = new session: rebuild the system prompt
         _cio.delete_conversation_files(
             self._agent_dir(), self.conversation_id,
             extra_paths=[self._meta_path()],

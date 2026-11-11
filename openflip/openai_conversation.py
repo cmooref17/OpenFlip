@@ -1117,6 +1117,7 @@ class OpenAIConversation(SessionOverridesMixin):
         self._persisted_count = len(non_system)
 
     def clear_history(self):
+        self._instruction_snapshot = None  # /reset = new session: rebuild the system prompt
         _cio.delete_conversation_files(
             self._agent_dir(), self.conversation_id,
             extra_paths=[self._meta_path()],

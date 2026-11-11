@@ -268,7 +268,7 @@ def load_index_block(agent_dir: str) -> str:
     if not content.strip():
         return ("# Memory index (MEMORY.md)\n\nEmpty. When you save a memory with "
                 "save_memory(topic=...), it gets a topic file and a line here.")
-    return ("# Memory index (MEMORY.md, loaded automatically every turn)\n\n"
+    return ("# Memory index (MEMORY.md, loaded automatically)\n\n"
             "Each line points to a topic file with the details. Open one with "
             "read_memory(file=\"topics/<slug>\") when it matters. Save lasting facts "
             "with save_memory(text, topic=...).\n\n" + cap_index(content))
