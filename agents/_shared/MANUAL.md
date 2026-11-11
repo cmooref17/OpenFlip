@@ -3370,6 +3370,21 @@ aggregations over these rows.
   (`opus` / `sonnet` / `haiku`) to per-1M-token rates. These are **hand-maintained**
   — update the table when Anthropic changes prices. An unknown model records
   `est_cost_usd = 0.0` (it never guesses a price).
+- **Request breakdown (additive columns, NULL on old rows; added 2026-11-11):**
+  what each call was made of and why it ran, so "why did usage spike" is one query.
+  `system_chars`, `tools_chars` (loaded tool definitions only), `tools_loaded`,
+  `tools_deferred`, `messages_chars`, `message_count` (character counts of the
+  request body; tokens ≈ chars/4). `trigger` = `user_message`, `peer_reply`,
+  `peer_message`, `cron`, `restart` or `synthetic`, with `+tool_loop` on the
+  rounds after the first; `trigger_from` = the user id or peer agent id.
+  `cache_miss` = 1 when the call re-wrote a prefix the previous call in the same
+  session had cached within the 1h TTL (read < half the previous prefix and
+  >2k written); `cache_miss_reason` names it when known (`reload`, `compaction`,
+  else `prefix changed`). `limit_type` / `limit_resets_at` are reserved for 429s
+  (not filled yet). Existing ledgers upgrade in place via ALTER TABLE. Filled by
+  the anthropic provider today. Example:
+  `SELECT iso_ts, trigger, trigger_from, cache_read_tokens, cache_creation_tokens,
+  cache_miss_reason FROM usage WHERE cache_miss=1 ORDER BY ts DESC LIMIT 20;`
 
 ---
 

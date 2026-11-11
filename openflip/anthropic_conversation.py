@@ -2365,6 +2365,25 @@ class AnthropicConversation(SessionOverridesMixin):
                         }
                     ]
 
+        # Request breakdown for the usage ledger (what this call is made of).
+        # Character counts of the body sections; cheap and exact. Never fatal.
+        try:
+            _loaded = [t for t in (tool_schemas or []) if not t.get("defer_loading")]
+            self._request_breakdown = {
+                "system_chars": sum(len(b.get("text", "")) for b in (body.get("system") or [])),
+                "tools_chars": len(json.dumps(_loaded, default=str)),
+                "tools_loaded": len(_loaded),
+                "tools_deferred": len(tool_schemas or []) - len(_loaded),
+                "messages_chars": len(json.dumps(api_messages, default=str)),
+                "message_count": len(api_messages),
+                "trigger": getattr(self, "turn_trigger", None),
+                "trigger_from": getattr(self, "turn_trigger_from", None),
+                "cache_miss_reason": getattr(self, "pending_cache_miss_reason", None),
+            }
+            self.pending_cache_miss_reason = None
+        except Exception:
+            self._request_breakdown = None
+
         # Headers were built with the system blocks above (build_auth). The
         # `compact-2026-01-12` beta must stay in both modes: `compact_20260112`
         # in the body 400s without it.
@@ -2704,6 +2723,7 @@ class AnthropicConversation(SessionOverridesMixin):
                                 model=self.model,
                                 usage=_final_usage,
                                 outcome=_outcome,
+                                breakdown=getattr(self, "_request_breakdown", None),
                             )
                         except Exception as _led_e:
                             print_ts(

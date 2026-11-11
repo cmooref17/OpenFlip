@@ -49,6 +49,25 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "haiku": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25},
 }
 
+# What a request was made of and why it ran. All optional; providers fill what
+# they know. Sizes are characters of the request body (a cheap, exact proxy;
+# tokens ~= chars/4). cache_miss = 1 when this call re-wrote a prefix the
+# previous call in the same session had cached (see _cache_miss below).
+_BREAKDOWN_COLUMNS = [
+    ("system_chars", "INTEGER"),
+    ("tools_chars", "INTEGER"),
+    ("tools_loaded", "INTEGER"),
+    ("tools_deferred", "INTEGER"),
+    ("messages_chars", "INTEGER"),
+    ("message_count", "INTEGER"),
+    ("trigger", "TEXT"),
+    ("trigger_from", "TEXT"),
+    ("cache_miss", "INTEGER"),
+    ("cache_miss_reason", "TEXT"),
+    ("limit_type", "TEXT"),
+    ("limit_resets_at", "TEXT"),
+]
+
 _GROUP_BY_WHITELIST = {"agent_id", "channel_id", "session_id", "user_id", "model"}
 
 _RETENTION_SECONDS = 30 * 86400
@@ -106,6 +125,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_usage_channel ON usage(channel_id);
         """
     )
+    # Additive request-breakdown columns (2026-11-11). Old rows read NULL.
+    # Added with ALTER so existing ledgers upgrade in place; nothing renamed.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(usage)")}
+    for col, typ in _BREAKDOWN_COLUMNS:
+        if col not in have:
+            conn.execute(f"ALTER TABLE usage ADD COLUMN {col} {typ}")
     conn.commit()
     _schema_ready = True
 
@@ -156,7 +181,8 @@ def record_usage(*, agent_id: str | None, transport: str | None,
                  channel_id: str | None, session_id: str | None,
                  user_id: str | None, user_handle: str | None,
                  model: str | None, usage: dict,
-                 outcome: str | None = None) -> None:
+                 outcome: str | None = None,
+                 breakdown: dict | None = None) -> None:
     """Append one raw usage row for a completed turn.
 
     `usage` uses the same keys anthropic_conversation.py already reads:
@@ -189,7 +215,14 @@ def record_usage(*, agent_id: str | None, transport: str | None,
         try:
             if not _schema_ready:
                 _ensure_schema(conn)
-            conn.execute(
+            bd = dict(breakdown or {})
+            if "cache_miss" not in bd and session_id:
+                miss, why = _cache_miss(conn, str(session_id), now, cache_read, cache_creation)
+                if miss is not None:
+                    bd["cache_miss"] = miss
+                    if miss and why and not bd.get("cache_miss_reason"):
+                        bd["cache_miss_reason"] = why
+            cur = conn.execute(
                 """
                 INSERT INTO usage (
                     ts, iso_ts, agent_id, transport, channel_id, session_id,
@@ -211,12 +244,46 @@ def record_usage(*, agent_id: str | None, transport: str | None,
                     total_tokens, est_cost, outcome, raw,
                 ),
             )
+            _cols = [c for c, _ in _BREAKDOWN_COLUMNS if bd.get(c) is not None]
+            if _cols:
+                conn.execute(
+                    f"UPDATE usage SET {', '.join(c + '=?' for c in _cols)} WHERE id=?",
+                    [bd[c] for c in _cols] + [cur.lastrowid],
+                )
             conn.commit()
             _maybe_purge(conn, now)
         finally:
             conn.close()
     except Exception as e:
         print_ts(f"usage_ledger: record_usage failed (continuing): {e}", error=True)
+
+
+def _cache_miss(conn, session_id: str, now: float, cache_read: int,
+                cache_creation: int) -> tuple[int | None, str]:
+    """Did this call re-write history the previous call had cached?
+
+    Compares with the previous row in the same session. A miss is: the previous
+    call cached a prefix (read+creation) of P tokens, it was recent enough for
+    the 1h cache to still hold it, and this call read well under P from cache
+    while writing a lot. Returns (None, "") when there's no previous call."""
+    try:
+        prev = conn.execute(
+            "SELECT ts, cache_read_tokens, cache_creation_tokens FROM usage "
+            "WHERE session_id=? AND ts<? ORDER BY ts DESC LIMIT 1",
+            (session_id, now),
+        ).fetchone()
+    except Exception:
+        return None, ""
+    if prev is None:
+        return None, ""
+    prev_prefix = int(prev[1] or 0) + int(prev[2] or 0)
+    if prev_prefix < 2000:
+        return 0, ""
+    if now - float(prev[0]) > 3600:
+        return 0, ""  # cache TTL passed: a re-write is expected, not a miss
+    if cache_read < prev_prefix * 0.5 and cache_creation > 2000:
+        return 1, "prefix changed"
+    return 0, ""
 
 
 def query_usage(since_ts: float, until_ts: float | None = None) -> list[dict]:

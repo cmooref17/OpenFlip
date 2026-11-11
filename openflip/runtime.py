@@ -617,6 +617,7 @@ class AgentRunner:
             for _c in self.conversations.values():
                 try:
                     _c._instruction_snapshot = None
+                    _c.pending_cache_miss_reason = "reload"
                 except Exception:
                     pass
         if not changed:
@@ -2760,6 +2761,22 @@ class AgentRunner:
             _cur_sources.append(("(deferred tools)", _deferred_block))
         _snap = getattr(conv, "_instruction_snapshot", None)
         _instr_note = ""
+        # What started this turn, for the usage ledger (additive logging).
+        try:
+            if auto_route_from_peer:
+                conv.turn_trigger, conv.turn_trigger_from = "peer_reply", auto_route_from_peer
+            elif originator_agent_id:
+                conv.turn_trigger, conv.turn_trigger_from = "peer_message", originator_agent_id
+            elif discord_message is not None or inbound is not None:
+                conv.turn_trigger = "user_message"
+                conv.turn_trigger_from = str(speaker_id) if speaker_id else None
+            else:
+                _tag = (log_tag or "").lower()
+                conv.turn_trigger = ("restart" if "restart" in _tag else
+                                     "cron" if "cron" in _tag or "synthetic" in _tag else "synthetic")
+                conv.turn_trigger_from = None
+        except Exception:
+            pass
         if _snap is None:
             _sys = conv.system_message or ""
             if _base_ext:
@@ -3011,6 +3028,14 @@ class AgentRunner:
             async with (_silent_typing(channel) if silent else _safe_typing(channel)):
                 while True:
                     turn_count += 1
+                    if turn_count == 2:
+                        # Rounds after the first are tool-loop continuations of
+                        # the same trigger (ledger 'trigger' field).
+                        try:
+                            _t0 = getattr(conv, "turn_trigger", None) or "turn"
+                            conv.turn_trigger = f"{_t0}+tool_loop"
+                        except Exception:
+                            pass
                     if turn_count > MAX_TOOL_TURNS:
                         # Mirror queryLoop's max_turns return ({ reason: 'max_turns' }).
                         print_ts(f"{COLOR_YELLOW}{log_tag}Tool loop exceeded {MAX_TOOL_TURNS} turns; aborting.{COLOR_END}", agent=agent.id)
@@ -3164,6 +3189,7 @@ class AgentRunner:
                         # snapshot next turn (Claude Code re-reads instruction
                         # files on compaction too).
                         conv._instruction_snapshot = None
+                        conv.pending_cache_miss_reason = "compaction"
                         try:
                             conv.messages.append(ChatMessage(
                                 'user',
