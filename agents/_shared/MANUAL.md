@@ -3290,13 +3290,14 @@ visible right there.
 - `/agents` — agent overview panel: enable/disable, reload, per-agent
   tool toggles.
 
-### `/usage` — Claude plan limits (owner-only)
+### `/usage` — Claude plan limits (admin)
 
 `/usage` shows the subscription plan limits the anthropic provider's OAuth login
 is under — the same numbers Claude Code's `/usage` shows: the session (5-hour)
 and weekly bars, each with its percent used and reset time (machine-local time),
 plus per-model weekly buckets (Opus/Sonnet) and extra-usage credits when the
-account has them. Owner-only, ephemeral, read-only. Works as the Discord slash
+account has them. Admin-gated (owner + `admin_ids` / `admin_handles`, the same tier as
+`/reload`), ephemeral, read-only. Works as the Discord slash
 command and as a text-prefix command on every other transport (iMessage etc.); both
 answer without a model call, so it still works when the plan is out of usage. Source:
 `GET {api_base}/api/oauth/usage` with the OAuth bearer token

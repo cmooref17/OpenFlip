@@ -521,9 +521,9 @@ def register_commands(bot: nextcord.ext.commands.Bot, runner):
         await agents_ui.open_agents_panel(interaction, runner_agent_id=runner.agent.id)
 
     @bot.slash_command(name="usage",
-        description="(owner) Claude plan usage: session and weekly limits, like Claude Code's /usage.")
+        description="(admin) Claude plan usage: session and weekly limits, like Claude Code's /usage.")
     async def usage_cmd(interaction: nextcord.Interaction):
-        if not await _owner_check(interaction): return
+        if not await _admin_check(interaction): return
         await interaction.response.defer(ephemeral=True)
         from . import plan_usage
         try:

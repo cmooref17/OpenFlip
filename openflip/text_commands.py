@@ -23,7 +23,7 @@ import os
 import shutil
 from typing import Any
 
-from .acl import is_owner
+from .acl import is_owner, is_admin
 from .utils import print_ts, save_json, COLOR_YELLOW, COLOR_END
 
 
@@ -232,9 +232,10 @@ async def handle_text_command(
     if head == "/usage":
         # Plan limits (session + weekly), same as the Discord /usage slash command.
         # Answered here without a model call, so it still works when the plan is
-        # out of usage, which is exactly when you want to see it.
-        if not is_owner(speaker_id, transport=tname, handle=handle):
-            await _send(transport, session_id, channel, "Owner only.")
+        # out of usage, which is exactly when you want to see it. Read-only, so
+        # admins may run it too (owner is always an admin).
+        if not is_admin(speaker_id, integration=tname, handle=handle):
+            await _send(transport, session_id, channel, "Admins only.")
             return True
         from . import plan_usage
         try:
