@@ -96,3 +96,30 @@ def format_plan_usage(data: dict) -> str:
         used, lim = extra.get("used_credits"), extra.get("monthly_limit")
         lines.append(f"Extra usage: on (used {used} of {lim})")
     return "\n".join(lines)
+
+
+async def describe_limit_hit() -> tuple[str, str, str]:
+    """After a 429: which plan limit is full and when it resets.
+
+    Returns (limit_label, resets_at_iso, human_text). Reads the same
+    /api/oauth/usage source as /usage. Picks the bucket at or nearest 100%.
+    Never raises; returns ("", "", "") when the limit can't be read."""
+    import asyncio
+    try:
+        data = await asyncio.wait_for(fetch_plan_usage(), timeout=10)
+    except Exception:
+        return "", "", ""
+    best = None
+    for key, val in (data or {}).items():
+        if not isinstance(val, dict) or val.get("utilization") is None:
+            continue
+        pct = float(val.get("utilization") or 0)
+        if best is None or pct > best[1]:
+            best = (key, pct, val.get("resets_at") or "")
+    if best is None:
+        return "", "", ""
+    key, pct, resets = best
+    label = _LABELS.get(key, key)
+    when = _reset_text(resets)
+    text = f"{label} limit is at {pct:.0f}%" + (f", {when}" if when else "")
+    return label, resets, text

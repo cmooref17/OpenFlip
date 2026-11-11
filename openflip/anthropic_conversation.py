@@ -1225,6 +1225,14 @@ class AnthropicConversation(SessionOverridesMixin):
         """
         return self.effective_effort()
 
+    def _breakdown_with_limit(self) -> dict | None:
+        bd = dict(getattr(self, "_request_breakdown", None) or {})
+        lim = getattr(self, "pending_limit", None)
+        if lim:
+            bd["limit_type"], bd["limit_resets_at"] = lim
+            self.pending_limit = None
+        return bd or None
+
     def _agent_dir(self) -> str:
         return os.path.dirname(self.agent.path)
 
@@ -2502,8 +2510,29 @@ class AnthropicConversation(SessionOverridesMixin):
                             _ra = float(resp.headers.get("retry-after", "") or 0)
                         except (TypeError, ValueError):
                             _ra = 0.0
+                        _rl_msg = "⚠️ Anthropic rate limit (429). Subscription quota — wait and retry."
+                        try:
+                            from .plan_usage import describe_limit_hit
+                            _lbl, _rst, _txt = await describe_limit_hit()
+                            if _txt:
+                                _rl_msg = f"⚠️ Claude usage limit hit (429): {_txt}."
+                            self.pending_limit = (_lbl or None, _rst or None)
+                            # A 429 carries no usage, so no normal ledger row
+                            # is written. Record a zero-token "rate_limited"
+                            # row so limit hits are queryable (additive).
+                            from . import usage_ledger as _ul
+                            _cid = getattr(self, "conversation_id", "") or ""
+                            _tr, _ch = (_cid.split(":", 1) if ":" in _cid else (None, _cid or None))
+                            _ul.record_usage(
+                                agent_id=self.agent.id, transport=_tr, channel_id=_ch,
+                                session_id=_cid or None, user_id=None, user_handle=None,
+                                model=self.model, usage={}, outcome="rate_limited",
+                                breakdown=self._breakdown_with_limit(),
+                            )
+                        except Exception:
+                            pass
                         yield FrameworkErrorEvent(
-                            message="⚠️ Anthropic rate limit (429). Subscription quota — wait and retry.",
+                            message=_rl_msg,
                             kind="rate_limit",
                             status=429,
                             retry_after=_ra,
@@ -2723,7 +2752,7 @@ class AnthropicConversation(SessionOverridesMixin):
                                 model=self.model,
                                 usage=_final_usage,
                                 outcome=_outcome,
-                                breakdown=getattr(self, "_request_breakdown", None),
+                                breakdown=self._breakdown_with_limit(),
                             )
                         except Exception as _led_e:
                             print_ts(

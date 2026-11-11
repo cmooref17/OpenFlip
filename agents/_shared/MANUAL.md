@@ -3351,6 +3351,14 @@ replies with the error instead of numbers.
 (The old `/usage` that aggregated the usage ledger by window/group was removed
 2026-10-13. The ledger itself and the web dashboard's /usage page are unchanged.)
 
+### Rate-limit errors name the limit
+
+On a 429 the anthropic provider reads `/api/oauth/usage` (10s timeout, never
+fatal) and the user-facing error says which plan limit is full and when it
+resets, e.g. "Claude usage limit hit (429): Weekly (all models) limit is at
+100%, resets Sun Nov 15, 7:59 AM (in 89h 8m)." If the lookup fails it falls
+back to the old generic text. `plan_usage.describe_limit_hit()`.
+
 ### Compaction summary + claude_code compaction window
 
 - **Anthropic provider:** server-side compaction streams its whole summary in
@@ -3395,7 +3403,7 @@ aggregations over these rows.
   session had cached within the 1h TTL (read < half the previous prefix and
   >2k written); `cache_miss_reason` names it when known (`reload`, `compaction`,
   else `prefix changed`). `limit_type` / `limit_resets_at` are reserved for 429s
-  (not filled yet). Existing ledgers upgrade in place via ALTER TABLE. Filled by
+  (filled on a 429: the plan bucket nearest 100% and its reset time, from the same `/api/oauth/usage` source as `/usage`; a zero-token `outcome=rate_limited` row is written since a 429 has no usage). Existing ledgers upgrade in place via ALTER TABLE. Filled by
   the anthropic provider today. Example:
   `SELECT iso_ts, trigger, trigger_from, cache_read_tokens, cache_creation_tokens,
   cache_miss_reason FROM usage WHERE cache_miss=1 ORDER BY ts DESC LIMIT 20;`
