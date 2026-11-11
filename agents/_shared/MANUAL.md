@@ -742,6 +742,24 @@ a blocked call fails with a model-visible permission error, and the
 per-speaker user preamble lists tools the current speaker can't use so
 you can decline up front.
 
+**Deferred tools (Claude Code's tool search, `openflip/tool_deferral.py`).**
+On the anthropic provider every definition is still sent, but tools outside
+the always-loaded set carry `defer_loading: true`, so the API keeps them out
+of context. Their names are listed in the system prompt (a "Deferred tools"
+section, part of the per-session instruction snapshot so it stays cached).
+To use one, call `tool_search(query="select:name1,name2")` (or keywords)
+first: it returns `tool_reference` blocks that the API expands into full
+definitions, and the tool stays loaded for the rest of the conversation
+(the references are persisted on the tool message and re-sent). Measured
+2026-11-11: 111 tools, ~22k tokens in context before, ~3k after.
+`tool_search` is always callable, like the memory tools. Config
+(`config.json`, all optional): `"tool_deferral": {"enabled": true,
+"always_load": [...names...], "providers": ["anthropic"]}`. Default
+always-loaded set: tool_search, read_file, write_file, edit_file,
+list_files, run_command, web_search, fetch_url, send_message,
+talk_to_agent, end_chain, save_memory, search_memory, read_memory.
+Other providers (ollama, openai, claude_code) get the full list as before.
+
 Tool docstrings are load-bearing: the first paragraph is the
 model-visible description, and the `Args:` block becomes the
 per-parameter JSON-schema descriptions sent to the provider (`@tool` in

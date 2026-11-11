@@ -805,8 +805,21 @@ async def _load_oauth_access_token(force_refresh: bool = False) -> str | None:
     return (fresh_creds.get("claudeAiOauth") or {}).get("accessToken")
 
 
-def _build_tool_schemas(tools: list[Callable]) -> list[dict]:
-    """Convert openflip tool callables to Anthropic Messages API tool format."""
+def _build_tool_schemas(tools: list[Callable], deferred: set[str] | None = None) -> list[dict]:
+    """Convert openflip tool callables to Anthropic Messages API tool format.
+
+    Tools named in `deferred` get `defer_loading: true` (Claude Code's tool
+    search): the API keeps them out of context until tool_search loads them.
+    """
+    schemas = _build_tool_schemas_plain(tools)
+    if deferred:
+        for sc in schemas:
+            if sc["name"] in deferred:
+                sc["defer_loading"] = True
+    return schemas
+
+
+def _build_tool_schemas_plain(tools: list[Callable]) -> list[dict]:
     schemas = []
     for func in tools or []:
         spec = getattr(func, "tool_spec", None)
@@ -918,7 +931,16 @@ def _openflip_msgs_to_anthropic(messages: list, system_prompt: str) -> tuple[str
                 while j < n and _msg_role(messages[j]) == "tool":
                     tm = messages[j]
                     tid = tm.get("tool_use_id", "") if hasattr(tm, "get") else ""
-                    lookahead_results.append((j, tid, _msg_content(tm)))
+                    tcontent = _msg_content(tm)
+                    # tool_search results carry deferred-tool names; send them as
+                    # tool_reference blocks so the API loads those tools.
+                    trefs = (tm.get("tool_references", None) if hasattr(tm, "get") else None) or []
+                    if trefs:
+                        blocks_ = [{"type": "tool_reference", "tool_name": str(r)} for r in trefs]
+                        if tcontent:
+                            blocks_.append({"type": "text", "text": tcontent})
+                        tcontent = blocks_
+                    lookahead_results.append((j, tid, tcontent))
                     j += 1
 
                 call_ids = [getattr(tc, "tool_use_id", "") or "" for tc in tool_calls]
@@ -2230,7 +2252,23 @@ class AnthropicConversation(SessionOverridesMixin):
         # Convert openflip tools to Anthropic JSON schema. Same call as
         # chat() — use the canonical helper that takes the list and
         # returns a list, not a per-tool builder.
-        tool_schemas = _build_tool_schemas(tools or [])
+        # Deferred tool loading (Claude Code's tool search): tools outside the
+        # always-load set carry defer_loading, so only their names (listed in
+        # the system prompt, see runtime/tool_deferral) are in context.
+        _deferred: set[str] = set()
+        try:
+            from .tool_deferral import deferral_enabled, deferred_names, set_current_catalog, SEARCH_TOOL_NAME
+            _names = [f.__name__ for f in (tools or [])]
+            if deferral_enabled("anthropic") and SEARCH_TOOL_NAME in _names:
+                _deferred = set(deferred_names(_names))
+                set_current_catalog(sorted(_deferred), {
+                    f.__name__: ((getattr(f, "tool_spec", None) or {}).get("description") or "")
+                    for f in (tools or []) if f.__name__ in _deferred
+                })
+        except Exception as _def_err:
+            print_ts(f"{COLOR_YELLOW}tool deferral skipped: {_def_err}{COLOR_END}", agent=self.agent.id)
+            _deferred = set()
+        tool_schemas = _build_tool_schemas(tools or [], _deferred)
         tools_map: dict[str, Callable] = {}
         for func in tools or []:
             tools_map[func.__name__] = func

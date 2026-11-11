@@ -42,6 +42,10 @@ class ToolResult:
     # tool outcomes — e.g. spawn_subagents' worker scoring — count denials
     # separately from other failures without matching the error string.
     denied: bool = False
+    # Names of deferred tools to load (tool_search). The anthropic provider sends
+    # them as `tool_reference` blocks in the tool_result; the API expands them
+    # into full definitions. See openflip/tool_deferral.py.
+    tool_references: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:

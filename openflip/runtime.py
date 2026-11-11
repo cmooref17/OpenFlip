@@ -2745,6 +2745,19 @@ class AgentRunner:
             _cur_sources.append(("(tool usage rules)", _base_ext))
         if _mem_block:
             _cur_sources.append(("MEMORY.md", _mem_block))
+        # Deferred tools (Claude Code's tool search): their names ride in the
+        # snapshot so the cached prefix stays stable; full definitions load
+        # on demand via tool_search. See tool_deferral.py.
+        _deferred_block = ""
+        try:
+            from .tool_deferral import deferral_enabled, names_block, SEARCH_TOOL_NAME
+            _api_names = [f.__name__ for f in (api_tool_funcs or [])]
+            if deferral_enabled(agent.provider or "") and SEARCH_TOOL_NAME in _api_names:
+                _deferred_block = names_block(_api_names)
+        except Exception as _dt_err:
+            print_ts(f"{COLOR_YELLOW}deferred tool list skipped: {_dt_err}{COLOR_END}", agent=agent.id)
+        if _deferred_block:
+            _cur_sources.append(("(deferred tools)", _deferred_block))
         _snap = getattr(conv, "_instruction_snapshot", None)
         _instr_note = ""
         if _snap is None:
@@ -2753,6 +2766,8 @@ class AgentRunner:
                 _sys = _sys + "\n" + _base_ext
             if _mem_block:
                 _sys = _sys + "\n\n" + _mem_block
+            if _deferred_block:
+                _sys = _sys + "\n\n" + _deferred_block
             _snap = InstructionSnapshot.capture(_cur_sources, _sys)
             conv._instruction_snapshot = _snap
         else:
@@ -3682,6 +3697,12 @@ class AgentRunner:
                         tu_id = getattr(_tc_obj, "tool_use_id", "") or ""
                         if tu_id:
                             tool_msg["tool_use_id"] = tu_id
+                        # tool_search: deferred tools to load. Kept on the message
+                        # (persisted) so every later request re-sends the same
+                        # tool_reference blocks and the tools stay loaded.
+                        _refs = list(getattr(tres, "tool_references", None) or [])
+                        if _refs:
+                            tool_msg["tool_references"] = _refs
                         conv.messages.append(tool_msg)
 
                     # Near the round cap: tell the model BEFORE it gets cut off, so it can

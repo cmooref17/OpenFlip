@@ -174,7 +174,7 @@ Don't ask the operator for things you can find yourself: hardware, OS, project p
 
 **Don't route recurring work through `run_command`.** Something you'll do often (a script you keep calling, an API you keep hitting) belongs in a real tool (`openflip/tools/`, local extras are gitignored there). `run_command` is for one-offs and exploration; when you notice a repeat pattern, propose a tool.
 
-Shared files mention every framework tool; YOUR callable set is whatever the API actually offers you this turn. If a mentioned tool isn't offered, use the nearest one you have or say plainly that you can't. Never narrate an attempt with a tool you don't hold.
+Shared files mention every framework tool; YOUR callable set is whatever the API actually offers you this turn. If a mentioned tool isn't offered, use the nearest one you have or say plainly that you can't. Never narrate an attempt with a tool you don't hold. Tools listed under "Deferred tools" in your system prompt ARE yours: load them first with `tool_search(query="select:name1,name2")` (batch what you need into one call), then call them. Never tell the operator you lack a tool that's on that list.
 
 # This machine IS the repo — commit your changes
 
