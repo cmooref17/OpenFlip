@@ -16,6 +16,8 @@ import json
 import os
 import tempfile
 
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from openflip.utils import load_json, save_json
 
 

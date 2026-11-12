@@ -45,6 +45,7 @@ from openflip.session_overrides import (
     normalize_override, session_command_text, parse_session_args,
     compaction_trigger_for_window, provider_for_model,
 )
+from openflip.session_overrides import PROVIDER_KEYS  # noqa: E402
 from openflip.config_global import get_config, get_model_context_window, get_compaction_trigger, get_effort, get_max_tokens
 from openflip.anthropic_conversation import AnthropicConversation
 from openflip.openai_conversation import OpenAIConversation
@@ -131,7 +132,7 @@ def main() -> int:
     check("no overrides: trigger == config for agent model", conv.effective_compaction_trigger() == base_trigger)
     check("no overrides: effort == config for agent model", conv._effort_level() == base_effort)
     check("no overrides: max_tokens == config for agent model", conv.effective_max_tokens() == get_max_tokens(ag.model, "anthropic"))
-    check("report has one row per anthropic key", [r[0] for r in conv.overrides_report()] == ["model", "context_window", "compaction_trigger", "max_tokens", "effort", "memory"])
+    check("report has one row per anthropic key", [r[0] for r in conv.overrides_report()] == list(PROVIDER_KEYS["anthropic"]))
 
     ok, msg = conv.set_override("model", "anthropic/claude-sonnet-4-6")
     check("set session model ok", ok)
@@ -247,7 +248,7 @@ def main() -> int:
     check("ollama overrides reload from meta", oc2.overrides.get("memory") is False and oc2.overrides.get("model") == "llama3.1:8b")
     oc2.clear_history()
     check("ollama clear_history removes the sidecar", not os.path.isfile(oc2._meta_path()))
-    check("ollama report keys", [r[0] for r in oc.overrides_report()] == ["model", "context_window", "options", "memory"])
+    check("ollama report keys", [r[0] for r in oc.overrides_report()] == list(PROVIDER_KEYS["ollama"]))
 
     print("\n(f2) openai")
     ag_oa = _agent(tmp, provider="openai", model="openai/gpt-5.1")
@@ -263,7 +264,7 @@ def main() -> int:
     oa._resync_model()
     check("openai model resync uses session model", oa.model == "gpt-5.2")
     check("openai effort_override property exists (so /effort works)", oa.effort_override == "minimal")
-    check("openai report keys", [r[0] for r in oa.overrides_report()] == ["model", "context_window", "max_tokens", "effort", "memory"])
+    check("openai report keys", [r[0] for r in oa.overrides_report()] == list(PROVIDER_KEYS["openai"]))
 
     print("\n(g) /session command body + ingress bulk-apply")
     check("parse: bare", parse_session_args("") == ("show", "", ""))
