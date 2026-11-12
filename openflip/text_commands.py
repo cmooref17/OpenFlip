@@ -597,6 +597,16 @@ async def _do_status(runner, ch_id, channel, transport, session_id) -> None:
                      error=True, agent=agent.id)
             on_disk = "? (read failed — see log)"
         lines.append(f"• Messages: {in_mem} in memory / {on_disk} on disk")
+    # Task checklist (todo_write), when this conversation has one open.
+    try:
+        from .tools.todo import load_todos, format_todos
+        _tconv = _conversation_id_for_channel(channel, ch_id)
+        _todos = load_todos(os.path.dirname(agent.path), _tconv) if _tconv else []
+        if _todos:
+            _done = sum(1 for t in _todos if t.get("status") == "completed")
+            lines.append(f"• Tasks ({_done}/{len(_todos)} done):\n" + format_todos(_todos))
+    except Exception as e:
+        print_ts(f"/status: task list read failed: {e}", error=True, agent=agent.id)
     await _send(transport, session_id, channel, "\n".join(lines))
 
 

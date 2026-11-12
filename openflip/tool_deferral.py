@@ -32,7 +32,7 @@ DEFAULT_ALWAYS_LOAD = (
     "read_file", "write_file", "edit_file", "list_files",
     "run_command", "web_search", "fetch_url",
     "send_message", "talk_to_agent", "end_chain",
-    "save_memory", "search_memory", "read_memory",
+    "save_memory", "search_memory", "read_memory", "todo_write",
 )
 
 

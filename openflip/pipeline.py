@@ -385,8 +385,9 @@ def should_respond(agent: Agent, inbound: InboundMessage, bot_user_id: int) -> b
 
 MEMORY_TOOL_NAMES = {"save_memory", "delete_memory", "update_core_memory", "search_memory", "read_memory", "list_memory_files", "reindex_memory"}
 # Framework tools every agent may call regardless of allowed_tools (they only
-# read framework state): tool_search loads deferred tool definitions.
-FRAMEWORK_TOOL_NAMES = {"tool_search"}
+# touch framework state): tool_search loads deferred tool definitions;
+# todo_write keeps the conversation's task checklist.
+FRAMEWORK_TOOL_NAMES = {"tool_search", "todo_write"}
 
 
 def strip_memory_tools(funcs: list) -> list:
@@ -488,7 +489,7 @@ def build_visible_tools(agent: Agent, *, speaker_id, speaker_role_ids, channel_i
     # cap memory injection too, or "no tools / chat only" wouldn't hold. None =
     # no narrowing → inject as before; a list (incl. []) → inject only named ones.
     _mem_allow: set[str] | None = None if tool_allowlist is None else {str(t) for t in tool_allowlist}
-    # Framework tools (tool_search) are always callable, like memory tools,
+    # Framework tools (tool_search, todo_write) are always callable, like memory tools,
     # unless a restrictive per-session allowlist leaves them out.
     for fname in sorted(FRAMEWORK_TOOL_NAMES):
         if _mem_allow is not None and fname not in _mem_allow:
