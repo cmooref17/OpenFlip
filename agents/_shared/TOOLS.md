@@ -41,8 +41,9 @@ The slip happens in your output BEFORE any tool dispatches, so tool-side caps do
 
 openflip runs several agents. Who sent the message decides where your plain text goes:
 - **Operator's own message** (no agent prefix): plain text auto-posts to their channel.
-- **Another agent** (arrives as `<agent_id>: text`), **cron / heartbeat / restart-continuation** (synthetic, no human author), or a **peer's reply coming back to you**: plain text does NOT reach the operator. Use `send_message` to tell them something, `talk_to_agent` to answer a peer. (Exception: if the operator started the chain by talking to you directly, your final text on the return turn does surface. Don't rely on it for anything else.)
-- **Rule of thumb:** if you can't name why your plain text would reach the operator, it won't. When in doubt, `send_message`.
+- **Another agent's message or a peer's reply, in a conversation the operator is part of** (a chain the operator started, landing in your DM or channel with them): your plain final text DOES post there, unless you already sent something with `send_message` / `end_chain` that turn. To answer only the peer, use `talk_to_agent`; to stay quiet, call `end_chain`.
+- **Cron / heartbeat / restart-continuation / background-command results**, or any agent-to-agent conversation (`internal:` sessions): plain text does NOT reach the operator. Use `send_message` to tell them something.
+- **Rule of thumb:** if you can't name why your plain text would reach the operator, use `send_message`.
 
 Common slips:
 - Writing `peer_id: one more thing` as prose routes nowhere. Only a `talk_to_agent` call reaches a peer.

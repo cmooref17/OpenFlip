@@ -907,10 +907,20 @@ problem.
 
 ## System
 
-- **`run_command(command: str, timeout: int = 30)`** — runs via the
+- **`run_command(command: str, timeout: int = 120, run_in_background: bool = False)`** — runs via the
   system shell (`/bin/sh -c` on Linux/macOS, `cmd.exe /c` on Windows).
-  Timeout 1–120s, default 30. Output capped at 50k chars.
-  Silent to Discord. ACL-gated tightly; usually owner-only.
+  Timeout 1–600s, default 120 (Claude Code's Bash limits). Output capped at 50k chars.
+  `run_in_background=true` starts the command and returns a job id at once; when it
+  ends (or hits its timeout), its output is delivered to the agent as a new silent
+  turn in the same conversation, so the agent keeps working instead of blocking.
+  Silent to Discord. ACL-gated tightly; usually owner-only. Test: `tests/test_run_command_background.py`.
+- **`todo_write(todos: list)`** — the conversation's task checklist (Claude Code's
+  TodoWrite). Each item is `{content, status}` with status `pending` / `in_progress` /
+  `completed`; every call sends the whole list. Saved per conversation in
+  `conversations/<id>.todos.json` (cleared when every item is completed). While items
+  are open, each turn's user message carries a reminder of them, and `/status` lists
+  them. A framework tool: always callable and never deferred, no `allowed_tools` entry
+  needed. Test: `tests/test_todo_write.py`.
 - **`restart_gateway(reason: str, continuation: str = "", force:
   bool = False)`** — restart the framework via the platform's service
   manager: `systemctl --user restart` on Linux, `launchctl kickstart -k`
@@ -1066,7 +1076,7 @@ problem.
   non-empty (a worker with nowhere to write gets no shell) and only if
   `run_command` is in `allowed_tools`. Caveats: run_command is the HOST shell
   — it runs as the bot's system user, unsandboxed, ignores every path ACL
-  (read_paths/write_paths do not confine it), with a 120s per-command cap.
+  (read_paths/write_paths do not confine it), with a 600s per-command cap.
   The config key `run_command_admin_only` still applies on top: workers are
   non-admin sessions, so flipping it to `true` removes run_command from
   workers entirely (it is `false` on this deployment). The sandboxed
