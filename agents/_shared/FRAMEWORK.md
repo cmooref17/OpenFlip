@@ -118,6 +118,20 @@ Take the time you need; rushing creates debt. Fix the root cause, not the sympto
 
 **Never hardcode values that mirror something outside the code.** Versions, model IDs, API minimums, install paths: read them from their real source at runtime. If a fallback literal is truly unavoidable, comment it as a last-resort floor. A hardcoded copy of external state goes stale silently and breaks every agent the day the outside world moves (2026-09-22: a hardcoded Claude Code version in the User-Agent locked every agent out of a new model). Fix one at the source the turn you find it.
 
+# Building and changing software
+
+Applies whenever you write or change code, scripts, addons or config that something runs. A chat answer isn't software; a one-off shell command isn't either.
+
+- **Git first.** Every project you build lives in a git repo; never edit the only copy. If a project the operator owns has no repo, make one before your first change. Never add git, tests or a `CLAUDE.md` to someone else's repo. Inside this openflip install, follow "This machine IS the repo": framework files commit and push; personal agent files stay gitignored, so give a personal project its own nested repo (never `git add -f`) and never push it anywhere unless the operator says to.
+- **One test command, written down.** Every project has one command that runs all its tests (e.g. `tests/run.sh`, non-zero exit on failure) and a `CLAUDE.md` saying what it is, how it's laid out, and how to build, run all tests and run one test. Read it before you start; fix it when it's wrong.
+- **Plan big changes, then keep going.** Before a change that touches several files or anything live, write a short plan in your reply or a design file (what changes, which files, how you'll test and verify it) and check it against the actual code. A plan is not a stop: only pause for the cases in "Ask only when".
+- **Test what it does, not that it loads.** Write or extend a test that checks the behaviour you changed, with fakes for anything you can't run offline. A syntax check is not a test. Tests live in the project (never `/tmp`) and run against the live files, never a copy: a test that loads a copy passes while the real code is broken.
+- **When a test fails, find which side is wrong first.** A fake that doesn't match the real API isn't a code bug; a real bug isn't fixed by loosening the test.
+- **Run the whole suite and show the result.** Run the project's full test command before calling anything done and put the pass/fail lines in your reply. If it takes longer than one command allows, run it detached (e.g. `systemd-run --user --collect`, output to a file) and read the result; never skip it because it's slow.
+- **Then verify it for real.** Passing tests prove your assumptions, not the outcome. Drive the actual feature end to end and observe it working (a log line, an output file, a real response) through a safe path: a dry run, a read-only command, a test item, your own DM. Never break an existing rule to verify. Until then say "built, tests pass, not confirmed live yet"; if no safe live path exists, say "not confirmed live".
+- **Commit only after the tests pass** (framework files per "This machine IS the repo"). When a test catches something, fix the code or the test in the same change.
+- **Can't test it? Say so in the same reply,** with what you checked instead. Only stop and ask if the change is also destructive or irreversible.
+
 # Multi-agent collaboration
 
 - Push back on collaborators on real merits issues, not just on the operator. No yes-man dynamic in either direction.
