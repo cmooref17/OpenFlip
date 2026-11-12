@@ -124,6 +124,45 @@ class _SessionChannel:
         return f"_SessionChannel(channel={self._real!r}, conversation_id={self._session.conversation_id!r})"
 
 
+def _peer_turn_text_reaches_human(
+    *,
+    chain_root_operator: bool,
+    final_text: str,
+    channel_session_transport: str,
+    channel_conversation_id: str,
+    already_delivered: bool,
+) -> bool:
+    """Should a peer-triggered turn's plain final text post to the channel it ran in?
+
+    Claude Code parity: "All text you output outside of tool use is displayed to
+    the user." A turn that runs inside a REAL human conversation (the operator's
+    DM or channel with this agent) and ends in plain text leaves that text in the
+    conversation's history; if it never posts, the human's own conversation holds
+    an answer they never saw. That silently ate replies on 2026-11-11/12 (an agent
+    answered the operator after a peer's message and the text only reached the log).
+
+    Posts when ALL hold:
+      - a human is at the chain root (operator_channel / legacy ""), never a
+        cron / kairos / heartbeat / silent_agent_chain chain;
+      - the turn runs in a real channel, not an `internal:` peer conversation
+        (agent-to-agent traffic stays private, as in the 2026-06 leak fix);
+      - there is real text (not empty, not STAY_SILENT);
+      - nothing was delivered to the human this turn already (send_message,
+        end_chain or a direct post), so there's no double-post.
+    """
+    if not chain_root_operator:
+        return False
+    text = (final_text or "").strip()
+    if not text or text == "STAY_SILENT":
+        return False
+    if already_delivered:
+        return False
+    if (channel_session_transport == "internal"
+            or str(channel_conversation_id or "").startswith("internal:")):
+        return False
+    return True
+
+
 def _terminator_text_surfaces(
     *,
     is_chain_terminator: bool,
@@ -2939,6 +2978,19 @@ class AgentRunner:
                 )
         if _instr_note and not _verbatim:
             framed_user = f"{framed_user}\n\n<system-reminder>\n{_instr_note}\n</system-reminder>"
+        # Task checklist (todo_write, Claude Code's TodoWrite): while this
+        # conversation's list has open items, remind the agent on each turn so a
+        # long job can't quietly stop halfway. Rides on the user message (end of
+        # the conversation) like the instruction note, so the cached prefix holds.
+        if not _verbatim:
+            try:
+                from .tools.todo import todo_reminder
+                _todo_conv = (_conv_id or getattr(conv, "conversation_id", "") or "")
+                _todo_note = todo_reminder(os.path.dirname(agent.path), _todo_conv)
+                if _todo_note:
+                    framed_user = f"{framed_user}\n\n<system-reminder>\n{_todo_note}\n</system-reminder>"
+            except Exception as _todo_err:
+                print_ts(f"{COLOR_YELLOW}todo reminder skipped: {_todo_err}{COLOR_END}", agent=agent.id)
         conv.messages.append(ChatMessage('user', framed_user))
 
         async def _restore_system():
@@ -4270,11 +4322,23 @@ class AgentRunner:
                         # leaks into the operator's DM as unsolicited noise
                         # (the 2026-05-23 complaint). The agent can still
                         # reach the operator explicitly via send_message.
-                        if (auto_post_final_text
+                        _rp_sess = getattr(channel, "_session", None)
+                        _peer_reply_visible = _peer_turn_text_reaches_human(
+                            chain_root_operator=_chain_root_operator,
+                            final_text=final_text,
+                            channel_session_transport=(
+                                getattr(_rp_sess, "transport", "") if _rp_sess is not None else ""),
+                            channel_conversation_id=(
+                                getattr(_rp_sess, "conversation_id", "") if _rp_sess is not None else ""),
+                            already_delivered=(reply_equivalent_tool_fired or _posted_assistant_text),
+                        ) and not (media_only and any_attachments_this_turn
+                                   and not _human_softinject_drained_this_turn)
+                        if ((auto_post_final_text
                                 and not silent
                                 and not (media_only and any_attachments_this_turn
                                          and not _human_softinject_drained_this_turn)
-                                and _human_softinjected_this_turn):
+                                and _human_softinjected_this_turn)
+                                or _peer_reply_visible):
                             try:
                                 for chunk in _split_for_discord(final_text):
                                     await _safe_channel_send(channel, chunk)
@@ -4498,7 +4562,17 @@ class AgentRunner:
                         # terminators stay silent (leak fix preserved). See
                         # _terminator_text_surfaces for the full discriminator.
                         _ts_sess = getattr(channel, "_session", None)
-                        _surface = _terminator_text_surfaces(
+                        _surface = _peer_turn_text_reaches_human(
+                            chain_root_operator=_chain_root_operator,
+                            final_text=final_text,
+                            channel_session_transport=(
+                                getattr(_ts_sess, "transport", "") if _ts_sess is not None else ""),
+                            channel_conversation_id=(
+                                getattr(_ts_sess, "conversation_id", "") if _ts_sess is not None else ""),
+                            already_delivered=(reply_equivalent_tool_fired or _posted_assistant_text),
+                        ) and not (media_only and any_attachments_this_turn
+                                   and not _human_softinject_drained_this_turn)
+                        _surface = _surface or _terminator_text_surfaces(
                             is_chain_terminator=is_chain_terminator,
                             chain_root_operator=_chain_root_operator,
                             final_text=final_text,
