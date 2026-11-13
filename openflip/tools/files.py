@@ -291,9 +291,71 @@ def _atomic_write_bytes(full_path: str, content: bytes) -> None:
         raise
 
 
+# Image files read_file shows to the model as a real image (sniffed from the
+# first bytes, not the extension). Same formats the vision path accepts.
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+
+
+def _sniff_image(full: str) -> str | None:
+    try:
+        with open(full, "rb") as f:
+            head = f.read(16)
+    except OSError:
+        return None
+    for magic, mt in _IMAGE_MAGIC:
+        if head.startswith(magic):
+            return mt
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+async def _read_image(full: str, path: str, media_type: str) -> ToolResult:
+    """Queue an image file into the model's vision for this turn (the same
+    queue the screen tool and fetch_discord_message use), downscaled so the
+    longest side fits the vision limit."""
+    import io
+    from PIL import Image
+    from .fetch_discord_message import _queue_image_bytes_for_vision, _conv_for_current_turn
+    from ..tool_executor import CURRENT_AGENT
+    from ..registry import RUNNERS
+    try:
+        im = Image.open(full)
+        w, h = im.size
+        if max(w, h) > _READ_IMAGE_MAX_EDGE:
+            k = _READ_IMAGE_MAX_EDGE / max(w, h)
+            im = im.resize((round(w * k), round(h * k)), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.convert("RGB").save(buf, "PNG")
+    except Exception as e:
+        return ToolResult.fail(f"'{path}' looks like an image ({media_type}) but could not be opened: {e}")
+    try:
+        runner = RUNNERS.get(CURRENT_AGENT.get().id)
+    except LookupError:
+        runner = None
+    ok, reason = await _queue_image_bytes_for_vision(
+        buf.getvalue(), os.path.basename(full), "image/png",
+        _conv_for_current_turn(runner) if runner else None)
+    if not ok:
+        return ToolResult.fail(f"Image '{path}' ({w}x{h}) could not be shown to you: {reason}")
+    return ToolResult(model_feedback=(
+        f"Image file '{path}' ({w}x{h} {media_type}) is attached to your next view: "
+        f"look at it there and describe what you actually see."))
+
+
+_READ_IMAGE_MAX_EDGE = 1920  # longest side sent to vision, same cap as the screen tool
+
+
 @tool
 async def read_file(path: str) -> ToolResult:
-    """Read a text file. Absolute paths or relative to your agent folder.
+    """Read a file. Text files return their text. Image files (png, jpg, gif,
+    webp) are shown to you as a real image you can look at. Absolute paths or
+    relative to your agent folder.
 
     Args:
         path: Path to the file.
@@ -306,10 +368,17 @@ async def read_file(path: str) -> ToolResult:
         return ToolResult.fail(f"File not found: {path}")
     if os.path.isdir(full):
         return ToolResult.fail(f"'{path}' is a directory, not a file. Use list_files.")
+    media_type = _sniff_image(full)
+    if media_type:
+        return await _read_image(full, path, media_type)
     try:
         with open(full, "r", encoding="utf-8") as f:
             content = f.read()
         return ToolResult(model_feedback=content)
+    except UnicodeDecodeError:
+        return ToolResult.fail(
+            f"'{path}' is a binary file, not text or an image read_file can show. "
+            f"Inspect it with run_command (e.g. `file`, `xxd | head`).")
     except Exception as e:
         return ToolResult.fail(f"Failed to read: {redact_paths(str(e))}")
 

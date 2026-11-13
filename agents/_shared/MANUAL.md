@@ -818,9 +818,15 @@ problem.
 
 ## Files (path-ACL gated)
 
-- **`read_file(path: str)`** — read a text file. Path can be absolute
-  or relative to the agent's directory. Subject to `allowed_read_paths`
-  + `denied_paths`.
+- **`read_file(path: str)`** — read a file. Text files return their
+  text. Image files (png/jpg/gif/webp, detected from the bytes, not the
+  extension) are downscaled to 1920px max and queued into the model's
+  vision for the next request, the same queue `screen` and
+  `fetch_discord_message` use, so the agent actually SEES the image.
+  Other binaries fail with a plain "binary file" error. Path can be
+  absolute or relative to the agent's directory. Subject to
+  `allowed_read_paths` + `denied_paths`. Tests:
+  `tests/test_read_file_images.py`.
 - **`send_file(path: str, caption: str = "", channel_id: int = 0)`** —
   deliver an EXISTING on-disk file to the conversation as an attachment
   (e.g. an audio/image output already saved). Read-ACL gated;
