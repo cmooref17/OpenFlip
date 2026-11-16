@@ -67,6 +67,26 @@ def test_tool_reference_blocks_round_trip():
     assert res["content"] == [{"type": "tool_reference", "tool_name": "generate_image"}]
 
 
+def test_tool_reference_result_has_no_text_block():
+    # 2026-11-16: tool_search("select:screen,send_message") with send_message already
+    # loaded returned refs + the note "Already loaded (call directly): send_message.".
+    # A text block next to tool_reference blocks is rejected by the API (400 "Tool
+    # definitions/code execution functions cannot be mixed with other content").
+    from types import SimpleNamespace as NS
+    names, note = td.search_deferred("select:generate_image,read_file")
+    assert names and note  # one deferred tool found + a note about the other
+    msgs = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "", "tool_calls": [NS(tool_use_id="t1", function_name="tool_search", args={"query": "select:generate_image,read_file"})]},
+        {"role": "tool", "content": note, "tool_use_id": "t1", "tool_references": names},
+    ]
+    _, api = _openflip_msgs_to_anthropic(msgs, "sys")
+    res = api[-1]["content"][0]
+    assert res["type"] == "tool_result"
+    assert all(b["type"] == "tool_reference" for b in res["content"])
+    assert [b["tool_name"] for b in res["content"]] == names
+
+
 def test_disable_via_config(monkeypatch=None):
     orig = td._cfg
     try:

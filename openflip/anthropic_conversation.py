@@ -936,10 +936,14 @@ def _openflip_msgs_to_anthropic(messages: list, system_prompt: str) -> tuple[str
                     # tool_reference blocks so the API loads those tools.
                     trefs = (tm.get("tool_references", None) if hasattr(tm, "get") else None) or []
                     if trefs:
-                        blocks_ = [{"type": "tool_reference", "tool_name": str(r)} for r in trefs]
-                        if tcontent:
-                            blocks_.append({"type": "text", "text": tcontent})
-                        tcontent = blocks_
+                        # tool_reference blocks must be the ONLY content of the
+                        # tool_result: the API rejects any text next to them with
+                        # 400 "Tool definitions/code execution functions cannot be
+                        # mixed with other content" (2026-11-16: a select: query
+                        # with one deferred + one already-loaded tool added the
+                        # "Already loaded ..." note and broke rhea's session on
+                        # every later request). The note is dropped here.
+                        tcontent = [{"type": "tool_reference", "tool_name": str(r)} for r in trefs]
                     lookahead_results.append((j, tid, tcontent))
                     j += 1
 
