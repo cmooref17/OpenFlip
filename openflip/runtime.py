@@ -2459,6 +2459,29 @@ class AgentRunner:
             CURRENT_CHAIN_ROOT_AGENT.set(chain_root_agent_id or "")
         except Exception:
             pass
+        # UserPromptSubmit hooks (docs/hooks.md). Runs here, after the turn's
+        # contextvars are set and BEFORE anything is written to history or any
+        # turn state starts, so a block can simply end the turn. Plain stdout /
+        # additionalContext rides on the user message as a system-reminder.
+        # /redo's verbatim re-send skips hooks (they already ran on the original).
+        _ups_context: list[str] = []
+        from . import hooks as _hooks
+        if verbatim_user_message is None and _hooks.has_hooks(self.agent, "UserPromptSubmit"):
+            from .tool_executor import hook_payload as _hook_payload
+            _ups_payload = _hook_payload(self.agent, "UserPromptSubmit", int(speaker_id or 0))
+            _ups_payload["prompt"] = user_text
+            _ups = await _hooks.run_event(self.agent, "UserPromptSubmit", _ups_payload)
+            if _ups.blocked:
+                print_ts(f"{COLOR_YELLOW}{log_tag}UserPromptSubmit hook blocked the turn: "
+                         f"{_ups.reason[:200]}{COLOR_END}", agent=self.agent.id)
+                if auto_post_final_text and not silent and result_future is None:
+                    try:
+                        await _safe_channel_send(channel, f"⚠️ A hook blocked this message: {_ups.reason[:1500]}")
+                    except Exception:
+                        pass
+                _settle_result_future(result_future, text=f"(blocked by a UserPromptSubmit hook: {_ups.reason})")
+                return
+            _ups_context = list(_ups.context)
         # Pre-turn self-edit hot-reload. Hash-based fingerprint over agent.json
         # + all system_files (per-agent + _shared/). If anything
         # changed since last load — whether from this agent's own tool call
@@ -2862,6 +2885,10 @@ class AgentRunner:
             conv.retry_notice_cb = None
         callable_names = {f.__name__ for f in callable_funcs}
         media_only = (agent.tool_response_mode == "media_only")
+        # Stop-hook loop guard for this turn (docs/hooks.md). Subagent worker
+        # turns (result_future) don't run Stop hooks: their output goes to the
+        # orchestrator, which runs its own.
+        _stop_state = _hooks.StopState() if result_future is None else None
         any_attachments_this_turn = False
         any_tool_called = False
         # Running tool-outcome tallies for a worker turn (result_future set).
@@ -2991,6 +3018,9 @@ class AgentRunner:
                     framed_user = f"{framed_user}\n\n<system-reminder>\n{_todo_note}\n</system-reminder>"
             except Exception as _todo_err:
                 print_ts(f"{COLOR_YELLOW}todo reminder skipped: {_todo_err}{COLOR_END}", agent=agent.id)
+        if _ups_context:
+            framed_user = (f"{framed_user}\n\n<system-reminder>\nUserPromptSubmit hook:\n"
+                           + "\n".join(_ups_context) + "\n</system-reminder>")
         conv.messages.append(ChatMessage('user', framed_user))
 
         async def _restore_system():
@@ -3556,6 +3586,40 @@ class AgentRunner:
                                     agent=agent.id,
                                 )
                             else:
+                                continue
+                        # ----- Stop hooks (docs/hooks.md) -----
+                        # The model wants to end the turn. A Stop hook that
+                        # blocks feeds its reason back as a [FRAMEWORK] user
+                        # message and runs another round (Claude Code's Stop
+                        # decision: "block"). The intra-loop poster above has
+                        # NOT posted this round's text (no tool calls), so the
+                        # text stays in history and the model continues after
+                        # it. Loop guard: stop_hook_active on re-entry, and
+                        # after STOP_CONTINUATION_CAP consecutive blocks the
+                        # stop is allowed (Claude Code's 8 cap). STAY_SILENT
+                        # replies and impossible:true never get blocked.
+                        if _stop_state is not None and _hooks.has_hooks(agent, "Stop"):
+                            from .tool_executor import hook_payload as _hook_payload
+                            _stop_fb = await _hooks.evaluate_stop(
+                                agent, _stop_state,
+                                _hook_payload(agent, "Stop", int(speaker_id or 0)), _ct)
+                            if _stop_fb is not None:
+                                if _ct.strip() and auto_post_final_text and not silent:
+                                    # Show the operator the text the model just
+                                    # wrote before it keeps working, like
+                                    # intra-loop text posted beside tool calls.
+                                    try:
+                                        for chunk in _split_for_discord(_ct.strip()):
+                                            await _safe_channel_send(channel, chunk)
+                                        _posted_assistant_text = True
+                                        _quiet.note_posted()
+                                    except Exception:
+                                        pass
+                                conv.messages.append(ChatMessage('user', _stop_fb))
+                                print_ts(
+                                    f"{COLOR_YELLOW}{log_tag}Stop hook kept the turn going "
+                                    f"({_stop_state.continuations}/{_hooks.STOP_CONTINUATION_CAP})"
+                                    f"{COLOR_END}", agent=agent.id)
                                 continue
                         # NOTE: no post_drain_retry here.
                         #

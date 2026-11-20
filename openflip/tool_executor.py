@@ -139,6 +139,32 @@ def _lock_key(agent: Agent, user_id: int, tool_name: str) -> tuple[str, int, str
     return (agent.id, user_id, tool_name)
 
 
+def hook_payload(agent: Agent, event: str, speaker_id: int = 0) -> dict:
+    """Common hook input fields (docs/hooks.md) for the CURRENT turn, read from
+    the executor contextvars. Never raises."""
+    from . import hooks as _hooks
+    sess = CURRENT_SESSION.get(None)
+    try:
+        visibility = CURRENT_TURN_VISIBILITY.get("")
+        depth = CURRENT_TURN_DEPTH.get(0)
+    except Exception:
+        visibility, depth = "", 0
+    if visibility in ("cron", "heartbeat"):
+        kind = visibility
+    elif depth > 0 or visibility == "silent_agent_chain":
+        kind = "peer"
+    else:
+        kind = "human"
+    return _hooks.base_payload(
+        agent, event,
+        session_id=str(getattr(sess, "conversation_id", "") or ""),
+        speaker_id=speaker_id or int(CURRENT_SPEAKER_ID.get(0) or 0),
+        speaker_is_owner=bool(CURRENT_TURN_OWNER.get(False)),
+        transport=str(getattr(sess, "transport", "") or ""),
+        turn_kind=kind,
+    )
+
+
 async def _invoke_tool(name: str, args: dict) -> ToolResult:
     tool = TOOL_REGISTRY.get(name)
     if not tool:
@@ -277,6 +303,28 @@ async def execute_tool_calls(
             continue
 
         async with lock:
+            # PreToolUse hooks (docs/hooks.md): run after the ACL check, before
+            # the tool. A block turns into the tool error the model sees; an
+            # updatedInput replaces the args. Hooks never break the call.
+            from . import hooks as _hooks
+            _hook_ctx: list[str] = []
+            if _hooks.has_hooks(agent, "PreToolUse"):
+                _pre_payload = hook_payload(agent, "PreToolUse", speaker_id)
+                _pre_payload.update({
+                    "tool_name": name, "tool_input": args,
+                    "tool_use_id": str(getattr(tc, "tool_use_id", "") or ""),
+                })
+                _pre = await _hooks.run_event(agent, "PreToolUse", _pre_payload, name)
+                if _pre.blocked:
+                    print_ts(f"{COLOR_YELLOW}PreToolUse hook blocked '{name}': "
+                             f"{_pre.reason[:200]}{COLOR_END}", agent=agent.id)
+                    _hb = ToolResult.fail(f"A PreToolUse hook blocked this call: {_pre.reason}")
+                    _hb.denied = True
+                    out.append((name, _hb))
+                    continue
+                if _pre.updated_input is not None:
+                    args = _pre.updated_input
+                _hook_ctx.extend(_pre.context)
             print_ts(f"Tool call: {name}({args})", agent=agent.id)
             # Dry-run: log what WOULD have been called and skip the actual tool.
             # Bypasses media_only suppression so the notice always posts.
@@ -313,6 +361,28 @@ async def execute_tool_calls(
                 _agent_state.on_tool_end(agent.id)
             except Exception:
                 pass
+            # PostToolUse hooks: the tool already ran, so they can't block;
+            # their feedback (exit-2 stderr / additionalContext) is appended to
+            # what the model sees as this tool's result.
+            if _hooks.has_hooks(agent, "PostToolUse"):
+                _post_payload = hook_payload(agent, "PostToolUse", speaker_id)
+                _resp_text = result.error if not result.ok else (result.model_feedback or result.text or "")
+                _post_payload.update({
+                    "tool_name": name, "tool_input": args,
+                    "tool_use_id": str(getattr(tc, "tool_use_id", "") or ""),
+                    "tool_response": {
+                        "ok": bool(result.ok),
+                        "text": str(_resp_text or "")[:_hooks.TOOL_RESPONSE_CAP],
+                        "attachments": [str(p) for p in (result.attachments or [])],
+                    },
+                })
+                _postr = await _hooks.run_event(agent, "PostToolUse", _post_payload, name)
+                _hook_ctx.extend(_postr.context)
+                _hook_ctx.extend(_postr.reasons)
+            if _hook_ctx:
+                # build_model_feedback appends these to whatever the model
+                # would otherwise see (text, attachments+URLs, or the error).
+                result.hook_feedback = [c for c in _hook_ctx if c]
             try:
                 from . import events_log as _events_log
                 _events_log.log_event(
@@ -564,6 +634,9 @@ def build_model_feedback(name: str, result: ToolResult) -> str:
     worker session (see _redaction_exempt) so it can act on and report real
     paths back to its owner-gated orchestrator."""
     raw = _build_model_feedback_raw(name, result)
+    _hf = getattr(result, "hook_feedback", None) or []
+    if _hf:
+        raw = f"{raw}\n[hook feedback]\n" + "\n".join(_hf)
     if _redaction_exempt():
         return raw
     return redact_paths(raw)

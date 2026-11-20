@@ -623,6 +623,7 @@ nested object. `respond_to_bots`, `memory_enabled`, etc. are top-level.
 | `proactive.interval_minutes` | int | `30` | Tick interval (must be > 0). |
 | `proactive.quiet_hours` | object \| null | `null` | e.g. `{"start":"23:00","end":"08:00","timezone":"US/Mountain"}`. Malformed values (bad `HH:MM`, unknown tz, only one bound) are REJECTED at job write/load time by `cron.validate_job`; a stored malformed window warns once per job at fire time and fails open (job fires) — never silently. |
 | `proactive.channel_id` | int | `0` | Channel the tick anchors / posts to. |
+| `hooks` | object | `{}` | Owner hooks for this agent (PreToolUse / PostToolUse / UserPromptSubmit / Stop), Claude Code's config shape. Runs after config.json `hooks`. See §12b. |
 | `per_context_sessions` | bool | `false` | Opt-in session-cost control (Fable, 2026-08). When `true`: headless-agent `talk_to_agent` work routes into per-context internal sessions (`internal:<agent>-<operator-label>` for human-rooted chains, `internal:<agent>-cron-<slug>` for cron-rooted, `internal:<agent>-peer-<sender>` otherwise) instead of ONE eternal shared `internal:<agent>` thread; interval cron jobs default to a dedicated `cron:<slug>` session; each recurring cron run starts on a FRESH session (previous archived, 5 kept). OFF = pre-2026-08 single-shared-thread behavior, byte-for-byte. Fixes internal scratch threads growing to 500k+ tokens re-read PER CALL and eating a whole usage block. |
 | `internal_compaction_trigger` | int | `150000` | Compaction trigger for INTERNAL working sessions only (conversation ids prefixed `internal:`/`cron:`). These are agent scratch threads no human reads; on a 1M-context model the per-model trigger (~window − 20k) let them reach 500k+-token contexts re-read every call before compaction fired. Floored at Anthropic's 50k min; `0`/negative disables the override (internal sessions then use the per-model trigger). Human-facing threads are UNAFFECTED — they always use the per-model trigger. Independent of `per_context_sessions`. |
 | `operator_labels` | object | `{}` | Optional `{ "<speaker_id>": "cmoore" }` map giving readable per-operator labels used in `per_context_sessions` names (`internal:<agent>-<label>`). Falls back to `op<id>` (stable, unique, less readable). Only alnum/`-_.` labels accepted. |
@@ -692,6 +693,10 @@ gateway restart). Beyond `integrations.*`, `models.*`, and
   this global key → built-in default `"Sorry, something went wrong. Please try
   again in a bit."`). An empty string at a tier counts as NOT set and falls
   through to the next tier.
+- `hooks` — object, same shape as agent.json `hooks`; applies to EVERY agent
+  (runs first). `disable_all_hooks` (bool) turns all hooks off;
+  `hooks_model` picks the model for prompt hooks; `hooks_auth: "api_key"`
+  makes prompt hooks use the API key instead of OAuth. See §12b.
 - `quiet_turn_nudge` — object `{"enabled": true, "rounds": 3, "seconds": 90}`
   (all fields optional; defaults shown). On an operator-facing human turn,
   once `rounds` tool rounds OR `seconds` of wall time pass with no text from
@@ -2632,6 +2637,68 @@ control char **before** it reaches the `<id>.jsonl` path joins. A corrupt
 or malicious marker (e.g. `../../etc/foo`) is treated as a stale marker —
 the tool_result injection is skipped and the marker is still deleted.
 Defense in depth against path traversal via the unsigned marker.
+
+---
+
+# 12b. Hooks (owner-configured, every provider)
+
+Commands or one-shot model checks that run on agent events, every time,
+outside the model. Same config shape and exit-code contract as Claude Code's
+hooks. Full design: `docs/hooks.md`. Code: `openflip/hooks.py`. Tests:
+`tests/test_hooks.py`, `tests/test_hooks_executor.py`, `tests/test_hooks_turn.py`.
+
+**Where:** `config.json` `hooks` (every agent; read at startup, restart to
+change) and `agent.json` `hooks` (that agent; hot-reloads). Both run, global
+first; an identical handler in both runs once. Only the owner edits these
+files: chat content reaches a hook only as JSON on stdin.
+
+```json
+"hooks": {
+  "PostToolUse": [{"matcher": "edit_file|write_file",
+                   "hooks": [{"type": "command", "command": "~/bin/check.sh", "timeout": 60}]}],
+  "Stop": [{"hooks": [{"type": "prompt", "prompt": "Did the agent do everything the user asked? $ARGUMENTS"}]}]
+}
+```
+
+**Events (v1):**
+- `PreToolUse`: after the ACL check, before the tool. Exit 2 (or JSON
+  `hookSpecificOutput.permissionDecision: "deny"`) stops the call; the model
+  gets the reason as a denied tool error. `updatedInput` replaces the args.
+  Deny beats allow across hooks.
+- `PostToolUse`: after the tool. Can't block; exit-2 stderr and
+  `additionalContext` are appended to what the model sees as the result
+  (`[hook feedback]`). The user-facing post is unchanged.
+- `UserPromptSubmit`: turn start, before anything enters history. Exit 2 /
+  `decision: "block"` ends the turn and posts "⚠️ A hook blocked this
+  message: <reason>". Plain stdout / `additionalContext` rides on the user
+  message as a system-reminder. Skipped on `/redo`.
+- `Stop`: the model gave a final reply (no tool calls). A block posts that
+  reply, adds the reason as a `[FRAMEWORK]` note and runs another round.
+  `stop_hook_active` is true on re-entry; after 8 consecutive continuations
+  the stop is allowed. Never blocks `STAY_SILENT` or worker (spawn_subagents)
+  turns; a prompt hook's `impossible: true` lets the turn end.
+
+Matchers filter tool events by tool name: `*`/empty = all; letters, digits,
+`_ - , |` and spaces = exact names; anything else = unanchored regex.
+
+**Handlers:** `command` runs `/bin/sh -c` in the agent dir with the event
+JSON on stdin and `OPENFLIP_AGENT_ID` / `OPENFLIP_AGENT_DIR` /
+`OPENFLIP_HOOK_EVENT` set (default timeout 600s). Exit 0 = ok (stdout JSON
+fields apply), exit 2 = block with stderr as the reason, anything else /
+timeout / bad JSON = logged, non-blocking. `prompt` sends the prompt
+(`$ARGUMENTS` = event JSON) to `model`, else config `hooks_model`, else the
+memory-recall selector model; it must answer `{"ok", "reason", "impossible"}`
+(default timeout 30s; `hooks_auth: "api_key"` in config.json to use the API key).
+
+**Input JSON (all events):** `hook_event_name`, `agent_id`, `session_id`,
+`transcript_path`, `cwd`, `speaker_id`, `speaker_is_owner`, `transport`,
+`turn_kind` (`human`/`cron`/`heartbeat`/`peer`). Plus `tool_name`,
+`tool_input`, `tool_use_id` (and `tool_response` on PostToolUse); `prompt` on
+UserPromptSubmit; `stop_hook_active`, `last_assistant_message` on Stop.
+
+**Off switch:** `config.json` `"disable_all_hooks": true` or env
+`OPENFLIP_DISABLE_HOOKS=1`. Every run logs `hooks: <Event> ran N handler(s): ok|BLOCKED`.
+Not yet built: `/goal`, `/hooks`, SessionStart/compaction events, `http` handlers.
 
 ---
 

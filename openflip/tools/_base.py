@@ -46,6 +46,9 @@ class ToolResult:
     # them as `tool_reference` blocks in the tool_result; the API expands them
     # into full definitions. See openflip/tool_deferral.py.
     tool_references: list[str] = field(default_factory=list)
+    # PreToolUse / PostToolUse hook feedback (docs/hooks.md), set by
+    # tool_executor. build_model_feedback appends it to what the model sees.
+    hook_feedback: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:

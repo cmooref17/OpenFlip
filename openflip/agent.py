@@ -636,6 +636,10 @@ class Agent:
     # survives save() re-serialization round-trips (save() rebuilds data from
     # known fields only and would otherwise drop an unknown top-level key).
     external: dict = field(default_factory=dict)
+    # Hooks (docs/hooks.md): {"<Event>": [{"matcher": ..., "hooks": [handler, ...]}]}.
+    # Raw dict; validated by openflip.hooks at fire time. Missing = no agent hooks
+    # (config.json `hooks` still apply to every agent).
+    hooks: dict = field(default_factory=dict)
     _fingerprint: str = ""
 
     @classmethod
@@ -741,6 +745,7 @@ class Agent:
             transport=str(data.get("transport", "discord")),
             transports=list(data.get("transports", []) or []),
             external=dict(data.get("external", {}) or {}),
+            hooks=(dict(data["hooks"]) if isinstance(data.get("hooks"), dict) else {}),
             _fingerprint=fingerprint,
         )
 
