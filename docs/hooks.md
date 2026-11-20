@@ -77,7 +77,7 @@ Handlers for one event run in parallel. Any hook failure is logged and never bre
 
 Common: `hook_event_name`, `session_id` (conversation key), `transcript_path`
 (`agents/<id>/conversations/<key>.jsonl`), `cwd`, `agent_id`, `speaker_id`, `speaker_is_owner`,
-`transport`, `turn_kind` (`human` / `cron` / `heartbeat` / `peer` / `synthetic`).
+`transport`, `turn_kind` (`human` / `cron` / `heartbeat` / `peer` / `synthetic`). `human` only when a transport delivered a real message; a restart continuation or other framework-made turn is `synthetic`.
 - Tool events: `tool_name`, `tool_input`, `tool_use_id`; `PostToolUse` adds
   `tool_response` (`ok`, `text`/`error`, capped at 20k chars).
 - `UserPromptSubmit`: `prompt` (the user's raw text).

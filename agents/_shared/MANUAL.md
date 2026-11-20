@@ -2692,7 +2692,7 @@ memory-recall selector model; it must answer `{"ok", "reason", "impossible"}`
 
 **Input JSON (all events):** `hook_event_name`, `agent_id`, `session_id`,
 `transcript_path`, `cwd`, `speaker_id`, `speaker_is_owner`, `transport`,
-`turn_kind` (`human`/`cron`/`heartbeat`/`peer`). Plus `tool_name`,
+`turn_kind` (`human` = a real inbound message from a person; `cron`/`heartbeat`/`peer`; `synthetic` = any other framework-made turn, e.g. a restart continuation). Plus `tool_name`,
 `tool_input`, `tool_use_id` (and `tool_response` on PostToolUse); `prompt` on
 UserPromptSubmit; `stop_hook_active`, `last_assistant_message` on Stop.
 

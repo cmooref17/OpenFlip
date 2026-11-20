@@ -2431,6 +2431,12 @@ class AgentRunner:
         # cron turn has owner=True but a synthesized Session with is_owner=False.
         # spawn_subagents gates on this.
         CURRENT_TURN_OWNER.set(bool(owner))
+        # Real inbound from a person vs a framework-made turn (hooks' turn_kind).
+        try:
+            from .tool_executor import CURRENT_TURN_FROM_HUMAN
+            CURRENT_TURN_FROM_HUMAN.set(inbound is not None or discord_message is not None)
+        except Exception:
+            pass
         try:
             CURRENT_CHANNEL_ID.set(int(getattr(channel, "id", 0) or 0))
         except Exception:

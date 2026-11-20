@@ -24,6 +24,12 @@ CURRENT_SPEAKER_ID: contextvars.ContextVar[int] = contextvars.ContextVar("curren
 # privilege but its synthesized Session has is_owner=False. Tools that gate on
 # the turn's real owner status (e.g. spawn_subagents) read this.
 CURRENT_TURN_OWNER: contextvars.ContextVar[bool] = contextvars.ContextVar("current_turn_owner", default=False)
+# True only when THIS turn was started by a real inbound message from a person
+# (a transport delivered it: runtime._run_turn got an `inbound` or a
+# `discord_message`). Framework-made turns (restart continuation, cron,
+# kairos ticks, talk_to_agent, subagent workers) leave it False. Hooks read it
+# so a restart wake-up isn't reported to them as turn_kind "human".
+CURRENT_TURN_FROM_HUMAN: contextvars.ContextVar[bool] = contextvars.ContextVar("current_turn_from_human", default=False)
 # Transport-agnostic session for the current turn. Set by runtime._run_turn
 # once Session objects exist (Phase 1 Discord-decouple). Tools that need
 # to know the session (transport, transport_id, conversation_id, etc.) read
@@ -149,12 +155,20 @@ def hook_payload(agent: Agent, event: str, speaker_id: int = 0) -> dict:
         depth = CURRENT_TURN_DEPTH.get(0)
     except Exception:
         visibility, depth = "", 0
+    try:
+        from_human = bool(CURRENT_TURN_FROM_HUMAN.get(False))
+    except Exception:
+        from_human = False
     if visibility in ("cron", "heartbeat"):
         kind = visibility
     elif depth > 0 or visibility == "silent_agent_chain":
         kind = "peer"
-    else:
+    elif from_human:
         kind = "human"
+    else:
+        # Framework-made turn with no person behind it (restart continuation,
+        # kairos tick, ...). Fail closed: never claim "human" without an inbound.
+        kind = "synthetic"
     return _hooks.base_payload(
         agent, event,
         session_id=str(getattr(sess, "conversation_id", "") or ""),

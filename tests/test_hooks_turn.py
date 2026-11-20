@@ -107,6 +107,8 @@ def test_runtime_wiring_order():
     assert "_hooks.StopState() if result_future is None else None" in src, \
         "worker turns get no Stop hooks"
     assert "verbatim_user_message is None and _hooks.has_hooks" in src, "/redo skips UserPromptSubmit"
+    human = src.index("CURRENT_TURN_FROM_HUMAN.set(inbound is not None or discord_message is not None)")
+    assert human < ups, "turn_kind's human flag is set before the first hook can fire"
 
 
 if __name__ == "__main__":

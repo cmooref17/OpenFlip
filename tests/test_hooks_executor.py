@@ -26,7 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import openflip.hooks as hooks  # noqa: E402
 from openflip.session import Session  # noqa: E402
 from openflip.tool_executor import (  # noqa: E402
-    CURRENT_AGENT, CURRENT_SESSION, CURRENT_TURN_OWNER, execute_tool_calls, build_model_feedback,
+    CURRENT_AGENT, CURRENT_SESSION, CURRENT_TURN_OWNER, CURRENT_TURN_FROM_HUMAN,
+    execute_tool_calls, build_model_feedback,
 )
 from openflip.tools._base import tool  # noqa: E402
 
@@ -54,7 +55,7 @@ def _agent(hcfg: dict):
                            provider="anthropic", model="m", display_name="T")
 
 
-def _exec(agent, args=None, callable_names=frozenset({"hook_probe"})):
+def _exec(agent, args=None, callable_names=frozenset({"hook_probe"}), from_human=True):
     sess = Session(transport="discord", transport_id="1", conversation_id="discord:1",
                    speaker_id=7, speaker_role_ids=[], is_owner=True, is_dm=True, display_name="o")
     msg = SimpleNamespace(tool_calls=[SimpleNamespace(function_name="hook_probe",
@@ -64,11 +65,13 @@ def _exec(agent, args=None, callable_names=frozenset({"hook_probe"})):
     async def go():
         ta, ts = CURRENT_AGENT.set(agent), CURRENT_SESSION.set(sess)
         to = CURRENT_TURN_OWNER.set(True)
+        th = CURRENT_TURN_FROM_HUMAN.set(from_human)
         try:
             return await execute_tool_calls(agent=agent, conversation=None, ai_message=msg,
                                             callable_tool_names=set(callable_names), channel=None,
                                             speaker_id=7, session_id="discord:1", silent=True)
         finally:
+            CURRENT_TURN_FROM_HUMAN.reset(th)
             CURRENT_TURN_OWNER.reset(to)
             CURRENT_AGENT.reset(ta)
             CURRENT_SESSION.reset(ts)
@@ -137,6 +140,18 @@ def test_no_hooks_is_unchanged():
     assert CALLS == [{"path": "/orig"}]
     assert out[0][1].hook_feedback == []
     assert build_model_feedback("hook_probe", out[0][1]) == "probe saw /orig"
+
+
+def test_framework_turn_is_synthetic_not_human():
+    """A restart continuation / kairos tick has no inbound message: hooks must
+    see turn_kind "synthetic", never "human" (found live 2026-11-19: a restart
+    wake-up was logged as human)."""
+    dump = os.path.join(_TMP, "synth.json")
+    _exec(_agent(_post(f"cat > {dump}")), from_human=False)
+    got = json.load(open(dump))
+    assert got["turn_kind"] == "synthetic", got["turn_kind"]
+    _exec(_agent(_post(f"cat > {dump}")), from_human=True)
+    assert json.load(open(dump))["turn_kind"] == "human"
 
 
 if __name__ == "__main__":
