@@ -640,6 +640,9 @@ class Agent:
     # Raw dict; validated by openflip.hooks at fire time. Missing = no agent hooks
     # (config.json `hooks` still apply to every agent).
     hooks: dict = field(default_factory=dict)
+    # Skills config (docs/skills.md): {"enabled": false} turns skills off for
+    # this agent; {"disabled": [names]} hides named ones. Empty = all on.
+    skills: dict = field(default_factory=dict)
     _fingerprint: str = ""
 
     @classmethod
@@ -746,6 +749,7 @@ class Agent:
             transports=list(data.get("transports", []) or []),
             external=dict(data.get("external", {}) or {}),
             hooks=(dict(data["hooks"]) if isinstance(data.get("hooks"), dict) else {}),
+            skills=(dict(data["skills"]) if isinstance(data.get("skills"), dict) else {}),
             _fingerprint=fingerprint,
         )
 
@@ -869,6 +873,12 @@ class Agent:
         # without the transport keep byte-identical agent.json files.
         if self.external:
             data["external"] = dict(self.external)
+        # hooks / skills: only when set, so other agents' files stay byte-identical.
+        # Without these a save() (slash-command edits) silently dropped them.
+        if self.hooks:
+            data["hooks"] = dict(self.hooks)
+        if self.skills:
+            data["skills"] = dict(self.skills)
         return save_json(self.path, data)
 
     @staticmethod

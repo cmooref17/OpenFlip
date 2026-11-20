@@ -960,6 +960,13 @@ class AgentRunner:
         self._drop_queued_turns(conv_key)
         ok = True
         conv = self.conversations.pop(conv_key, None)
+        # A fresh session has no skills loaded (docs/skills.md).
+        try:
+            from . import skills as _skills_mod
+            _skills_mod.forget_loaded(
+                (getattr(conv, "conversation_id", "") if conv else "") or fallback_conv_id or "")
+        except Exception:
+            pass
         if conv and hasattr(conv, "clear_history"):
             try:
                 conv.clear_history()
@@ -2827,6 +2834,20 @@ class AgentRunner:
             print_ts(f"{COLOR_YELLOW}deferred tool list skipped: {_dt_err}{COLOR_END}", agent=agent.id)
         if _deferred_block:
             _cur_sources.append(("(deferred tools)", _deferred_block))
+        # Skills (docs/skills.md): one listing line per skill rides in the
+        # snapshot like the deferred-tool names; a mid-session skill change
+        # arrives as a "(skills)" entry in the instruction-change note.
+        _skills_block = ""
+        try:
+            from . import skills as _skills_mod
+            _sk_found, _sk_warns = _skills_mod.load_skills(_agent_dir, agent)
+            _skills_block, _sk_list_warns = _skills_mod.listing_block(_sk_found)
+            for _w in (_sk_warns + _sk_list_warns):
+                print_ts(f"{COLOR_YELLOW}skills: {_w}{COLOR_END}", agent=agent.id)
+        except Exception as _sk_err:
+            print_ts(f"{COLOR_YELLOW}skill listing skipped: {_sk_err}{COLOR_END}", agent=agent.id)
+        if _skills_block:
+            _cur_sources.append(("(skills)", _skills_block))
         _snap = getattr(conv, "_instruction_snapshot", None)
         _instr_note = ""
         # What started this turn, for the usage ledger (additive logging).
@@ -2853,6 +2874,8 @@ class AgentRunner:
                 _sys = _sys + "\n\n" + _mem_block
             if _deferred_block:
                 _sys = _sys + "\n\n" + _deferred_block
+            if _skills_block:
+                _sys = _sys + "\n\n" + _skills_block
             _snap = InstructionSnapshot.capture(_cur_sources, _sys)
             conv._instruction_snapshot = _snap
         else:
@@ -2976,6 +2999,26 @@ class AgentRunner:
         _verbatim = verbatim_user_message is not None
         if _verbatim:
             framed_user = verbatim_user_message
+        # Operator skill invocation (docs/skills.md): a real owner message that
+        # starts with /<skill-name> gets that skill's rendered instructions
+        # attached, like Claude Code's direct /name. Built-in text commands
+        # never reach here (handled before the turn), and their names are
+        # reserved so a same-named skill can't shadow one.
+        if not _verbatim and owner and inbound is not None:
+            try:
+                from . import skills as _skills_mod
+                from .text_commands import _TEXT_COMMANDS as _builtin_cmds
+                _sk_block, _sk_name = _skills_mod.operator_invocation(
+                    getattr(inbound, "text", "") or "", _agent_dir, agent,
+                    is_owner=bool(getattr(getattr(inbound, "session", None), "is_owner", False)),
+                    conversation_id=getattr(conv, "conversation_id", "") or "",
+                    reserved=set(_builtin_cmds) | {"/stop"},
+                )
+                if _sk_block:
+                    framed_user = f"{framed_user}\n\n{_sk_block}"
+                    print_ts(f"skills: operator ran /{_sk_name}", agent=agent.id)
+            except Exception as _sk_err:
+                print_ts(f"{COLOR_YELLOW}skill invocation skipped: {_sk_err}{COLOR_END}", agent=agent.id)
         # Memory recall (Claude-Code-style, see openflip/memory_recall.py): on
         # a human turn a person is waiting on, a small selector model picks up
         # to 5 relevant topic files and their bodies ride on THIS user message
@@ -3278,6 +3321,24 @@ class AgentRunner:
                         # files on compaction too).
                         conv._instruction_snapshot = None
                         conv.pending_cache_miss_reason = "compaction"
+                        # Loaded skills were summarized away with the rest
+                        # (docs/skills.md): name them so the agent reloads
+                        # any it still needs, and reset the dedupe record so
+                        # a reload sends the full text again.
+                        _sk_note = ""
+                        try:
+                            from . import skills as _skills_mod
+                            _sk_cid = getattr(conv, "conversation_id", "") or ""
+                            _sk_names = _skills_mod.loaded_names(_sk_cid)
+                            _skills_mod.forget_loaded(_sk_cid)
+                            if _sk_names:
+                                _sk_note = (
+                                    " Skills you had loaded were summarized too ("
+                                    + ", ".join(_sk_names)
+                                    + "): call use_skill again for any you still need."
+                                )
+                        except Exception:
+                            pass
                         try:
                             conv.messages.append(ChatMessage(
                                 'user',

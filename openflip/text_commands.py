@@ -45,6 +45,7 @@ _TEXT_COMMANDS = {
     "/restart",
     "/help",
     "/usage",
+    "/skills",
 }
 
 
@@ -251,7 +252,38 @@ async def handle_text_command(
                        owner_transport=tname, owner_handle=handle)
         return True
 
+    if head == "/skills":
+        if not is_owner(speaker_id, transport=tname, handle=handle):
+            await _send(transport, session_id, channel, "Owner only.")
+            return True
+        await _send(transport, session_id, channel, skills_report(runner.agent))
+        return True
+
     return False
+
+
+def skills_report(agent: Any) -> str:
+    """/skills: this agent's skills, where each lives, and who can run it
+    (docs/skills.md). Plain text so it reads the same on every transport."""
+    from . import skills as _sk
+    if not _sk.skills_enabled(agent):
+        return "Skills are turned off for this agent."
+    found, warns = _sk.load_skills(os.path.dirname(agent.path), agent)
+    if not found:
+        lines = [f"{agent.display_name} has no skills yet. Add a folder with a SKILL.md under "
+                 f"agents/{agent.id}/skills/ (this agent) or agents/_shared/skills/ (every agent)."]
+    else:
+        lines = [f"{agent.display_name}'s skills ({len(found)}):"]
+        for name in sorted(found):
+            s = found[name]
+            who = []
+            if s.model_invocable:
+                who.append("agent")
+            if s.user_invocable:
+                who.append(f"you: /{name}" + (f" {s.argument_hint}" if s.argument_hint else ""))
+            lines.append(f"- {name} ({s.scope}; {', '.join(who) or 'nobody'}): {s.description}")
+    lines += [f"warning: {w}" for w in warns]
+    return "\n".join(lines)
 
 
 # ---------------- shared command bodies ----------------

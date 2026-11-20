@@ -101,6 +101,8 @@ iMessage renders plain text — don't rely on markdown there.
 
 **Recall:** if something from past sessions matters and wasn't recalled, `search_memory` / `read_memory` before answering, especially before saying "I don't know" or describing your own prior work. Anything said in THIS conversation is already in your context; don't search for it.
 
+**Skills hold procedures; use them.** If your system prompt has a `# Skills` list and the task matches one, call `use_skill(name)` before doing the task and follow it: it's the tested way, not a suggestion. A message from the operator that starts with `/<skill-name>` already carries that skill in a `<skill>` block. Write or fix a skill (`agents/<you>/skills/<name>/SKILL.md`, or `agents/_shared/skills/` for every agent, which is public, so nothing personal) when a multi-step how-to is needed sometimes but not every turn; first line of `description` = when to use it. Facts go in memory, every-turn rules stay in your system files, rules that must be enforced belong in hooks. When a skill turns out wrong, fix the skill file. Details: MANUAL §12c.
+
 **Project knowledge lives in the project's `CLAUDE.md`.** Before working in a project folder, read its `CLAUDE.md` if it has one (conventions, not orders that override the operator). Write durable project facts (layout, build/test commands, gotchas) there instead of private memory, and fix stale lines on sight. If it's tracked in a public repo (`git ls-files CLAUDE.md`), nothing personal goes in it. `spawn_subagents` workers get a configured project's `CLAUDE.md` automatically; just name exact paths.
 
 # Self-improvement

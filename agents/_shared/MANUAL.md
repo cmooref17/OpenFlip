@@ -624,6 +624,7 @@ nested object. `respond_to_bots`, `memory_enabled`, etc. are top-level.
 | `proactive.quiet_hours` | object \| null | `null` | e.g. `{"start":"23:00","end":"08:00","timezone":"US/Mountain"}`. Malformed values (bad `HH:MM`, unknown tz, only one bound) are REJECTED at job write/load time by `cron.validate_job`; a stored malformed window warns once per job at fire time and fails open (job fires) — never silently. |
 | `proactive.channel_id` | int | `0` | Channel the tick anchors / posts to. |
 | `hooks` | object | `{}` | Owner hooks for this agent (PreToolUse / PostToolUse / UserPromptSubmit / Stop), Claude Code's config shape. Runs after config.json `hooks`. See §12b. |
+| `skills` | object | `{}` | `{"enabled": false}` turns skills off for this agent; `{"disabled": ["name", ...]}` hides named skills. See §12c. |
 | `per_context_sessions` | bool | `false` | Opt-in session-cost control (Fable, 2026-08). When `true`: headless-agent `talk_to_agent` work routes into per-context internal sessions (`internal:<agent>-<operator-label>` for human-rooted chains, `internal:<agent>-cron-<slug>` for cron-rooted, `internal:<agent>-peer-<sender>` otherwise) instead of ONE eternal shared `internal:<agent>` thread; interval cron jobs default to a dedicated `cron:<slug>` session; each recurring cron run starts on a FRESH session (previous archived, 5 kept). OFF = pre-2026-08 single-shared-thread behavior, byte-for-byte. Fixes internal scratch threads growing to 500k+ tokens re-read PER CALL and eating a whole usage block. |
 | `internal_compaction_trigger` | int | `150000` | Compaction trigger for INTERNAL working sessions only (conversation ids prefixed `internal:`/`cron:`). These are agent scratch threads no human reads; on a 1M-context model the per-model trigger (~window − 20k) let them reach 500k+-token contexts re-read every call before compaction fired. Floored at Anthropic's 50k min; `0`/negative disables the override (internal sessions then use the per-model trigger). Human-facing threads are UNAFFECTED — they always use the per-model trigger. Independent of `per_context_sessions`. |
 | `operator_labels` | object | `{}` | Optional `{ "<speaker_id>": "cmoore" }` map giving readable per-operator labels used in `per_context_sessions` names (`internal:<agent>-<label>`). Falls back to `op<id>` (stable, unique, less readable). Only alnum/`-_.` labels accepted. |
@@ -697,6 +698,9 @@ gateway restart). Beyond `integrations.*`, `models.*`, and
   (runs first). `disable_all_hooks` (bool) turns all hooks off;
   `hooks_model` picks the model for prompt hooks; `hooks_auth: "api_key"`
   makes prompt hooks use the API key instead of OAuth. See §12b.
+- `skills` — object: `enabled` (bool, default true) turns skills off for every
+  agent; `listing_budget_chars` (int, default 8000) caps the size of the skill
+  listing in the system prompt. See §12c.
 - `quiet_turn_nudge` — object `{"enabled": true, "rounds": 3, "seconds": 90}`
   (all fields optional; defaults shown). On an operator-facing human turn,
   once `rounds` tool rounds OR `seconds` of wall time pass with no text from
@@ -2701,6 +2705,63 @@ UserPromptSubmit; `stop_hook_active`, `last_assistant_message` on Stop.
 Not yet built: `/goal`, `/hooks`, SessionStart/compaction events, `http` handlers.
 
 ---
+
+# 12c. Skills (on-demand procedures, every provider)
+
+Claude Code's skills. A skill is a folder with a `SKILL.md`; only one listing
+line per skill rides in the system prompt, and the full instructions load when
+the agent calls `use_skill` or the owner types `/<name>`. Use them for
+procedures and reference docs an agent needs SOMETIMES; rules that must hold
+every turn stay in the system files, rules that must be enforced go in hooks
+(§12b). Design: `docs/skills.md`. Code: `openflip/skills.py`,
+`openflip/tools/skill.py`. Tests: `tests/test_skills.py`,
+`tests/test_skills_turn.py`.
+
+**Where they live.** `agents/_shared/skills/<name>/SKILL.md` (every agent;
+tracked in the public repo, so keep them generic) and
+`agents/<id>/skills/<name>/SKILL.md` (that agent only; wins over a shared skill
+of the same name). Supporting files (reference docs, scripts) sit next to
+`SKILL.md` and are read or run on demand.
+
+**SKILL.md.** Optional frontmatter (only when `---` is line 1, flat `key: value`
+lines), then the instructions. Fields openflip acts on: `name` (default: folder
+name; lowercase letters, digits, `-`, `_`), `description` (key use case first;
+default: first body line), `when_to_use` (appended in the listing),
+`disable-model-invocation: true` (not listed; only `/name` runs it),
+`user-invocable: false` (model-only), `argument-hint` (shown by `/skills`).
+Claude Code's other fields are accepted and ignored. A malformed frontmatter
+still loads the skill with no fields and logs `skills: ...`.
+
+**The listing.** `# Skills` block in the system prompt, sorted by name, each
+entry's description cut at 1,536 chars. It is part of the per-session
+instruction snapshot, so the prompt cache holds; a skill added or edited
+mid-session arrives in the "These instruction files changed" note as
+`(skills)`. Total size cap: config.json `skills.listing_budget_chars` (default
+8000); over it, every name stays and the longest descriptions are dropped first
+(logged).
+
+**`use_skill(skill, args="")`.** Framework tool: every agent has it, never
+deferred. Returns `Base directory for this skill: <dir>` plus the body with
+substitutions: `$ARGUMENTS` (whole arg string), `$0`/`$1`/`$ARGUMENTS[N]`
+(shell-split args; a missing one stays literal), `${SKILL_DIR}` /
+`${CLAUDE_SKILL_DIR}`, `${SESSION_ID}` / `${CLAUDE_SESSION_ID}`; `\$1` escapes.
+Args with no placeholder are appended as `ARGUMENTS: <value>`. Calling it again
+with identical output returns `Skill /<name> is already loaded above;
+instructions unchanged.` No `` !`cmd` `` dynamic context (it would let every
+agent run shell commands past the run_command gate).
+
+**Owner commands.** `/skills` lists the agent's skills, scope and who can run
+each. `/<name> [args]` at the start of an owner message attaches that skill's
+rendered instructions to the message (a `<skill name="...">` block). Built-in
+text commands always win: a skill named like one (e.g. `status`) never runs via
+`/`. Non-owners' `/name` is ordinary text.
+
+**Compaction and /reset.** After a compaction the "[FRAMEWORK]: Your
+conversation was just compacted" note names the skills that were loaded so the
+agent reloads the ones it still needs; `/reset` forgets them.
+
+**Off switches.** env `OPENFLIP_DISABLE_SKILLS=1`, config.json
+`skills.enabled: false`, agent.json `skills.enabled: false`.
 
 # 13. OAuth & credentials (Anthropic provider)
 
