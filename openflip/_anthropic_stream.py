@@ -379,6 +379,11 @@ async def stream_sse_events(resp_content) -> "AsyncIterator":  # type: ignore
                                                 "content_block_delta",
                                                 "content_block_stop"):
                             content_events_count += 1
+                        elif current_event == "error":
+                            # The API's mid-stream error event; mapped to a
+                            # FrameworkErrorEvent below. Mark it so the
+                            # end-of-stream checks don't overwrite it.
+                            yielded_error = True
                         # Yield the appropriate StreamEvent for this SSE event.
                         async for ev in _yield_for_sse_event(
                             current_event, data,
@@ -413,6 +418,21 @@ async def stream_sse_events(resp_content) -> "AsyncIterator":  # type: ignore
     #     transient-retry / partial-salvage path owns it instead.
     # Skipped when an error event already surfaced mid-stream (don't
     # overwrite a more specific kind, e.g. a rate_limit's retry_after).
+    # Stream closed before message_start ever arrived (HTTP 200, then nothing
+    # usable: an empty body, only pings, or only unknown events). Previously
+    # this yielded NOTHING, so the caller built an empty reply with no
+    # stop_reason and treated it as a model decision. Surface it as an
+    # empty_stream error so chat()'s transient retry owns it.
+    if not saw_message_start and not yielded_error:
+        yield FrameworkErrorEvent(
+            message=(
+                "⚠️ Anthropic returned HTTP 200 but the stream ended before "
+                "message_start (no response at all). Retry in a moment."
+            ),
+            kind="empty_stream",
+        )
+        return
+
     if saw_message_start and not saw_message_stop and not yielded_error:
         if content_events_count == 0:
             yield FrameworkErrorEvent(
@@ -433,6 +453,24 @@ async def stream_sse_events(resp_content) -> "AsyncIterator":  # type: ignore
                 ),
                 kind="incomplete_stream",
             )
+
+
+# Anthropic error.type (in a mid-stream `error` SSE event) -> FrameworkErrorEvent
+# kind. Transient types map to kinds chat() retries; request problems map to
+# bad_request (terminal). Anything unrecognised is treated as transport
+# (retryable) rather than silently dropped.
+_ERROR_EVENT_KINDS = {
+    "overloaded_error": "overloaded",
+    "api_error": "overloaded",
+    "rate_limit_error": "rate_limit",
+    "timeout_error": "timeout",
+    "invalid_request_error": "bad_request",
+    "request_too_large": "bad_request",
+    "authentication_error": "auth",
+    "permission_error": "auth",
+    "not_found_error": "bad_request",
+    "billing_error": "auth",
+}
 
 
 async def _yield_for_sse_event(
@@ -538,6 +576,21 @@ async def _yield_for_sse_event(
 
     if event == "message_stop":
         yield MessageStopEvent()
+        return
+
+    if event == "error":
+        # Mid-stream error (docs: "We may occasionally send errors in the
+        # event stream", e.g. overloaded_error during high usage). Previously
+        # this fell through to "unknown event: ignore", which turned an
+        # overload/API error into a silent empty reply with no stop_reason.
+        err = data.get("error") if isinstance(data.get("error"), dict) else {}
+        etype = str(err.get("type") or "")
+        emsg = str(err.get("message") or "")[:300]
+        kind = _ERROR_EVENT_KINDS.get(etype, "transport")
+        yield FrameworkErrorEvent(
+            message=f"⚠️ Anthropic stream error ({etype or 'unknown'}): {emsg}".rstrip(": "),
+            kind=kind,
+        )
         return
 
     # Unknown event: ignore. Anthropic may add new event types over time

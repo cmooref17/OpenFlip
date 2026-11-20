@@ -3038,6 +3038,15 @@ stream that ends without `message_stop` after partial content logs/
 retries as `incomplete_stream` (one retry, then the partial-text salvage
 path); a codex stream with no terminal event surfaces as a transport
 error. Truncated replies no longer enter history as complete messages.
+Two more shapes are surfaced and retried (up to 3 times, 90s budget)
+instead of becoming a blank reply with no stop_reason:
+- the API's mid-stream `error` SSE event (e.g. `overloaded_error`) logs as
+  `⚠️ Anthropic stream error (<type>): <message>` with a kind mapped from
+  the error type (overloaded / rate_limit / timeout retry;
+  invalid_request / request_too_large are terminal `bad_request`);
+- an HTTP 200 stream that ends before `message_start` (empty body, pings
+  only) is `empty_stream`.
+Tests: `tests/test_sse_stream_errors.py`.
 
 ## "Why didn't your last reply post?"
 

@@ -1774,6 +1774,11 @@ class AnthropicConversation(SessionOverridesMixin):
             # (the partial-content cap below bounds it to ONE retry) and
             # eligible for the pure-text salvage path.
             "incomplete_stream",
+            # HTTP 200 but the stream produced no content at all (ended
+            # before message_start, or right after it). Upstream
+            # degradation, not a model decision: retry instead of turning
+            # it into a blank reply.
+            "empty_stream",
         }
         _MAX_TRANSIENT_RETRIES = 3
         _RETRY_BUDGET_S = 90.0
