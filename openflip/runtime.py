@@ -356,6 +356,10 @@ SOFT_INJECT_ACK_TEXT = (
     "[FRAMEWORK]: The operator just sent a message. "
     "Acknowledge it in one line, then continue."
 )
+QUIET_STATUS_CONTINUE_TEXT = (
+    "[FRAMEWORK]: Your status line was posted. Now continue the work with tool calls; "
+    "end the turn only when the task is done or you need the operator."
+)
 _QUIET_TURN_NUDGE_DEFAULTS = {"enabled": True, "rounds": 3, "seconds": 90.0}
 
 
@@ -445,6 +449,7 @@ class QuietTurnTracker:
         the quiet nudge (one note per round) and resets the window."""
         if not self.enabled or not operator_facing:
             return None
+        self.awaiting_status = False        # a tool round after the nudge = it continued by itself
         if human_drained:
             self.reset()
             return SOFT_INJECT_ACK_TEXT
@@ -457,8 +462,30 @@ class QuietTurnTracker:
         ):
             self.fired += 1
             self.reset()
+            self.awaiting_status = True
             return QUIET_TURN_NUDGE_TEXT
         return None
+    # The quiet nudge asks for "a few words, then continue". The model's answer is
+    # often text-only ("Fixing it now."), and a text-only round normally ENDS the
+    # turn, so the "then continue" never happened: the work just stopped mid-task
+    # (2026-11-25, several times in one day). After a quiet nudge, ONE text-only
+    # round is treated as the status line: it is posted and the turn runs another
+    # round. A second text-only round in a row ends the turn normally. Claude Code
+    # has no such mid-turn status prompt, so it never hits this.
+    awaiting_status: bool = False
+    status_continues: int = 0
+    STATUS_CONTINUE_CAP = 3                 # per turn, so a model that only talks can't loop
+
+    def take_status_continue(self) -> bool:
+        """True (once) when the current text-only round is the answer to a quiet
+        nudge and the turn should keep going; consumes the flag."""
+        if not self.awaiting_status:
+            return False
+        self.awaiting_status = False
+        if self.status_continues >= self.STATUS_CONTINUE_CAP:
+            return False
+        self.status_continues += 1
+        return True
 
 
 class AgentRunner:
@@ -3729,6 +3756,22 @@ class AgentRunner:
                                 )
                             else:
                                 continue
+                        # ----- Quiet-nudge status line (QuietTurnTracker.take_status_continue) -----
+                        # This text-only round answers "say what you're doing, then
+                        # continue": post it, then run another round instead of ending.
+                        if _ct.strip() and _ct.strip() != "STAY_SILENT" and _quiet.take_status_continue():
+                            if auto_post_final_text and not silent:
+                                try:
+                                    for chunk in _split_for_discord(_ct.strip()):
+                                        await _safe_channel_send(channel, chunk)
+                                    _posted_assistant_text = True
+                                    _quiet.note_posted()
+                                except Exception:
+                                    pass
+                            conv.messages.append(ChatMessage('user', QUIET_STATUS_CONTINUE_TEXT))
+                            print_ts(f"{COLOR_YELLOW}{log_tag}quiet-nudge status line posted; "
+                                     f"continuing the turn{COLOR_END}", agent=agent.id)
+                            continue
                         # ----- Stop hooks (docs/hooks.md) -----
                         # The model wants to end the turn. A Stop hook that
                         # blocks feeds its reason back as a [FRAMEWORK] user

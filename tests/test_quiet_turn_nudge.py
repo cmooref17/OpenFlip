@@ -212,6 +212,52 @@ def test_tracker_reads_settings_dict():
     assert t.after_tool_round(operator_facing=True) == QUIET_TURN_NUDGE_TEXT
 
 
+# ------------------------------------------- a text-only answer to the nudge continues (2026-11-25)
+# The nudge says "say what you're doing, then continue". A text-only reply used to END the turn, so the work
+# stopped mid-task ("Fixing both now." and nothing happened). One text-only round after a nudge = the status
+# line: the turn keeps going. Not after a tool round, not twice for one nudge, capped per turn.
+
+def test_status_line_after_nudge_continues_once():
+    t = QuietTurnTracker({"enabled": True, "rounds": 1, "seconds": 1e9}, clock=FakeClock())
+    assert t.after_tool_round(operator_facing=True) == QUIET_TURN_NUDGE_TEXT
+    assert t.take_status_continue() is True        # the text-only reply right after the nudge continues
+    assert t.take_status_continue() is False       # a second text-only round in a row ends the turn
+
+
+def test_no_continue_without_a_nudge():
+    t = _tracker()
+    assert t.after_tool_round(operator_facing=True) is None
+    assert t.take_status_continue() is False       # a normal final reply ends the turn as before
+
+
+def test_tool_round_after_nudge_clears_it():
+    t = QuietTurnTracker({"enabled": True, "rounds": 2, "seconds": 1e9}, clock=FakeClock())
+    assert t.after_tool_round(operator_facing=True) is None
+    assert t.after_tool_round(operator_facing=True) == QUIET_TURN_NUDGE_TEXT
+    assert t.after_tool_round(operator_facing=True) is None   # it continued on its own with tools (no new nudge)
+    assert t.take_status_continue() is False       # its later final reply really ends the turn
+
+
+def test_status_continue_is_capped_per_turn():
+    t = QuietTurnTracker({"enabled": True, "rounds": 1, "seconds": 1e9}, clock=FakeClock())
+    got = []
+    for _ in range(6):
+        t.awaiting_status = True                   # as if a nudge fired before each text round
+        got.append(t.take_status_continue())
+    assert got.count(True) == QuietTurnTracker.STATUS_CONTINUE_CAP
+
+
+def test_runtime_wires_the_status_continue():
+    import inspect
+    import openflip.runtime as rt
+    src = inspect.getsource(rt)
+    i = src.find("_quiet.take_status_continue()")
+    assert i > 0, "the turn loop must ask the tracker before ending on a text-only round"
+    j = src.find("# ----- Stop hooks (docs/hooks.md) -----", i)
+    assert 0 < j - i < 2500, "it must sit right before the Stop hooks (the end-of-turn gate)"
+    assert "QUIET_STATUS_CONTINUE_TEXT" in src[i:j] and "continue" in src[i:j]
+
+
 if __name__ == "__main__":
     import traceback
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

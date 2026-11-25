@@ -708,7 +708,11 @@ gateway restart). Beyond `integrations.*`, `models.*`, and
   `[FRAMEWORK]` note is appended after that round's tool results asking for
   a few words of status before continuing. Fires at most once per silence
   window (the counters reset when it fires and whenever the agent's text
-  posts). A human message drained mid-turn gets an immediate "acknowledge it
+  posts). If the agent answers that note with text only (no tool calls), the
+  text is posted as the status line and the turn runs another round instead
+  of ending there (at most 3 times per turn; a second text-only round in a row
+  ends the turn normally). Before this, a "Fixing it now." answer ended the
+  turn and the work silently stopped. A human message drained mid-turn gets an immediate "acknowledge it
   in one line" note instead. Never fires on silent, synthetic (cron /
   heartbeat / kairos / trigger), peer, or chain-terminator turns. `false`
   (or `"enabled": false`) turns it off. Pairs with FRAMEWORK.md's "Keep the
