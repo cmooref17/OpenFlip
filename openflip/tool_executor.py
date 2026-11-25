@@ -4,6 +4,7 @@ import asyncio
 import contextvars
 import inspect
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Optional
@@ -317,6 +318,23 @@ async def execute_tool_calls(
             continue
 
         async with lock:
+            # Plan mode (openflip/plan_mode.py): research only, so tools that
+            # change things are blocked until the operator approves a plan.
+            try:
+                from . import plan_mode as _pm
+                _pm_cid = str(getattr(CURRENT_SESSION.get(None), "conversation_id", "") or "")
+                _pm_dir = os.path.dirname(getattr(agent, "path", "") or "")
+                if _pm_cid and _pm_dir and _pm.is_on(_pm_dir, _pm_cid):
+                    _pm_why = _pm.blocked_reason(name, args)
+                    if _pm_why:
+                        print_ts(f"{COLOR_YELLOW}plan mode blocked '{name}'{COLOR_END}", agent=agent.id)
+                        _pmb = ToolResult.fail(_pm_why)
+                        _pmb.denied = True
+                        out.append((name, _pmb))
+                        continue
+            except Exception as _pm_err:
+                print_ts(f"{COLOR_YELLOW}plan mode check failed (allowing): {_pm_err}{COLOR_END}",
+                         agent=agent.id)
             # PreToolUse hooks (docs/hooks.md): run after the ACL check, before
             # the tool. A block turns into the tool error the model sees; an
             # updatedInput replaces the args. Hooks never break the call.
@@ -375,6 +393,17 @@ async def execute_tool_calls(
                 _agent_state.on_tool_end(agent.id)
             except Exception:
                 pass
+            # Remember files this conversation read/edited so they can be
+            # re-read after compaction (openflip/recent_files.py, CC parity).
+            if result.ok and name in ("read_file", "edit_file", "write_file") and args.get("path"):
+                try:
+                    from . import recent_files as _rf
+                    from .tools.files import _resolve as _rf_resolve
+                    _rf.note_touched(
+                        str(getattr(CURRENT_SESSION.get(None), "conversation_id", "") or ""),
+                        _rf_resolve(str(args["path"])))
+                except Exception:
+                    pass
             # PostToolUse hooks: the tool already ran, so they can't block;
             # their feedback (exit-2 stderr / additionalContext) is appended to
             # what the model sees as this tool's result.

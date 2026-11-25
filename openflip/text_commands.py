@@ -46,6 +46,8 @@ _TEXT_COMMANDS = {
     "/help",
     "/usage",
     "/skills",
+    "/goal",
+    "/plan",
 }
 
 
@@ -252,6 +254,28 @@ async def handle_text_command(
                        owner_transport=tname, owner_handle=handle)
         return True
 
+    if head == "/goal":
+        # Owner-only: a goal keeps the agent working (and spending) across
+        # turns until a model judges it met. docs/goal_plan_reread.md.
+        if not is_owner(speaker_id, transport=tname, handle=handle):
+            await _send(transport, session_id, channel, "Owner only.")
+            return True
+        cid = _conv_id or _conversation_id_for_channel(channel, conv_key)
+        await _do_goal(runner, session if session is not None else ch_id, cid, arg,
+                       speaker_id, channel, transport, session_id)
+        return True
+
+    if head == "/plan":
+        # Owner-only: plan mode blocks the agent's write tools until the
+        # operator approves its plan. docs/goal_plan_reread.md.
+        if not is_owner(speaker_id, transport=tname, handle=handle):
+            await _send(transport, session_id, channel, "Owner only.")
+            return True
+        cid = _conv_id or _conversation_id_for_channel(channel, conv_key)
+        await _do_plan(runner, session if session is not None else ch_id, cid, arg,
+                       speaker_id, channel, transport, session_id)
+        return True
+
     if head == "/skills":
         if not is_owner(speaker_id, transport=tname, handle=handle):
             await _send(transport, session_id, channel, "Owner only.")
@@ -315,6 +339,98 @@ def _conversation_id_for_channel(channel: Any, ch_id: int) -> str:
     except Exception:
         pass
     return ""
+
+
+async def _do_goal(runner, target, conversation_id, arg, speaker_id,
+                   channel, transport, session_id) -> None:
+    """/goal [condition | clear]: Claude Code's /goal (openflip/goal.py)."""
+    from . import goal as _goal
+    agent_dir = os.path.dirname(runner.agent.path)
+    if not conversation_id:
+        await _send(transport, session_id, channel,
+                    "⚠️ /goal: could not resolve the conversation for this channel.")
+        return
+    action, condition = _goal.parse_command(arg)
+    if action == "status":
+        await _send(transport, session_id, channel, _goal.status_text(agent_dir, conversation_id))
+        return
+    if action == "clear":
+        g = _goal.clear_goal(agent_dir, conversation_id)
+        await _send(transport, session_id, channel,
+                    f"Goal cleared: {g.condition}" if g else "No goal set")
+        return
+    g = _goal.set_goal(agent_dir, conversation_id, condition)
+    await _send(transport, session_id, channel, f"Goal set: {g.condition}")
+    # Setting a goal starts a turn right away with the condition as the
+    # directive (CC). Operator-attributed, posted to this conversation.
+    try:
+        await runner.run_synthetic_turn(
+            target, _goal.kickoff_prompt(g.condition),
+            auto_post_final_text=True,
+            speaker_id=int(speaker_id or 0),
+            originator_visibility="operator_channel",
+            log_tag="[goal] ",
+        )
+    except Exception as e:
+        print_ts(f"{COLOR_YELLOW}/goal: failed to start the goal turn: {e}{COLOR_END}",
+                 agent=runner.agent.id)
+        await _send(transport, session_id, channel, f"⚠️ Goal is set but the first turn didn't start: {e}")
+
+
+async def _do_plan(runner, target, conversation_id, arg, speaker_id,
+                   channel, transport, session_id) -> None:
+    """/plan [request | approve | no <feedback> | off]: Claude Code's plan mode."""
+    from . import plan_mode as _pm
+    agent_dir = os.path.dirname(runner.agent.path)
+    if not conversation_id:
+        await _send(transport, session_id, channel,
+                    "⚠️ /plan: could not resolve the conversation for this channel.")
+        return
+    action, text = _pm.parse_command(arg)
+    on = _pm.is_on(agent_dir, conversation_id)
+    prompt = ""
+    if action == "toggle":
+        if on:
+            _pm.turn_off(agent_dir, conversation_id)
+            await _send(transport, session_id, channel, "Plan mode off.")
+        else:
+            _pm.turn_on(agent_dir, conversation_id)
+            await _send(transport, session_id, channel,
+                        "Plan mode on: I'll research and plan, and change nothing until you approve.")
+        return
+    if action == "off":
+        _pm.turn_off(agent_dir, conversation_id)
+        await _send(transport, session_id, channel, "Plan mode off." if on else "Plan mode wasn't on.")
+        return
+    if action == "approve":
+        plan = _pm.load_plan(agent_dir, conversation_id)
+        if not on or not plan or not _pm.state(agent_dir, conversation_id).get("awaiting_approval"):
+            await _send(transport, session_id, channel, "No plan is waiting for approval.")
+            return
+        _pm.turn_off(agent_dir, conversation_id)
+        await _send(transport, session_id, channel, "Plan approved. Plan mode off, starting the work.")
+        prompt = _pm.approve_prompt(plan)
+    elif action == "reject":
+        if not on:
+            await _send(transport, session_id, channel, "Plan mode isn't on.")
+            return
+        d = _pm.state(agent_dir, conversation_id)
+        d["awaiting_approval"] = False
+        _pm._save(agent_dir, conversation_id, d)
+        await _send(transport, session_id, channel, "Sent back. Still in plan mode.")
+        prompt = _pm.reject_prompt(text)
+    else:  # plan <request>
+        _pm.turn_on(agent_dir, conversation_id)
+        await _send(transport, session_id, channel, "Plan mode on.")
+        prompt = _pm.plan_prompt(text)
+    try:
+        await runner.run_synthetic_turn(
+            target, prompt, auto_post_final_text=True, speaker_id=int(speaker_id or 0),
+            originator_visibility="operator_channel", log_tag="[plan] ",
+        )
+    except Exception as e:
+        print_ts(f"{COLOR_YELLOW}/plan: failed to start the turn: {e}{COLOR_END}", agent=runner.agent.id)
+        await _send(transport, session_id, channel, f"⚠️ The turn didn't start: {e}")
 
 
 async def _do_reset(runner, ch_id, channel, transport, session_id) -> None:

@@ -967,6 +967,18 @@ class AgentRunner:
                 (getattr(conv, "conversation_id", "") if conv else "") or fallback_conv_id or "")
         except Exception:
             pass
+        # /reset clears an active goal (CC: /clear removes it) and plan mode.
+        try:
+            from . import goal as _goal_mod
+            _g_cid = (getattr(conv, "conversation_id", "") if conv else "") or fallback_conv_id or ""
+            if _g_cid:
+                _goal_mod.save_goal(os.path.dirname(self.agent.path), _g_cid, None)
+                from . import recent_files as _rf
+                _rf.forget(_g_cid)
+                from . import plan_mode as _pm
+                _pm.clear(os.path.dirname(self.agent.path), _g_cid)
+        except Exception:
+            pass
         if conv and hasattr(conv, "clear_history"):
             try:
                 conv.clear_history()
@@ -2625,6 +2637,15 @@ class AgentRunner:
         # native to _conv_id itself so is_forwarded is False (safe — keys native).
         _native_full = f"{_tr}:{_tid}" if _tr else (_conv_id or str(_native_ch))
         conv = self.get_conversation(channel.id, conversation_id=_conv_id, native_key=_native_full)
+        # /goal: an owner's real message resumes a goal the no-progress guard
+        # paused (CC: "evaluation resumes after your next prompt").
+        if owner and (inbound is not None or discord_message is not None):
+            try:
+                from . import goal as _goal_mod
+                _goal_mod.unpause_on_operator_message(
+                    os.path.dirname(agent.path), getattr(conv, "conversation_id", "") or "")
+            except Exception:
+                pass
         # Session memory switch (`/session set memory off`, or an ingress
         # token's session_overrides). When off for THIS conversation, strip
         # the memory tools from BOTH lists — the model neither sees them
@@ -2920,6 +2941,12 @@ class AgentRunner:
         _stop_state = _hooks.StopState() if result_future is None else None
         any_attachments_this_turn = False
         any_tool_called = False
+        # /goal (openflip/goal.py): did any tool run since the last goal check?
+        # Feeds the no-progress guard. Goals run on the operator's own
+        # conversation only: never on peer chains or subagent workers.
+        _goal_tools_since_eval = False
+        _goal_eligible = result_future is None and depth == 0 and not originator_agent_id
+        _goal_notice_pending = ""
         # Running tool-outcome tallies for a worker turn (result_future set).
         # Settled into the WorkerOutcome so the spawner scores success on
         # structured counts, not text matching. Accumulated after every
@@ -3067,6 +3094,17 @@ class AgentRunner:
                     framed_user = f"{framed_user}\n\n<system-reminder>\n{_todo_note}\n</system-reminder>"
             except Exception as _todo_err:
                 print_ts(f"{COLOR_YELLOW}todo reminder skipped: {_todo_err}{COLOR_END}", agent=agent.id)
+        # Plan mode reminder (openflip/plan_mode.py): every turn while it's on,
+        # like Claude Code's plan-mode system reminder.
+        if not _verbatim:
+            try:
+                from . import plan_mode as _pm
+                _pm_note = _pm.reminder(os.path.dirname(agent.path),
+                                        (_conv_id or getattr(conv, "conversation_id", "") or ""))
+                if _pm_note:
+                    framed_user = f"{framed_user}\n\n<system-reminder>\n{_pm_note}\n</system-reminder>"
+            except Exception as _pm_err:
+                print_ts(f"{COLOR_YELLOW}plan mode reminder skipped: {_pm_err}{COLOR_END}", agent=agent.id)
         if _ups_context:
             framed_user = (f"{framed_user}\n\n<system-reminder>\nUserPromptSubmit hook:\n"
                            + "\n".join(_ups_context) + "\n</system-reminder>")
@@ -3339,6 +3377,32 @@ class AgentRunner:
                                 )
                         except Exception:
                             pass
+                        # Re-attach working state the summary loses (Claude
+                        # Code's context-window.md): up to 5 recently touched
+                        # files, the approved/active plan, the active goal.
+                        _after = []
+                        _cc_cid = getattr(conv, "conversation_id", "") or ""
+                        try:
+                            from . import recent_files as _rf
+                            _rb = _rf.reread_block(_cc_cid)
+                            if _rb:
+                                _after.append(_rb)
+                        except Exception:
+                            pass
+                        try:
+                            from . import plan_mode as _pm
+                            _pb = _pm.compaction_block(_agent_dir, _cc_cid)
+                            if _pb:
+                                _after.append(_pb)
+                        except Exception:
+                            pass
+                        try:
+                            from . import goal as _goal_mod
+                            _ag = _goal_mod.active_goal(_agent_dir, _cc_cid)
+                            if _ag is not None:
+                                _after.append(f"Active goal (set with /goal, still being checked): {_ag.condition}")
+                        except Exception:
+                            pass
                         try:
                             conv.messages.append(ChatMessage(
                                 'user',
@@ -3346,6 +3410,8 @@ class AgentRunner:
                                 'recent fine-grained history is now a summary. If you '
                                 'need exact details about earlier work, use search_memory '
                                 'or read_memory rather than guessing from context.'
+                                + _sk_note
+                                + (("\n\n" + "\n\n".join(_after)) if _after else "")
                             ))
                             print_ts(
                                 f"{COLOR_YELLOW}  compaction — injected [FRAMEWORK] note for next turn{COLOR_END}",
@@ -3432,6 +3498,15 @@ class AgentRunner:
                         # on every future request.
                         _err_kind = getattr(ai_message, "framework_error_kind", "") or ""
                         _structural = _err_kind == "bad_request"
+                        if _goal_eligible:
+                            try:
+                                from . import goal as _goal_mod
+                                _g_err_note = _goal_mod.on_framework_error(
+                                    _agent_dir, getattr(conv, "conversation_id", "") or "", _err_kind)
+                                if _g_err_note:
+                                    _goal_notice_pending = _g_err_note
+                            except Exception:
+                                pass
                         if _structural:
                             if conv.messages and conv.messages[-1].role == 'user':
                                 conv.messages.pop()
@@ -3688,6 +3763,36 @@ class AgentRunner:
                                     f"({_stop_state.continuations}/{_hooks.STOP_CONTINUATION_CAP})"
                                     f"{COLOR_END}", agent=agent.id)
                                 continue
+                        # ----- /goal (openflip/goal.py, docs/goal_plan_reread.md) -----
+                        # Same mechanics as a blocking Stop hook: a separate
+                        # small model checks the goal condition; not met feeds
+                        # its reason back and runs another round. Met /
+                        # impossible / paused post a notice and let it end.
+                        if _goal_eligible and _ct.strip() != "STAY_SILENT":
+                            from . import goal as _goal_mod
+                            _g_cid = getattr(conv, "conversation_id", "") or ""
+                            if _goal_mod.active_goal(_agent_dir, _g_cid) is not None:
+                                _g_dec = await _goal_mod.on_stop(
+                                    _agent_dir, _g_cid, conv.messages,
+                                    used_tools_this_turn=_goal_tools_since_eval,
+                                    background_running=_goal_mod.background_running_for(_g_cid),
+                                )
+                                _goal_tools_since_eval = False
+                                if _g_dec.keep_going:
+                                    if _ct.strip() and auto_post_final_text and not silent:
+                                        try:
+                                            for chunk in _split_for_discord(_ct.strip()):
+                                                await _safe_channel_send(channel, chunk)
+                                            _posted_assistant_text = True
+                                            _quiet.note_posted()
+                                        except Exception:
+                                            pass
+                                    conv.messages.append(ChatMessage('user', _g_dec.feedback))
+                                    print_ts(f"{COLOR_YELLOW}{log_tag}goal not met; turn keeps going{COLOR_END}",
+                                             agent=agent.id)
+                                    continue
+                                if _g_dec.notice:
+                                    _goal_notice_pending = _g_dec.notice
                         # NOTE: no post_drain_retry here.
                         #
                         # The text-only break can only fire AFTER chat() has
@@ -3830,6 +3935,7 @@ class AgentRunner:
 
                     if tool_results:
                         any_tool_called = True
+                        _goal_tools_since_eval = True
 
                     # Tally this batch's tool outcomes for the worker outcome.
                     # One entry per processed call (incl. ACL-blocked / lock-
@@ -4777,6 +4883,18 @@ class AgentRunner:
                         _posted_assistant_text = True
                     except Exception as e:
                         print_ts(f"{COLOR_RED}{log_tag}Failed to post message: {e}{COLOR_END}", error=True, agent=agent.id)
+
+        # /goal notice (achieved / impossible / paused / check failed): goes
+        # to the operator's conversation even on a silent background-result
+        # turn, since that's where a goal usually finishes.
+        if _goal_notice_pending:
+            try:
+                for chunk in _split_for_discord(_goal_notice_pending):
+                    await _safe_channel_send(channel, chunk)
+                print_ts(f"{log_tag}goal: {_goal_notice_pending.splitlines()[0][:120]}", agent=agent.id)
+            except Exception as _gn_err:
+                print_ts(f"{COLOR_YELLOW}{log_tag}goal notice post failed: {_gn_err}{COLOR_END}",
+                         agent=agent.id)
 
         # Subagent foundation: hand the final plain text back to the awaiting
         # caller. History is already persisted (`_save_conv("post-loop")`

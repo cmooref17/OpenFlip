@@ -25,6 +25,9 @@ _MAX_OUTPUT = 50_000    # characters
 # conversation that started it (Claude Code delivers a finished background
 # shell the same way, as a task notification).
 _BG_JOBS: dict[str, "asyncio.Task"] = {}
+# job_id -> conversation_id that started it (goal.py defers /goal evaluation
+# while a conversation's own background work is still running).
+_BG_OWNERS: dict[str, str] = {}
 
 
 def _format(code: int | None, out: bytes, err: bytes) -> str:
@@ -79,6 +82,7 @@ async def _run_bg(job_id: str, command: str, timeout: int, agent_id: str, sessio
         body = f"Failed to run: {e}"
     finally:
         _BG_JOBS.pop(job_id, None)
+        _BG_OWNERS.pop(job_id, None)
     print_ts(f"run_command bg {job_id} done; delivering result")
     try:
         await _deliver_bg_result(agent_id, session, channel_id, job_id, command, body)
@@ -127,6 +131,7 @@ async def run_command(command: str, timeout: int = 120, run_in_background: bool 
             channel_id = 0
         job_id = "bg-" + uuid.uuid4().hex[:8]
         print_ts(f"{COLOR_YELLOW}run_command bg {job_id}: {command!r} (timeout={timeout}s){COLOR_END}")
+        _BG_OWNERS[job_id] = str(getattr(session, "conversation_id", "") or channel_id or "")
         _BG_JOBS[job_id] = asyncio.create_task(_run_bg(job_id, command, timeout, agent.id, session, channel_id))
         return ToolResult(model_feedback=(
             f"Started in the background as {job_id} (timeout {timeout}s). Its output will arrive as a "

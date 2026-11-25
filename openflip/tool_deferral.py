@@ -33,6 +33,7 @@ DEFAULT_ALWAYS_LOAD = (
     "run_command", "web_search", "fetch_url",
     "send_message", "talk_to_agent", "end_chain",
     "save_memory", "search_memory", "read_memory", "todo_write", "use_skill",
+    "exit_plan_mode",
 )
 
 

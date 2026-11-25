@@ -91,6 +91,7 @@ openflip/tools/*
 !openflip/tools/tool_search.py
 !openflip/tools/todo.py
 !openflip/tools/skill.py
+!openflip/tools/plan.py
 !openflip/tools/memory.py
 !openflip/tools/files.py
 !openflip/tools/fetch_url.py

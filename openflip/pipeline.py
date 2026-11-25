@@ -388,7 +388,7 @@ MEMORY_TOOL_NAMES = {"save_memory", "delete_memory", "update_core_memory", "sear
 # touch framework state): tool_search loads deferred tool definitions;
 # todo_write keeps the conversation's task checklist; use_skill loads a
 # skill's instructions (docs/skills.md).
-FRAMEWORK_TOOL_NAMES = {"tool_search", "todo_write", "use_skill"}
+FRAMEWORK_TOOL_NAMES = {"tool_search", "todo_write", "use_skill", "exit_plan_mode"}
 
 
 def strip_memory_tools(funcs: list) -> list:

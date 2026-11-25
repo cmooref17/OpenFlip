@@ -2763,6 +2763,57 @@ agent reloads the ones it still needs; `/reset` forgets them.
 **Off switches.** env `OPENFLIP_DISABLE_SKILLS=1`, config.json
 `skills.enabled: false`, agent.json `skills.enabled: false`.
 
+# 12d. /goal, plan mode, and re-reading files after compaction
+
+Three Claude Code features, copied from its docs (goal.md, permission-modes.md,
+context-window.md). Design: `docs/goal_plan_reread.md`. Code: `openflip/goal.py`,
+`openflip/plan_mode.py`, `openflip/tools/plan.py`, `openflip/recent_files.py`.
+Tests: `tests/test_goal.py`, `tests/test_plan_mode.py`, `tests/test_recent_files.py`.
+All three are text commands, so they work on every transport. Owner only.
+
+**/goal: keep working until a condition holds.**
+- `/goal <condition>` (up to 4000 chars) sets this conversation's goal and starts a
+  turn right away with the condition as the instruction. A new goal replaces the old one.
+- `/goal` shows the condition, how long it's run, turns evaluated and the last check's
+  reason (or the last achieved goal). `/goal clear` (also stop/off/reset/none/cancel)
+  removes it. `/reset` removes it too.
+- Each time the agent tries to end a turn, a small fast model (`hooks_model`, else the
+  memory-recall selector model; same auth as prompt hooks, `hooks_auth`) reads the
+  condition and the recent transcript and says met / not met / impossible with a reason.
+  Not met: the reason goes back to the agent and the turn keeps going. Met: "Goal
+  achieved". Impossible: the goal is cleared with the reason.
+- The evaluator can't run anything. Write conditions the agent's own output can prove
+  ("tests/run.sh exits 0"), and add "or stop after N turns" to bound it.
+- No tool use for 3 checks in a row pauses the goal (still set); your next message
+  resumes it. A background `run_command` started from the conversation defers the
+  check until its result turn. An `auth` or `bad_request` error clears the goal;
+  other errors leave it set.
+- Saved in `conversations/<id>.goal.json`, so it survives a restart. Runs on the
+  operator's own conversation only (never peer chains or subagent workers).
+- Limit per turn is still `max_tool_turns`.
+
+**Plan mode: research and plan, change nothing until you approve.**
+- `/plan` toggles it. `/plan <request>` turns it on and starts a turn on that request.
+- While it's on, tools that change things (edit/write/delete files, restarts, cron,
+  messages and posts, generation, claude_code, subagents, memory writes, ...:
+  `plan_mode.WRITE_TOOLS`) are blocked in the tool executor, and `run_command` is
+  limited to read-only commands (writes like rm/mv/cp, git commit/push, installs,
+  systemctl start/restart, kill, sed -i and output redirects are blocked; background
+  runs too). The agent gets a reminder every turn.
+- The agent presents its plan with `exit_plan_mode(plan)`: it's posted to you and saved
+  to `conversations/<id>.plan.md`.
+- `/plan approve` (or yes/go/ok): plan mode turns off and a turn starts that carries the
+  plan out. `/plan no <feedback>`: still in plan mode, the agent revises.
+  `/plan off`: leave without approving.
+- The shell guard is a pattern check, not a sandbox: it stops the common writes, and the
+  agent is told read-only only.
+
+**Re-reading files after compaction.** Every file a successful `read_file`, `edit_file`
+or `write_file` touched in a conversation is remembered (in memory, per process). Right
+after a compaction, up to 5 of them, most recently modified first, are re-read into the
+compaction note; a file over ~5000 tokens comes back as `Referenced file <path>` with no
+content. The same note re-attaches the plan (if any) and the active goal.
+
 # 13. OAuth & credentials (Anthropic provider)
 
 This section covers the legacy `anthropic_auth: "oauth"` path only. The
